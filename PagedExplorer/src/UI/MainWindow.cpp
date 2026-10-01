@@ -12,6 +12,8 @@
 
 static constexpr int WM_APP_PAGELOADED = WM_APP + 1;
 static constexpr UINT WM_APP_WIN_E = WM_APP + 2;   // Win+E 被拦截后激活本窗口
+static constexpr int WM_APP_CLOSE_TAB = WM_APP + 3; // 中键点击分页 -> 延后到主窗口关闭
+static constexpr int WM_APP_MOVE_TAB  = WM_APP + 4; // 拖拽分页 -> 延后到主窗口移动
 
 // 自定义通知值：Edit 没有 EN_RETURN 常量，回车通知用这个
 static constexpr UINT EN_ADDR_RETURN = 0x1000;
@@ -106,6 +108,11 @@ void MainWindow::BuildChildren()
     tabs_[0].pane = 0;
     tabs_[0].pages->SetNotify([this]() { PostMessage(hwnd_, WM_APP_PAGELOADED, 0, 0); });
     panes_[0].tabs.push_back(0);
+    // 首个窗格的首个分页也要有 tab 头：否则窗格没有标题条，“+”按钮会贴到窗格最左边
+    TCITEMW ti0{};
+    ti0.mask = TCIF_TEXT;
+    ti0.pszText = const_cast<LPWSTR>(L"新建");
+    SendMessageW(panes_[0].tab, TCM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&ti0));
 
     // 分页栏
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"|◀", IDC_FIRST, &pagerFirst_);
@@ -243,6 +250,11 @@ int MainWindow::AllocPaneTag()
 void MainWindow::RemovePane(size_t idx)
 {
     if (idx >= panes_.size()) return;
+    if (tabDragPane_ == (int)idx || (int)idx < tabDragPane_) {
+        tabDragActive_ = false;    // 拖拽源/目标没了，别再引用旧下标
+        tabDragPane_ = -1;
+        tabDragIndex_ = -1;
+    }
     DestroyWindow(panes_[idx].tab);
     panes_.erase(panes_.begin() + idx);
     for (auto& t : tabs_)
@@ -334,15 +346,24 @@ void MainWindow::SetPaneCount(int n)
 {
     if (n < 1) n = 1;
     if (n > 4) n = 4;
-    // 减少：把末尾窗格的分页逐个移进第 n-1 个窗格（MoveTabToPane 会自动关闭空窗格）
+    // 减少：把末尾窗格的分页逐个移进第 n-1 个窗格（MoveTabToPane 会自动关闭空窗格）；
+    // 目标窗格已有相同目录的分页时，直接丢弃这个重复分页，不再搬过去
+    const size_t target = (size_t)n - 1;
     while ((int)panes_.size() > n) {
         Pane& last = panes_.back();
         if (last.tabs.empty()) {
-            size_t idx = panes_.size() - 1;
-            RemovePane(idx);
+            RemovePane(panes_.size() - 1);
             continue;
         }
-        MoveTabToPane(last.tabs[0], (size_t)n - 1);
+        size_t tabIndex = last.tabs[0];
+        if (PaneHasDir(target, tabs_[tabIndex].dir)) {
+            bool emptied = false;
+            RemoveTab(tabIndex, emptied);
+            if (emptied && panes_.size() > 1)
+                RemovePane(panes_.size() - 1);
+            continue;
+        }
+        MoveTabToPane(tabIndex, target);
     }
     // 增加
     while ((int)panes_.size() < n)
@@ -463,13 +484,34 @@ void MainWindow::UpdateRightTabLabels()
     }
 }
 
-void MainWindow::CloseRightTab(size_t index)
+// 目标窗格里是否已经有同一目录的分页（忽略大小写与结尾多余的 \）
+bool MainWindow::PaneHasDir(size_t paneIdx, const std::wstring& dir) const
 {
-    if (tabs_.size() <= 1 || index >= tabs_.size()) return; // 至少保留一个
+    if (paneIdx >= panes_.size() || dir.empty()) return false;
+    auto trim = [](const std::wstring& s) {
+        size_t n = s.size();
+        while (n > 0 && s[n - 1] == L'\\') --n;  // "C:\\Users\\" -> "C:\\Users"（根盘符 "C:\" -> "C:"）
+        return std::make_pair(s.c_str(), n);
+    };
+    auto [pd, pn] = trim(dir);
+    for (size_t tabIdx : panes_[paneIdx].tabs) {
+        const std::wstring& d = tabs_[tabIdx].dir;
+        if (d.empty()) continue;
+        auto [qd, qn] = trim(d);
+        if (pn == qn && _wcsnicmp(pd, qd, pn) == 0) return true;
+    }
+    return false;
+}
+
+// 删除一个分页：从所属窗格的 tab 控件删项、停止加载、从 tabs_ 移除并修正所有下标。
+// paneEmptied 返回所属窗格是否因此变空（是否 RemovePane 由调用方决定）
+void MainWindow::RemoveTab(size_t index, bool& paneEmptied)
+{
+    paneEmptied = false;
+    if (index >= tabs_.size()) return;
     size_t paneIdx = tabs_[index].pane;
     if (paneIdx >= panes_.size()) return;
 
-    // 从所属窗格的 tab 控件上删掉这一项
     Pane& p = panes_[paneIdx];
     for (size_t k = 0; k < p.tabs.size(); ++k)
         if (p.tabs[k] == index) {
@@ -479,8 +521,7 @@ void MainWindow::CloseRightTab(size_t index)
 
     tabs_[index].pages->Shutdown();
     tabs_.erase(tabs_.begin() + index);
-    // 修正窗格里记录的 tab 下标（tab 下标整体前移，pane 下标不受影响）
-    bool paneEmpty = false;
+    // 窗格里记录的 tab 下标整体前移（pane 下标不受影响）
     for (auto& pp : panes_) {
         for (size_t k = 0; k < pp.tabs.size();) {
             if (pp.tabs[k] == index) pp.tabs.erase(pp.tabs.begin() + k);
@@ -488,15 +529,27 @@ void MainWindow::CloseRightTab(size_t index)
         }
         if (pp.active >= pp.tabs.size() && !pp.tabs.empty()) pp.active = pp.tabs.size() - 1;
     }
-    paneEmpty = p.tabs.empty();
+    if (activeTab_ > index) --activeTab_;
+    else if (activeTab_ >= tabs_.size() && !tabs_.empty()) activeTab_ = tabs_.size() - 1;
+    paneEmptied = p.tabs.empty();
+}
 
-    size_t newIdx = (index < tabs_.size()) ? index : tabs_.size() - 1;
-    if (paneEmpty && panes_.size() > 1)
-        RemovePane(paneIdx);    // 窗格空了就合并掉（始终保留最后一个窗格）
-    SelectRightTab(newIdx);
+void MainWindow::CloseRightTab(size_t index)
+{
+    if (tabs_.size() <= 1 || index >= tabs_.size()) return; // 至少保留一个
+    size_t paneIdx = tabs_[index].pane;
+    if (paneIdx >= panes_.size()) return;
+    bool emptied = false;
+    RemoveTab(index, emptied);
+    if (emptied && panes_.size() > 1) {
+        RemovePane(paneIdx);    // 窗格空了就合并掉
+        SaveFavorites();        // panes= 记录要跟实际窗格数保持一致
+    }
+    SelectRightTab((index < tabs_.size()) ? index : tabs_.size() - 1);
     UpdateRightTabLabels();
     Layout();
 }
+
 
 void MainWindow::InsertColumns(HWND list)
 {
@@ -1132,9 +1185,11 @@ static LRESULT CALLBACK AddressProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 // ---------------------------------------------------------------------------
 static LRESULT CALLBACK PaneTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 {
-    auto* self = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(GetParent(h), GWLP_USERDATA));
+    if (!IsWindow(h)) return 0; // 窗格被销毁后可能还有残余消息，别再往下走
     WNDPROC orig = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(h, GWLP_USERDATA));
-    if (self && orig) return self->PaneTabHandler(h, m, wp, lp, orig);
+    if (!orig) return DefWindowProcW(h, m, wp, lp);
+    auto* self = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(GetParent(h), GWLP_USERDATA));
+    if (self) return self->PaneTabHandler(h, m, wp, lp, orig);
     return CallWindowProcW(orig, h, m, wp, lp);
 }
 
@@ -1160,18 +1215,27 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
         break;
     }
     case WM_MOUSEMOVE: {
-        if (tabDragActive_ && (wp & MK_LBUTTON)) {
+        if (tabDragActive_ && (wp & MK_LBUTTON) &&
+            tabDragPane_ >= 0 && tabDragPane_ < (int)panes_.size()) {
             POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             ClientToScreen(h, &pt);
             ScreenToClient(hwnd_, &pt);
-            // 落在其它窗格区域 -> 实时移动分页（整块矩形判定：上下排也能分清）
-            for (size_t i = 0; i < panes_.size(); ++i) {
+            // 落在其它窗格区域 -> 移动分页（整块矩形判定：上下排也能分清）
+            for (size_t i = 0; i < panes_.size() && i < paneRects_.size(); ++i) {
                 if ((int)i == tabDragPane_) continue;
                 if (PtInRect(&paneRects_[i], pt)) {
-                    size_t tabIndex = panes_[tabDragPane_].tabs[tabDragIndex_];
-                    tabDragActive_ = false; // 移动后重建拖拽状态
-                    ReleaseCapture();
-                    MoveTabToPane(tabIndex, i);
+                    size_t tabIndex = SIZE_MAX;
+                    if (tabDragIndex_ >= 0 && (size_t)tabDragIndex_ < panes_[tabDragPane_].tabs.size())
+                        tabIndex = panes_[tabDragPane_].tabs[tabDragIndex_];
+                    tabDragActive_ = false; // 拖拽状态先收尾
+                    if (GetCapture() == h) ReleaseCapture();
+                    if (tabIndex != SIZE_MAX) {
+                        // 移动可能连带销毁这个 tab（源窗格只有这一个分页），
+                        // 不能在 tab 自己的窗口过程中 DestroyWindow，延后到主窗口处理
+                        pendingMoveTab_ = tabIndex;
+                        pendingMovePane_ = (int)i;
+                        PostMessageW(hwnd_, WM_APP_MOVE_TAB, 0, 0);
+                    }
                     return 0;
                 }
             }
@@ -1184,6 +1248,23 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
             if (GetCapture() == h) ReleaseCapture();
         }
         break;
+    }
+    case WM_MBUTTONDOWN: {  // 中键点击分页标题 -> 关闭该分页
+        if (tabDragActive_) {           // 中键不参与拖拽，先收尾
+            tabDragActive_ = false;
+            if (GetCapture() == h) ReleaseCapture();
+        }
+        TCHITTESTINFO ht{};
+        ht.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        int idx = (int)SendMessageW(h, TCM_HITTEST, 0, reinterpret_cast<LPARAM>(&ht));
+        int pi = PaneOfTab(h);
+        if (idx >= 0 && pi >= 0 && (size_t)idx < panes_[pi].tabs.size()) {
+            // 关分页可能连带销毁这个窗格，不能在 tab 自己的窗口过程中 DestroyWindow，
+            // 丢给主窗口下一次消息循环处理
+            pendingCloseTab_ = panes_[pi].tabs[idx];
+            PostMessageW(hwnd_, WM_APP_CLOSE_TAB, 0, 0);
+        }
+        return 0;   // 吞掉中键，别触发系统的滚动热点
     }
     case WM_CAPTURECHANGED:
         tabDragActive_ = false;
@@ -1591,6 +1672,19 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     }
+
+    case WM_APP_CLOSE_TAB:      // 中键点击分页标题（延后到这里真正关闭）
+        CloseRightTab(pendingCloseTab_);
+        pendingCloseTab_ = SIZE_MAX;
+        return 0;
+
+    case WM_APP_MOVE_TAB:       // 拖拽分页到别的窗格（延后到这里真正移动）
+        if (pendingMoveTab_ != SIZE_MAX && pendingMovePane_ >= 0 &&
+            pendingMoveTab_ < tabs_.size() && (size_t)pendingMovePane_ < panes_.size())
+            MoveTabToPane(pendingMoveTab_, (size_t)pendingMovePane_);
+        pendingMoveTab_ = SIZE_MAX;
+        pendingMovePane_ = -1;
+        return 0;
 
     case WM_APP_PAGELOADED:
         OnPageLoaded();

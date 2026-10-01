@@ -134,6 +134,9 @@ private:
     int triLayout_ = 1;                 // 3 窗格形态：0=品字形(1上2下) 1=倒品字形(2上1下)，默认倒品
     int  savedPaneCount_ = 1;           // favorites.txt 的 panes= 恢复值
     bool startupLayoutApplied_ = false; // 启动恢复只做一次
+    size_t pendingCloseTab_ = SIZE_MAX; // 中键点击待关闭的分页（延后到下一次消息循环）
+    size_t pendingMoveTab_ = SIZE_MAX;  // 拖拽待移动的分页
+    int    pendingMovePane_ = -1;       // 拖拽目标窗格
     bool tabDragActive_ = false;        // 分页拖拽进行中
     int  tabDragPane_ = -1;             // 拖拽源窗格
     int  tabDragIndex_ = -1;            // 拖拽源窗格内的 tab 序号
@@ -156,6 +159,8 @@ private:
     void ApplySavedLayout();            // 启动时恢复上次布局（默认倒品字形）
     void SelectRightTab(size_t index);
     void SelectPane(size_t index);
+    bool PaneHasDir(size_t paneIdx, const std::wstring& dir) const; // 该窗格是否已有同一目录的分页
+    void RemoveTab(size_t index, bool& paneEmptied); // 删除分页（paneEmptied=所属窗格变空了吗）
     void CloseRightTab(size_t index);
     void MoveTabToPane(size_t tabIndex, size_t paneIdx); // 分页拖拽移动
     void UpdateRightTabLabels();
