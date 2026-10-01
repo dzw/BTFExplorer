@@ -16,6 +16,8 @@ enum {
     IDC_TAB = 1016, IDC_FAVLIST = 1017, IDC_RIGHTTAB = 1018, IDC_NEWTAB = 1019,
     IDC_LAYOUT1 = 1020, IDC_LAYOUT2 = 1021, IDC_LAYOUT3 = 1022, IDC_LAYOUT4 = 1023,
     IDC_TRI_PINTOP = 1024, IDC_TRI_PINDOWN = 1025,
+    // 分页标题右键菜单：关闭 / 关闭其他 / 关闭右边 / 锁定
+    IDC_TM_LOCK = 1030, IDC_TM_CLOSE = 1031, IDC_TM_OTHERS = 1032, IDC_TM_RIGHT = 1033,
 };
 
 // 每个右侧分页的独立状态（目录/页码/历史/加载器各自独立）
@@ -26,6 +28,7 @@ struct TabState {
     std::vector<FileEntry> pageItems;
     size_t curPage = 0;
     size_t pane = 0;                         // 所属窗格
+    bool locked = false;                     // 锁定：不被批量/中键关闭
     std::unique_ptr<PageManager> pages;
     TabState() : pages(std::make_unique<PageManager>()) {}
 };
@@ -137,6 +140,7 @@ private:
     size_t pendingCloseTab_ = SIZE_MAX; // 中键点击待关闭的分页（延后到下一次消息循环）
     size_t pendingMoveTab_ = SIZE_MAX;  // 拖拽待移动的分页
     int    pendingMovePane_ = -1;       // 拖拽目标窗格
+    size_t menuTab_ = SIZE_MAX;         // 右键菜单作用的分页
     bool tabDragActive_ = false;        // 分页拖拽进行中
     int  tabDragPane_ = -1;             // 拖拽源窗格
     int  tabDragIndex_ = -1;            // 拖拽源窗格内的 tab 序号
@@ -164,6 +168,11 @@ private:
     void CloseRightTab(size_t index);
     void MoveTabToPane(size_t tabIndex, size_t paneIdx); // 分页拖拽移动
     void UpdateRightTabLabels();
+    size_t PaneTabPos(size_t paneIdx, size_t tabIndex) const; // 分页在本窗格中的序号
+    void TabContextMenu(HWND h, int idx, POINT screenPt);     // 分页标题右键菜单
+    void CloseOtherTabs(size_t keepTabIndex);                 // 关闭同一窗格的其它分页
+    void CloseRightTabs(size_t keepTabIndex);                 // 关闭同一窗格中它右边的分页
+    void ToggleTabLock(size_t tabIndex);                      // 锁定 / 解锁该分页
 
     size_t pageSize_ = 100;
     int sortCol_ = 0;      // 排序列（全局记住）

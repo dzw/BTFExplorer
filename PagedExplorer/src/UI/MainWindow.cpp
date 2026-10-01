@@ -476,12 +476,104 @@ void MainWindow::UpdateRightTabLabels()
             if (s != std::wstring::npos && s + 1 < name.size()) name = name.substr(s + 1);
             else if (name.size() >= 2 && name[1] == L':') name = name.substr(0, 2);
             if (name.empty()) name = L"新建";
+            if (tabs_[p.tabs[k]].locked) name = L"[锁] " + name;
             TCITEMW ti{};
             ti.mask = TCIF_TEXT;
             ti.pszText = const_cast<LPWSTR>(name.c_str());
             SendMessageW(p.tab, TCM_SETITEMW, k, reinterpret_cast<LPARAM>(&ti));
         }
     }
+}
+
+// 分页在本窗格里的序号（找不到返回 SIZE_MAX）
+size_t MainWindow::PaneTabPos(size_t paneIdx, size_t tabIndex) const
+{
+    if (paneIdx >= panes_.size()) return SIZE_MAX;
+    const Pane& p = panes_[paneIdx];
+    for (size_t k = 0; k < p.tabs.size(); ++k)
+        if (p.tabs[k] == tabIndex) return k;
+    return SIZE_MAX;
+}
+
+// 分页标题右键菜单：关闭 / 关闭其他 / 关闭右边 / 锁定
+void MainWindow::TabContextMenu(HWND h, int idx, POINT screenPt)
+{
+    int pi = PaneOfTab(h);
+    if (pi < 0 || idx < 0 || (size_t)idx >= panes_[pi].tabs.size()) return;
+    menuTab_ = panes_[pi].tabs[idx];
+
+    bool lastOne = (tabs_.size() <= 1);
+    bool locked = tabs_[menuTab_].locked;
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING | (locked ? MF_CHECKED : 0), IDC_TM_LOCK, L"锁定(&L)");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    // 锁定 / 只剩这一个时不允许关闭
+    UINT dis = (locked || lastOne) ? (MF_DISABLED | MF_GRAYED) : 0;
+    AppendMenuW(m, MF_STRING | dis, IDC_TM_CLOSE,  L"关闭(&C)");
+    AppendMenuW(m, MF_STRING,      IDC_TM_OTHERS, L"关闭其他(&O)");
+    AppendMenuW(m, MF_STRING,      IDC_TM_RIGHT,  L"关闭右边(&R)");
+    TrackPopupMenuEx(m, TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                     screenPt.x, screenPt.y, hwnd_, nullptr);
+    DestroyMenu(m);
+}
+
+// 关闭同一窗格里除指定分页之外的分页（锁定的保留）
+void MainWindow::CloseOtherTabs(size_t keepTabIndex)
+{
+    if (keepTabIndex >= tabs_.size()) return;
+    size_t paneIdx = tabs_[keepTabIndex].pane;
+    if (paneIdx >= panes_.size()) return;
+
+    bool any = false;
+    for (;;) {
+        size_t victim = SIZE_MAX;
+        for (size_t k : panes_[paneIdx].tabs)
+            if (k != keepTabIndex && !tabs_[k].locked) victim = k;
+        if (victim == SIZE_MAX) break;
+        bool emptied = false;
+        RemoveTab(victim, emptied);         // 从后往前删，下标不会串
+        any = true;
+        if (emptied) break;                 // 理论不会发生（keep 还在）
+    }
+    if (any) {
+        UpdateRightTabLabels();
+        Layout();
+    }
+}
+
+// 关闭同一窗格中指定分页右侧的所有分页（锁定的保留）
+void MainWindow::CloseRightTabs(size_t keepTabIndex)
+{
+    if (keepTabIndex >= tabs_.size()) return;
+    size_t paneIdx = tabs_[keepTabIndex].pane;
+    if (paneIdx >= panes_.size()) return;
+    size_t keepPos = PaneTabPos(paneIdx, keepTabIndex);
+    if (keepPos == SIZE_MAX) return;
+
+    bool any = false;
+    for (;;) {
+        size_t victim = SIZE_MAX;
+        for (size_t k = keepPos + 1; k < panes_[paneIdx].tabs.size(); ++k)
+            if (!tabs_[panes_[paneIdx].tabs[k]].locked)
+                victim = panes_[paneIdx].tabs[k];   // 取最右一个可关的
+        if (victim == SIZE_MAX) break;
+        bool emptied = false;
+        RemoveTab(victim, emptied);
+        any = true;
+        keepPos = PaneTabPos(paneIdx, keepTabIndex);
+        if (keepPos == SIZE_MAX) break;
+    }
+    if (any) {
+        UpdateRightTabLabels();
+        Layout();
+    }
+}
+
+void MainWindow::ToggleTabLock(size_t tabIndex)
+{
+    if (tabIndex >= tabs_.size()) return;
+    tabs_[tabIndex].locked = !tabs_[tabIndex].locked;
+    UpdateRightTabLabels();   // 标题前加 [锁]
 }
 
 // 目标窗格里是否已经有同一目录的分页（忽略大小写与结尾多余的 \）
@@ -537,6 +629,7 @@ void MainWindow::RemoveTab(size_t index, bool& paneEmptied)
 void MainWindow::CloseRightTab(size_t index)
 {
     if (tabs_.size() <= 1 || index >= tabs_.size()) return; // 至少保留一个
+    if (tabs_[index].locked) return;                        // 锁定的不关
     size_t paneIdx = tabs_[index].pane;
     if (paneIdx >= panes_.size()) return;
     bool emptied = false;
@@ -1227,6 +1320,8 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
                     size_t tabIndex = SIZE_MAX;
                     if (tabDragIndex_ >= 0 && (size_t)tabDragIndex_ < panes_[tabDragPane_].tabs.size())
                         tabIndex = panes_[tabDragPane_].tabs[tabDragIndex_];
+                    if (tabIndex != SIZE_MAX && tabs_[tabIndex].locked)
+                        tabIndex = SIZE_MAX;    // 锁定的分页不允许被拖走
                     tabDragActive_ = false; // 拖拽状态先收尾
                     if (GetCapture() == h) ReleaseCapture();
                     if (tabIndex != SIZE_MAX) {
@@ -1248,6 +1343,18 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
             if (GetCapture() == h) ReleaseCapture();
         }
         break;
+    }
+    case WM_RBUTTONDOWN: {  // 右键分页标题 -> 关闭/关闭其他/关闭右边/锁定
+        TCHITTESTINFO ht{};
+        ht.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        int idx = (int)SendMessageW(h, TCM_HITTEST, 0, reinterpret_cast<LPARAM>(&ht));
+        if (idx >= 0) {
+            POINT pt = ht.pt;
+            ClientToScreen(h, &pt);
+            TabContextMenu(h, idx, pt);
+            return 0;
+        }
+        break;              // 标题空白处右键不管，交给默认过程
     }
     case WM_MBUTTONDOWN: {  // 中键点击分页标题 -> 关闭该分页
         if (tabDragActive_) {           // 中键不参与拖拽，先收尾
@@ -1638,6 +1745,10 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             else
                 AddRightTab(true);  // 普通点击：当前窗格加一个分页
             return 0;
+        case IDC_TM_CLOSE:  CloseRightTab(menuTab_); return 0;
+        case IDC_TM_OTHERS: CloseOtherTabs(menuTab_); return 0;
+        case IDC_TM_RIGHT:  CloseRightTabs(menuTab_); return 0;
+        case IDC_TM_LOCK:   ToggleTabLock(menuTab_); return 0;
         case IDC_LAYOUT1: SetPaneCount(1); return 0;
         case IDC_LAYOUT2: SetPaneCount(2); return 0;
         case IDC_LAYOUT3: SetPaneCount(3); return 0;
@@ -1697,16 +1808,37 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                               cds->cbData / sizeof(wchar_t));
             OpenTarget(path);
             if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
+            // 与 WM_APP_WIN_E 相同：借前台线程输入权限置前
+            HWND fg = GetForegroundWindow();
+            DWORD fgTid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+            DWORD myTid = GetCurrentThreadId();
+            bool attached = fgTid && fgTid != myTid &&
+                            AttachThreadInput(myTid, fgTid, TRUE);
+            BringWindowToTop(hwnd_);
             SetForegroundWindow(hwnd_);
+            if (attached) AttachThreadInput(myTid, fgTid, FALSE);
         }
         return TRUE;
     }
 
     // Win+E 被全局钩子拦截后，激活本窗口（还原最小化 / 置前）
-    case WM_APP_WIN_E:
+    case WM_APP_WIN_E: {
         if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
+        else if (!IsWindowVisible(hwnd_)) ShowWindow(hwnd_, SW_SHOW);
+        // SetForegroundWindow 只有在前台进程才有权限；Win+E 时前台属于
+        // 别的进程，直接调用只会闪任务栏。经典解法：AttachThreadInput
+        // 短暂挂到前台线程，借用其输入权限完成置前。
+        HWND fg = GetForegroundWindow();
+        DWORD fgTid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+        DWORD myTid = GetCurrentThreadId();
+        bool attached = fgTid && fgTid != myTid &&
+                        AttachThreadInput(myTid, fgTid, TRUE);
+        BringWindowToTop(hwnd_);
         SetForegroundWindow(hwnd_);
+        if (attached) AttachThreadInput(myTid, fgTid, FALSE);
+        if (activePane_ < panes_.size()) SetFocus(CurList());
         return 0;
+    }
 
     // 分隔条拖动：sideW .. sideW+12 之间是空命中区，鼠标落在此处归主窗口
     case WM_LBUTTONDOWN: {

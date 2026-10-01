@@ -11,7 +11,7 @@ call "%VS%\Common7\Tools\VsDevCmd.bat" -arch=x64 -no_logo
 
 if not exist build mkdir build
 
-cl /nologo /std:c++20 /EHsc /W3 /O2 /Zi /utf-8 ^
+cl /nologo /std:c++20 /EHsc /W3 /O2 /Zi /FS /utf-8 ^
   /DUNICODE /D_UNICODE /DNOMINMAX ^
   src\App\main.cpp src\Shell\*.cpp src\Pagination\*.cpp src\UI\*.cpp ^
   /Fe:build\PagedExplorer.exe /Fd:build\PagedExplorer.pdb /Fo:build\ ^
