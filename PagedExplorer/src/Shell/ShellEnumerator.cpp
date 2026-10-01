@@ -45,14 +45,19 @@ size_t EnumeratePage(const std::wstring& dir,
     if (total) {
         // 调用方要总数：需要走完全目录，代价大；分页 UI 用“还有更多”策略，
         // 这里只在第一页时统计（后台线程调用）。
+        // 注意：必须用独立的 fd2，不能复用 fd —— 第二次枚举会覆盖 fd，
+        // 导致主枚举句柄之后读到错乱数据、列表出现重复条目。
         if (offset == 0) {
             unsigned long long n = 0;
-            HANDLE h2 = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &fd,
+            WIN32_FIND_DATAW fd2{};
+            HANDLE h2 = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &fd2,
                                          FindExSearchNameMatch, nullptr, flags);
             if (h2 != INVALID_HANDLE_VALUE) {
                 for (;;) {
-                    if (accept()) ++n;
-                    if (!FindNextFileW(h2, &fd)) break;
+                    if (!(fd2.cFileName[0] == L'.' &&
+                          (fd2.cFileName[1] == 0 || (fd2.cFileName[1] == L'.' && fd2.cFileName[2] == 0))))
+                        ++n;
+                    if (!FindNextFileW(h2, &fd2)) break;
                 }
                 FindClose(h2);
             }
