@@ -67,12 +67,22 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     if (FAILED(hr)) { if (hMutex) CloseHandle(hMutex); return 1; }
 
-    // 加速键：Alt+Up=上级目录，Alt+Left=后退，Alt+Right=前进
-    ACCEL accel[3] = {};
-    accel[0].fVirt = FVIRTKEY | FALT; accel[0].key = VK_UP;    accel[0].cmd = IDC_UP;
-    accel[1].fVirt = FVIRTKEY | FALT; accel[1].key = VK_LEFT;  accel[1].cmd = IDC_BACK;
-    accel[2].fVirt = FVIRTKEY | FALT; accel[2].key = VK_RIGHT; accel[2].cmd = IDC_FORWARD;
-    HACCEL hAccel = CreateAcceleratorTableW(accel, 3);
+    // 加速键：焦点在列表/地址栏等子控件上时也能生效（Alt+消息不会自动转到主窗口）
+    //   Alt+方向键导航，Alt+1~4 切窗格数量，Alt+小键盘8/2 切品字形态
+    // 小键盘 NumLock 关闭时 8/2 会被上报成 VK_UP/VK_DOWN：
+    // 8 与 Alt+Up（上级目录）冲突，保持导航；2 无冲突，额外绑 Alt+Down 兜底
+    ACCEL accel[10] = {};
+    accel[0].fVirt = FVIRTKEY | FALT; accel[0].key = VK_UP;      accel[0].cmd = IDC_UP;
+    accel[1].fVirt = FVIRTKEY | FALT; accel[1].key = VK_LEFT;    accel[1].cmd = IDC_BACK;
+    accel[2].fVirt = FVIRTKEY | FALT; accel[2].key = VK_RIGHT;   accel[2].cmd = IDC_FORWARD;
+    accel[3].fVirt = FVIRTKEY | FALT; accel[3].key = '1';        accel[3].cmd = IDC_LAYOUT1;
+    accel[4].fVirt = FVIRTKEY | FALT; accel[4].key = '2';        accel[4].cmd = IDC_LAYOUT2;
+    accel[5].fVirt = FVIRTKEY | FALT; accel[5].key = '3';        accel[5].cmd = IDC_LAYOUT3;
+    accel[6].fVirt = FVIRTKEY | FALT; accel[6].key = '4';        accel[6].cmd = IDC_LAYOUT4;
+    accel[7].fVirt = FVIRTKEY | FALT; accel[7].key = VK_NUMPAD8; accel[7].cmd = IDC_TRI_PINTOP;
+    accel[8].fVirt = FVIRTKEY | FALT; accel[8].key = VK_NUMPAD2; accel[8].cmd = IDC_TRI_PINDOWN;
+    accel[9].fVirt = FVIRTKEY | FALT; accel[9].key = VK_DOWN;    accel[9].cmd = IDC_TRI_PINDOWN;
+    HACCEL hAccel = CreateAcceleratorTableW(accel, 10);
 
     int ret = 1;
     if (MainWindow* w = MainWindow::Create(hInst)) {

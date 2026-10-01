@@ -44,10 +44,7 @@ MainWindow* MainWindow::Create(HINSTANCE hInst)
 
     auto* self = new MainWindow();
     self->pageSize_ = 100;
-    self->tabs_.emplace_back(); // 首个分页
-    self->tabs_[0].pages->SetNotify([self]() {
-        PostMessage(self->hwnd_, WM_APP_PAGELOADED, 0, 0);
-    });
+    // 首个分页在 BuildChildren 里创建（那里才能拿到 tab 容器）
 
     RECT rcWork{};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &rcWork, 0);
@@ -59,6 +56,7 @@ MainWindow* MainWindow::Create(HINSTANCE hInst)
     if (!self->hwnd_) { delete self; return nullptr; }
 
     self->BuildChildren();
+    self->ApplySavedLayout();   // 窗格数量 / 品字形态：默认上次的布局
     self->PopulateDrives();
     self->Navigate(L"C:\\Users\\Public", false);
     ShowWindow(self->hwnd_, SW_SHOW);
@@ -99,7 +97,7 @@ void MainWindow::BuildChildren()
 
     // 右侧窗格（文件列表）：首个窗格 + 一个分页
     panes_.emplace_back();
-    CreatePane(panes_[0], 0);
+    CreatePane(panes_[0]);
     btnNewTab_ = CreateWindowExW(0, WC_BUTTONW, L"+",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
         0, 0, 26, 22, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_NEWTAB)), hInst, nullptr);
@@ -169,19 +167,23 @@ void MainWindow::SwitchSideTab(int index)
     Layout();
 }
 
-void MainWindow::BuildImageList()
+// 系统图像列表只取一次，所有窗格共用（列表带 LVS_SHAREIMAGELISTS）
+void MainWindow::BuildImageList(HWND list)
 {
-    // 用系统图像列表（Shell 维护，按 SHGFI_SYSICONINDEX 索引取图标）
-    SHFILEINFOW fi{};
-    HIMAGELIST sys = reinterpret_cast<HIMAGELIST>(
-        SHGetFileInfoW(L"C:\\", 0, &fi, sizeof(fi), SHGFI_SYSICONINDEX | SHGFI_SMALLICON));
-    if (sys) {
-        ListView_SetImageList(panes_[0].list, sys, LVSIL_SMALL);
-    } else {
+    if (!sysImgs_) {
+        SHFILEINFOW fi{};
+        sysImgs_ = reinterpret_cast<HIMAGELIST>(
+            SHGetFileInfoW(L"C:\\", 0, &fi, sizeof(fi), SHGFI_SYSICONINDEX | SHGFI_SMALLICON));
+    }
+    if (sysImgs_) {
+        ListView_SetImageList(list, sysImgs_, LVSIL_SMALL);
+        return;
+    }
+    if (!imgList_) {
         int cx = GetSystemMetrics(SM_CXSMICON), cy = GetSystemMetrics(SM_CYSMICON);
         imgList_ = ImageList_Create(cx, cy, ILC_COLOR32 | ILC_MASK, 32, 64);
-        ListView_SetImageList(panes_[0].list, imgList_, LVSIL_SMALL);
     }
+    if (imgList_) ListView_SetImageList(list, imgList_, LVSIL_SMALL);
 }
 
 void MainWindow::CreateTree()
@@ -199,12 +201,14 @@ void MainWindow::CreateTree()
         TreeView_SetImageList(tree_, sys, TVSIL_NORMAL);
 }
 
-void MainWindow::CreatePane(Pane& p, size_t paneIdx)
+void MainWindow::CreatePane(Pane& p)
 {
     HINSTANCE hInst = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd_, GWLP_HINSTANCE));
+    // 编号不直接用作窗格下标：删除窗格后下标会重排，编号保持唯一，避免 ID 撞车
+    p.tag = AllocPaneTag();
     p.tab = CreateWindowExW(0, WC_TABCONTROLW, L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | TCS_TABS,
-        0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RIGHTTAB + paneIdx)), hInst, nullptr);
+        0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RIGHTTAB + p.tag)), hInst, nullptr);
     if (uiFont_) SendMessageW(p.tab, WM_SETFONT, (WPARAM)uiFont_, TRUE);
     // 子类化：支持分页拖拽到其它窗格
     SetWindowLongPtrW(p.tab, GWLP_USERDATA, GetWindowLongPtrW(p.tab, GWLP_WNDPROC));
@@ -212,16 +216,70 @@ void MainWindow::CreatePane(Pane& p, size_t paneIdx)
 
     p.list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_OWNERDATA | LVS_SHAREIMAGELISTS,
-        0, 0, 0, 0, p.tab, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_LIST_BASE + paneIdx)), hInst, nullptr);
+        0, 0, 0, 0, p.tab, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_LIST_BASE + p.tag)), hInst, nullptr);
     if (uiFont_) SendMessageW(p.list, WM_SETFONT, (WPARAM)uiFont_, TRUE);
     ListView_SetExtendedListViewStyle(p.list,
         LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_GRIDLINES);
-    BuildImageList();
-    InsertColumns();
+    BuildImageList(p.list);
+    InsertColumns(p.list);
 
-    listOldProc_ = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(p.list, GWLP_WNDPROC,
+    p.listOld = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(p.list, GWLP_WNDPROC,
         reinterpret_cast<LONG_PTR>(&MainWindow::ListViewProcStatic)));
     SetWindowLongPtrW(p.list, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+}
+
+// 分配当前未被占用的窗格编号（最多同时 4 个窗格，编号池 0~7 足够）
+int MainWindow::AllocPaneTag()
+{
+    bool used[8] = { false };
+    for (const auto& p : panes_)
+        if (p.tag >= 0 && p.tag < 8) used[p.tag] = true;
+    for (int i = 0; i < 8; ++i)
+        if (!used[i]) return i;
+    return (int)panes_.size();
+}
+
+// 销毁窗格（list 是 tab 的子窗口，随之销毁），并修正所有分页的 pane 下标
+void MainWindow::RemovePane(size_t idx)
+{
+    if (idx >= panes_.size()) return;
+    DestroyWindow(panes_[idx].tab);
+    panes_.erase(panes_.begin() + idx);
+    for (auto& t : tabs_)
+        if (t.pane > idx) --t.pane;
+    if (panes_.empty()) activePane_ = 0;
+    else if (activePane_ >= panes_.size()) activePane_ = panes_.size() - 1;
+}
+
+int MainWindow::PaneOfList(HWND h) const
+{
+    for (size_t i = 0; i < panes_.size(); ++i)
+        if (panes_[i].list == h) return (int)i;
+    return -1;
+}
+
+int MainWindow::PaneOfTab(HWND h) const
+{
+    for (size_t i = 0; i < panes_.size(); ++i)
+        if (panes_[i].tab == h) return (int)i;
+    return -1;
+}
+
+TabState& MainWindow::PaneActiveTab(size_t pi)
+{
+    if (pi >= panes_.size()) return CurTab();
+    Pane& p = panes_[pi];
+    if (p.tabs.empty()) return CurTab();
+    if (p.active >= p.tabs.size()) p.active = p.tabs.size() - 1;
+    return tabs_[p.tabs[p.active]];
+}
+
+std::wstring MainWindow::PaneItemPath(size_t pi, int item)
+{
+    if (pi >= panes_.size() || item < 0) return {};
+    TabState& t = PaneActiveTab(pi);
+    if (item >= (int)t.pageItems.size()) return {};
+    return t.pageItems[item].path;
 }
 
 HWND MainWindow::CurList() const
@@ -263,12 +321,63 @@ void MainWindow::AddRightTab(bool navigateToDefault, size_t paneIdx)
 
 void MainWindow::AddPane()
 {
-    Pane p;
-    panes_.push_back(std::move(p));
-    size_t idx = panes_.size() - 1;
-    CreatePane(panes_[idx], idx);
+    size_t idx = panes_.size();
+    panes_.emplace_back();
+    CreatePane(panes_[idx]);
     Layout(); // 新窗格立即排布到正确位置（否则与现有窗格重叠）
     AddRightTab(true, idx); // 新窗格自带一个分页并激活
+}
+
+// Alt+1~4：窗格数量 1~4。减少时把多余窗格的分页并入最后一个保留窗格；
+// 增加时逐个 AddPane。
+void MainWindow::SetPaneCount(int n)
+{
+    if (n < 1) n = 1;
+    if (n > 4) n = 4;
+    // 减少：把末尾窗格的分页逐个移进第 n-1 个窗格（MoveTabToPane 会自动关闭空窗格）
+    while ((int)panes_.size() > n) {
+        Pane& last = panes_.back();
+        if (last.tabs.empty()) {
+            size_t idx = panes_.size() - 1;
+            RemovePane(idx);
+            continue;
+        }
+        MoveTabToPane(last.tabs[0], (size_t)n - 1);
+    }
+    // 增加
+    while ((int)panes_.size() < n)
+        AddPane();
+
+    layoutCount_ = (int)panes_.size();
+    if (activePane_ >= panes_.size()) activePane_ = panes_.size() - 1;
+    Pane& p = panes_[activePane_];
+    if (!p.tabs.empty()) {
+        if (p.active >= p.tabs.size()) p.active = p.tabs.size() - 1;
+        SelectRightTab(p.tabs[p.active]);
+    }
+    UpdateRightTabLabels();
+    Layout();
+    SaveFavorites(); // 记住窗格数量，下次启动沿用
+}
+
+// 3 窗格形态：0=品字形(1上2下) 1=倒品字形(2上1下)
+// 无论当前几个窗格都先记住选择（并持久化），三窗格时立刻生效
+void MainWindow::SetTriLayout(int t)
+{
+    int v = t ? 1 : 0;
+    bool changed = (triLayout_ != v);
+    triLayout_ = v;
+    if (panes_.size() == 3) Layout();
+    if (changed) SaveFavorites();
+}
+
+// 启动时恢复上次布局：没有记录就用默认的倒品字形
+void MainWindow::ApplySavedLayout()
+{
+    if (startupLayoutApplied_) return;
+    startupLayoutApplied_ = true;
+    if (savedPaneCount_ > 1 && savedPaneCount_ != (int)panes_.size())
+        SetPaneCount(savedPaneCount_);
 }
 
 void MainWindow::SelectRightTab(size_t index)
@@ -330,24 +439,9 @@ void MainWindow::MoveTabToPane(size_t tabIndex, size_t paneIdx)
     to.active = inPane;
 
     // 源窗格空了：关掉它
-    if (from.tabs.empty()) {
-        DestroyWindow(from.tab);
-        panes_.erase(panes_.begin() + oldPane);
-        // 修正所有 TabState 的 pane 下标
-        for (auto& t : tabs_)
-            if (t.pane > oldPane) --t.pane;
-        if (activePane_ >= panes_.size()) activePane_ = panes_.size() - 1;
-    }
+    if (panes_[oldPane].tabs.empty())
+        RemovePane(oldPane);
     SelectRightTab(tabIndex);
-    UpdatePaneVisibility();
-    Layout();
-}
-
-void MainWindow::UpdatePaneVisibility()
-{
-    for (size_t i = 0; i < panes_.size(); ++i) {
-        ShowWindow(panes_[i].tab, SW_HIDE); // Layout 会再显示
-    }
     Layout();
 }
 
@@ -373,28 +467,43 @@ void MainWindow::CloseRightTab(size_t index)
 {
     if (tabs_.size() <= 1 || index >= tabs_.size()) return; // 至少保留一个
     size_t paneIdx = tabs_[index].pane;
+    if (paneIdx >= panes_.size()) return;
+
+    // 从所属窗格的 tab 控件上删掉这一项
+    Pane& p = panes_[paneIdx];
+    for (size_t k = 0; k < p.tabs.size(); ++k)
+        if (p.tabs[k] == index) {
+            SendMessageW(p.tab, TCM_DELETEITEM, k, 0);
+            break;
+        }
+
     tabs_[index].pages->Shutdown();
     tabs_.erase(tabs_.begin() + index);
-    // 修正所有下标
-    for (auto& t : tabs_)
-        if (t.pane >= index) ; // pane 与 tab 下标无关，无需修正 pane
-    for (auto& p : panes_) {
-        for (size_t k = 0; k < p.tabs.size();) {
-            if (p.tabs[k] == index) p.tabs.erase(p.tabs.begin() + k);
-            else { if (p.tabs[k] > index) --p.tabs[k]; ++k; }
+    // 修正窗格里记录的 tab 下标（tab 下标整体前移，pane 下标不受影响）
+    bool paneEmpty = false;
+    for (auto& pp : panes_) {
+        for (size_t k = 0; k < pp.tabs.size();) {
+            if (pp.tabs[k] == index) pp.tabs.erase(pp.tabs.begin() + k);
+            else { if (pp.tabs[k] > index) --pp.tabs[k]; ++k; }
         }
-        if (p.active >= p.tabs.size() && !p.tabs.empty()) p.active = p.tabs.size() - 1;
+        if (pp.active >= pp.tabs.size() && !pp.tabs.empty()) pp.active = pp.tabs.size() - 1;
     }
-    if (activeTab_ >= tabs_.size()) activeTab_ = tabs_.size() - 1;
-    SelectRightTab(activeTab_);
+    paneEmpty = p.tabs.empty();
+
+    size_t newIdx = (index < tabs_.size()) ? index : tabs_.size() - 1;
+    if (paneEmpty && panes_.size() > 1)
+        RemovePane(paneIdx);    // 窗格空了就合并掉（始终保留最后一个窗格）
+    SelectRightTab(newIdx);
+    UpdateRightTabLabels();
+    Layout();
 }
 
-void MainWindow::InsertColumns()
+void MainWindow::InsertColumns(HWND list)
 {
     auto add = [&](int idx, const wchar_t* text, int w) {
         LVCOLUMNW c = { LVCF_TEXT | LVCF_WIDTH | LVCF_FMT, LVCFMT_LEFT, w, const_cast<LPWSTR>(text) };
         c.iSubItem = idx;
-        ListView_InsertColumn(panes_[0].list, idx, &c);
+        ListView_InsertColumn(list, idx, &c);
     };
     add(COL_NAME, L"名称", 300);
     add(COL_TYPE, L"类型", 140);
@@ -748,9 +857,8 @@ void MainWindow::LoadFavorites()
     std::wstring path = FavoritesFilePath();
     FILE* f = nullptr;
     if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) { RefreshFavoritesList(); return; }
-    // UTF-8 逐行读取；首行可为 sort=列,方向 配置行
+    // UTF-8 逐行读取；配置行 sort=/panes=/tri= 可出现在任意位置
     char line[1024];
-    bool first = true;
     while (fgets(line, sizeof(line), f)) {
         size_t n = strlen(line);
         while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
@@ -762,18 +870,25 @@ void MainWindow::LoadFavorites()
         // 去掉 UTF-8 BOM：文件以 BOM 开头时首字符是 U+FEFF，
         // 否则 "sort=" 配置行会被误判成一条收藏路径（收藏夹出现 "sort=1,1" 的根源）
         if (!w.empty() && w[0] == 0xFEFF) w.erase(0, 1);
-        if (first) {
-            first = false;
-            if (w.rfind(L"sort=", 0) == 0) {
-                int col = 0, asc = 1;
-                swscanf_s(w.c_str() + 5, L"%d,%d", &col, &asc);
-                if (col >= 0 && col <= 3) { sortCol_ = col; sortAsc_ = asc != 0; }
-                continue;
-            }
-            // 首行不是配置行，当作收藏路径处理
+        // 配置行不作为收藏项（兼容旧版污染的数据）
+        if (w.rfind(L"sort=", 0) == 0) {
+            int col = 0, asc = 1;
+            swscanf_s(w.c_str() + 5, L"%d,%d", &col, &asc);
+            if (col >= 0 && col <= 3) { sortCol_ = col; sortAsc_ = asc != 0; }
+            continue;
         }
-        // 任何残留的 sort= 配置行都不应作为收藏项（兼容旧版污染的数据）
-        if (w.rfind(L"sort=", 0) == 0) continue;
+        if (w.rfind(L"panes=", 0) == 0) {   // 上次退出时的窗格数量 1~4
+            int n = 1;
+            swscanf_s(w.c_str() + 6, L"%d", &n);
+            savedPaneCount_ = (n >= 1 && n <= 4) ? n : 1;
+            continue;
+        }
+        if (w.rfind(L"tri=", 0) == 0) {     // 上次的三窗格形态：0=品字形 1=倒品字形
+            int t = 1;
+            swscanf_s(w.c_str() + 4, L"%d", &t);
+            triLayout_ = t ? 1 : 0;
+            continue;
+        }
         favorites_.push_back(std::move(w));
     }
     fclose(f);
@@ -788,20 +903,17 @@ void MainWindow::SaveFavorites()
     // 写 UTF-8 BOM + 配置行 + UTF-8 行
     const unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
     fwrite(bom, 1, 3, f);
-    char cfg[64];
-    int cn = WideCharToMultiByte(CP_UTF8, 0,
-        (L"sort=" + std::to_wstring(sortCol_) + L"," + std::to_wstring(sortAsc_ ? 1 : 0)).c_str(), -1,
-        cfg, sizeof(cfg) - 1, nullptr, nullptr);
-    if (cn > 0) { cfg[cn - 1] = '\n'; fwrite(cfg, 1, cn, f); }
-    for (const auto& dir : favorites_) {
-        char buf[2048];
-        int n = WideCharToMultiByte(CP_UTF8, 0, dir.c_str(), (int)dir.size(),
+    auto putLine = [&](const std::wstring& s) {
+        char buf[4096];
+        int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(),
                                     buf, sizeof(buf) - 2, nullptr, nullptr);
-        if (n > 0) {
-            buf[n++] = '\n';
-            fwrite(buf, 1, n, f);
-        }
-    }
+        if (n > 0) { buf[n++] = '\n'; fwrite(buf, 1, n, f); }
+    };
+    putLine(L"sort=" + std::to_wstring(sortCol_) + L"," + std::to_wstring(sortAsc_ ? 1 : 0));
+    putLine(L"panes=" + std::to_wstring(panes_.size())); // 下次启动沿用窗格数量
+    putLine(L"tri=" + std::to_wstring(triLayout_));      // 下次启动沿用品字形态
+    for (const auto& dir : favorites_)
+        putLine(dir);
     fclose(f);
 }
 
@@ -1052,10 +1164,10 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
             POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             ClientToScreen(h, &pt);
             ScreenToClient(hwnd_, &pt);
-            // 落在其它窗格区域 -> 实时移动分页
+            // 落在其它窗格区域 -> 实时移动分页（整块矩形判定：上下排也能分清）
             for (size_t i = 0; i < panes_.size(); ++i) {
                 if ((int)i == tabDragPane_) continue;
-                if (pt.x >= paneRanges_[i].first && pt.x <= paneRanges_[i].second) {
+                if (PtInRect(&paneRects_[i], pt)) {
                     size_t tabIndex = panes_[tabDragPane_].tabs[tabDragIndex_];
                     tabDragActive_ = false; // 移动后重建拖拽状态
                     ReleaseCapture();
@@ -1120,40 +1232,80 @@ void MainWindow::Layout()
     place(tree_, 4, tabH + 6, sideW - 8, innerH);
     place(favList_, 4, tabH + 6, sideW - 8, innerH);
 
-    // 右侧多窗格：水平排列，窗格间留 12px 分隔条（可拖调宽）
-    int x = sideW + 12;
-    int rightAvail = W - x;
-    paneRanges_.clear();
-    // 总宽按各窗格 width 比例缩放到可用宽
-    int sumW = 0;
-    for (auto& p : panes_) sumW += p.width;
-    if (sumW <= 0) sumW = 1;
+    // 右侧多窗格网格布局：
+    //   1 个：独占；2 个：左右；3 个：品/倒品（triLayout_）；4 个：田字形
+    //   同排两个窗格的宽度按 Pane::width 比例分配（分隔条可拖）
+    int gx = sideW + 12;
+    int gw = W - gx;
+    int gh = listH;
+    const int S = 12; // 分隔条厚度
+    paneRects_.clear();
+    splitPairs_.clear();
+
+    size_t n = panes_.size();
+    std::vector<RECT> rects(n);
+    auto rowW = [&](size_t a, size_t b) { // 同排 a|b 两窗格的分割宽度
+        int wsum = panes_[a].width + panes_[b].width;
+        if (wsum <= 0) wsum = 2;
+        int w = (int)((long long)(gw - S) * panes_[a].width / wsum);
+        if (w < 160) w = 160;
+        if (gw - S - w < 160) w = gw - S - 160;
+        if (w < 160) w = 160;
+        return w;
+    };
+    if (n == 1) {
+        rects[0] = { gx, y, gx + gw, y + gh };
+    } else if (n == 2) {
+        int w = rowW(0, 1);
+        rects[0] = { gx, y, gx + w, y + gh };
+        rects[1] = { gx + w + S, y, gx + gw, y + gh };
+        splitPairs_.push_back({ 0, 1 });
+    } else if (n == 3) {
+        int halfH = (gh - S) / 2;
+        if (triLayout_ == 1) { // 倒品字形：2 上 1 下（默认）
+            int w = rowW(0, 1);
+            rects[0] = { gx, y, gx + w, y + halfH };
+            rects[1] = { gx + w + S, y, gx + gw, y + halfH };
+            rects[2] = { gx, y + halfH + S, gx + gw, y + gh };
+            splitPairs_.push_back({ 0, 1 }); // 竖分隔条在上方两窗格之间
+        } else {               // 品字形：1 上 2 下
+            int w = rowW(1, 2);
+            rects[0] = { gx, y, gx + gw, y + halfH };
+            rects[1] = { gx, y + halfH + S, gx + w, y + gh };
+            rects[2] = { gx + w + S, y + halfH + S, gx + gw, y + gh };
+            splitPairs_.push_back({ 1, 2 }); // 竖分隔条在下方两窗格之间
+        }
+    } else if (n >= 4) { // 4：田字形（n==0 时哪个分支都不走：窗格尚未创建）
+        int halfH = (gh - S) / 2;
+        int wTop = rowW(0, 1);
+        int wBot = rowW(2, 3);
+        rects[0] = { gx, y, gx + wTop, y + halfH };
+        rects[1] = { gx + wTop + S, y, gx + gw, y + halfH };
+        rects[2] = { gx, y + halfH + S, gx + wBot, y + gh };
+        rects[3] = { gx + wBot + S, y + halfH + S, gx + gw, y + gh };
+        splitPairs_.push_back({ 0, 1 });
+        splitPairs_.push_back({ 2, 3 });
+    }
 
     RECT rrt{};
     int rtabH = 24;
     for (size_t i = 0; i < panes_.size(); ++i) {
         Pane& p = panes_[i];
-        int w = (int)((long long)rightAvail * p.width / sumW);
-        if (w < 160) w = 160;
-        bool last = (i + 1 == panes_.size());
-        if (last) w = W - x; // 末窗格吃掉余量
-
-        place(p.tab, x, y, w, listH);
-        paneRanges_.push_back({ x, x + w });
+        RECT& r = rects[i];
+        int w = r.right - r.left, hh = r.bottom - r.top;
+        ShowWindow(p.tab, SW_SHOW); // 曾经被隐藏过（切换布局）的窗格要恢复
+        place(p.tab, r.left, r.top, w, hh);
+        paneRects_.push_back(r);
         SendMessageW(p.tab, TCM_GETITEMRECT, 0, reinterpret_cast<LPARAM>(&rrt));
         rtabH = rrt.bottom - rrt.top;
         // list 是 p.tab 的子窗口，坐标相对 p.tab 客户区
-        place(p.list, 4, rtabH + 6, w - 8, listH - rtabH - 12);
+        place(p.list, 4, rtabH + 6, w - 8, hh - rtabH - 12);
 
         // “+” 按钮放在该窗格最后一个 tab 头右侧
-        {
-            RECT rl{};
-            int cnt = (int)SendMessageW(p.tab, TCM_GETITEMCOUNT, 0, 0);
-            if (cnt > 0) SendMessageW(p.tab, TCM_GETITEMRECT, cnt - 1, reinterpret_cast<LPARAM>(&rl));
-            p.lastTabRight = x + rl.right + 6;
-        }
-        p.width = w; // 回写实际宽度
-        x += w + (last ? 0 : 12);
+        RECT rl{};
+        int cnt = (int)SendMessageW(p.tab, TCM_GETITEMCOUNT, 0, 0);
+        if (cnt > 0) SendMessageW(p.tab, TCM_GETITEMRECT, cnt - 1, reinterpret_cast<LPARAM>(&rl));
+        p.lastTabRight = r.left + rl.right + 6;
     }
 
     // “+” 按钮跟随激活窗格
@@ -1177,18 +1329,20 @@ void MainWindow::Layout()
     SendMessageW(status_, WM_SIZE, 0, MAKELPARAM(W, H));
 }
 
-LRESULT MainWindow::ListViewProc(UINT msg, WPARAM wp, LPARAM lp)
+LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
-    // 右键菜单：在列表空白/条目上弹出 Explorer 风格菜单
-    if (msg == WM_CONTEXTMENU) {
-        int sel = ListView_GetNextItem(CurList(), -1, LVNI_SELECTED);
+    int pi = PaneOfList(h);
+    if (pi >= 0 && msg == WM_CONTEXTMENU) {
+        // 右键菜单：在列表空白/条目上弹出 Explorer 风格菜单
+        if ((size_t)pi != activePane_) SelectPane((size_t)pi); // 先激活该窗格
+        int sel = ListView_GetNextItem(h, -1, LVNI_SELECTED);
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         if (pt.x == -1 && pt.y == -1) { // 键盘触发
             pt = { 200, 200 };
             ClientToScreen(hwnd_, &pt);
         }
         std::wstring path;
-        if (sel >= 0) path = CurrentPagePath(sel);
+        if (sel >= 0) path = PaneItemPath((size_t)pi, sel);
         HMENU menu = CreatePopupMenu();
         if (!path.empty())
             AppendMenuW(menu, MF_STRING, 1, L"添加当前目录到收藏");
@@ -1202,8 +1356,11 @@ LRESULT MainWindow::ListViewProc(UINT msg, WPARAM wp, LPARAM lp)
             RefreshList();
         return 0;
     }
-    if (msg == WM_CHAR && wp == VK_DELETE) { /* Del 经主窗口加速键 */ }
-    return CallWindowProcW(listOldProc_, CurList(), msg, wp, lp);
+    if (msg == WM_CHAR && wp == VK_DELETE) { /* Del 经 LVN_KEYDOWN 处理 */ }
+    // 每个窗格各自保存原过程，别用别窗格的
+    WNDPROC orig = (pi >= 0) ? panes_[pi].listOld : nullptr;
+    if (orig) return CallWindowProcW(orig, h, msg, wp, lp);
+    return DefWindowProcW(h, msg, wp, lp);
 }
 
 LRESULT CALLBACK MainWindow::ListViewProcStatic(HWND h, UINT m, WPARAM wp, LPARAM lp,
@@ -1211,7 +1368,7 @@ LRESULT CALLBACK MainWindow::ListViewProcStatic(HWND h, UINT m, WPARAM wp, LPARA
 {
     // 用 GWLP_USERDATA 取 self（CreateListView 时已设置）
     auto* self = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(h, GWLP_USERDATA));
-    if (self) return self->ListViewProc(m, wp, lp);
+    if (self) return self->ListViewProc(h, m, wp, lp);
     return DefWindowProcW(h, m, wp, lp);
 }
 
@@ -1233,7 +1390,16 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
 
-    case WM_SYSKEYDOWN: // Alt+方向键：上级 / 历史上一个 / 历史下一个
+    case WM_SYSKEYDOWN: // Alt+数字：窗格数量/布局；Alt+方向键：导航
+        // Alt+1~4 切换窗格数量（主键盘数字行；小键盘 2 另有“倒品字形”用途，不参与）
+        if (wp >= '1' && wp <= '4') {
+            SetPaneCount((int)(wp - '0'));
+            return 0;
+        }
+        // Alt+小键盘8：品字形(1上2下)；Alt+小键盘2：倒品字形(2上1下)
+        // （NumLock 关闭时小键盘 8/2 上报为 VK_UP/VK_DOWN，这里按非扩展键处理）
+        if (wp == VK_NUMPAD8) { SetTriLayout(0); return 0; }
+        if (wp == VK_NUMPAD2 || wp == VK_DOWN) { SetTriLayout(1); return 0; }
         switch (wp) {
         case VK_UP: {
             const std::wstring& dir = CurTab().dir;
@@ -1256,18 +1422,23 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
 
+    case WM_SYSCHAR:
+        return 0;   // 窗口无菜单：吞掉 Alt 组合键的默认处理（避免提示音）
+
     case WM_NOTIFY: {
         auto* nm = reinterpret_cast<NMHDR*>(lp);
-        // 多窗格：列表 ID = IDC_LIST_BASE + 窗格号
-        if (nm->idFrom >= IDC_LIST_BASE && nm->idFrom <= IDC_LIST_BASE + 63) {
-            size_t pi = nm->idFrom - IDC_LIST_BASE;
-            if (pi < panes_.size() && pi != activePane_ && nm->code != LVN_GETDISPINFOW)
-                SelectPane(pi); // 点击非激活窗格的列表 -> 激活它
+        // 多窗格：窗格被删除后控件 ID 与下标不再对应，统一用 hwnd 反查窗格
+        int pi = PaneOfList(nm->hwndFrom);
+        if (pi >= 0) {
+            // 操作非激活窗格 -> 先激活它（重绘除外，避免中途切换数据源造成重入）
+            if ((size_t)pi != activePane_ && nm->code != LVN_GETDISPINFOW)
+                SelectPane((size_t)pi);
             if (nm->code == LVN_GETDISPINFOW) {
                 auto* di = reinterpret_cast<NMLVDISPINFOW*>(nm);
+                TabState& vt = PaneActiveTab((size_t)pi); // 取本窗格自己的分页数据
                 int i = di->item.iItem;
-                if (i < 0 || i >= (int)CurTab().pageItems.size()) return 0;
-                FileEntry& e = CurTab().pageItems[i];
+                if (i < 0 || i >= (int)vt.pageItems.size()) return 0;
+                FileEntry& e = vt.pageItems[i];
                 if (di->item.mask & LVIF_TEXT) {
                     std::wstring text;
                     switch (di->item.iSubItem) {
@@ -1304,19 +1475,16 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                 else if (kd->wVKey == VK_F2) OnRename();
             }
         }
-        else if (nm->code == TCN_SELCHANGE &&
-                 nm->idFrom >= IDC_RIGHTTAB && nm->idFrom < IDC_RIGHTTAB + 63) {
+        else if (nm->code == TCN_SELCHANGE && PaneOfTab(nm->hwndFrom) >= 0) {
             // 某个窗格的 tab 头点击：切换该窗格的当前分页
-            size_t pi = nm->idFrom - IDC_RIGHTTAB;
-            if (pi < panes_.size()) {
-                size_t inPane = (size_t)SendMessageW(panes_[pi].tab, TCM_GETCURSEL, 0, 0);
-                if (inPane < panes_[pi].tabs.size()) {
-                    panes_[pi].active = inPane;
-                    SelectRightTab(panes_[pi].tabs[inPane]);
-                }
+            int tipi = PaneOfTab(nm->hwndFrom);
+            size_t inPane = (size_t)SendMessageW(panes_[tipi].tab, TCM_GETCURSEL, 0, 0);
+            if (inPane < panes_[tipi].tabs.size()) {
+                panes_[tipi].active = inPane;
+                SelectRightTab(panes_[tipi].tabs[inPane]);
             }
         }
-        else if (nm->idFrom == IDC_TAB && nm->code == TCN_SELCHANGE) {
+        else if (nm->hwndFrom == tab_ && nm->code == TCN_SELCHANGE) {
             SwitchSideTab((int)SendMessageW(tab_, TCM_GETCURSEL, 0, 0));
         }
         else if (nm->idFrom == IDC_FAVLIST) {
@@ -1384,11 +1552,17 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         case IDC_NEWTAB:
-            if (GetKeyState(VK_CONTROL) & 0x8000)
-                AddPane();          // Ctrl+点击：新增分页窗口（窗格）
+            if ((GetKeyState(VK_CONTROL) & 0x8000) && panes_.size() < 4)
+                AddPane();          // Ctrl+点击：新增窗格（最多 4 个）
             else
                 AddRightTab(true);  // 普通点击：当前窗格加一个分页
             return 0;
+        case IDC_LAYOUT1: SetPaneCount(1); return 0;
+        case IDC_LAYOUT2: SetPaneCount(2); return 0;
+        case IDC_LAYOUT3: SetPaneCount(3); return 0;
+        case IDC_LAYOUT4: SetPaneCount(4); return 0;
+        case IDC_TRI_PINTOP:  SetTriLayout(0); return 0; // 品字形：1 上 2 下
+        case IDC_TRI_PINDOWN: SetTriLayout(1); return 0; // 倒品字形：2 上 1 下
         case IDC_REFRESH: RefreshList(); return 0;
         case IDC_FIRST: CurTab().curPage = 0; RefreshList(); return 0;
         case IDC_PREV:  if (CurTab().curPage > 0) { --CurTab().curPage; RefreshList(); } return 0;
@@ -1444,13 +1618,15 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
     case WM_LBUTTONDOWN: {
         int x = static_cast<int>(GET_X_LPARAM(lp));
         int yy = static_cast<int>(GET_Y_LPARAM(lp));
-        // 窗格间分隔条命中：窗格 i 右缘 .. +12
+        // 窗格间分隔条命中：splitPairs_ 各对的右缘 .. +12（限该排高度内）
         if (yy >= splitTop_ && yy <= splitBot_) {
-            for (size_t i = 0; i + 1 < panes_.size(); ++i) {
-                int edge = paneRanges_[i].second;
-                if (x >= edge && x <= edge + 12) {
+            for (size_t k = 0; k < splitPairs_.size(); ++k) {
+                auto& pr = splitPairs_[k];
+                int edge = paneRects_[pr.first].right;
+                int top = paneRects_[pr.first].top, bot = paneRects_[pr.first].bottom;
+                if (x >= edge && x <= edge + 12 && yy >= top && yy <= bot) {
                     paneSplitDragging_ = true;
-                    paneSplitIndex_ = (int)i;
+                    paneSplitIndex_ = (int)k;
                     SetCapture(hwnd_);
                     SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
                     return 0;
@@ -1467,20 +1643,22 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_MOUSEMOVE:
         if (paneSplitDragging_) {
-            // 拖窗格 i/i+1 分隔条：从右侧窗格总体的比例微调两窗格 width
+            // 拖 splitPairs_[k] 分隔条：调整左右两窗格的 width
             int x = static_cast<int>(GET_X_LPARAM(lp));
-            int i = paneSplitIndex_;
-            if (i >= 0 && i + 1 < (int)panes_.size()) {
-                int leftEdge = paneRanges_[i].first;
+            int k = paneSplitIndex_;
+            if (k >= 0 && k < (int)splitPairs_.size()) {
+                auto& pr = splitPairs_[k];
+                size_t a = pr.first, b = pr.second;
+                int leftEdge = paneRects_[a].left;
                 int want = x - leftEdge;
                 int minW = 160;
-                int maxW = paneRanges_[i + 1].second - minW - 12;
+                int maxW = paneRects_[b].right - minW - 12;
                 if (want < minW) want = minW;
                 if (want > maxW) want = maxW;
-                int delta = want - panes_[i].width;
-                panes_[i].width += delta;
-                panes_[i + 1].width -= delta;
-                if (panes_[i + 1].width < 160) panes_[i + 1].width = 160;
+                int delta = want - panes_[a].width;
+                panes_[a].width += delta;
+                panes_[b].width -= delta;
+                if (panes_[b].width < 160) panes_[b].width = 160;
                 Layout();
             }
             return 0;
@@ -1511,9 +1689,11 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd_, &pt);
         // 窗格间分隔条光标
         if (pt.y >= splitTop_ && pt.y <= splitBot_) {
-            for (size_t i = 0; i + 1 < panes_.size(); ++i) {
-                int edge = paneRanges_[i].second;
-                if (pt.x >= edge && pt.x <= edge + 12) {
+            for (size_t k = 0; k < splitPairs_.size(); ++k) {
+                auto& pr = splitPairs_[k];
+                int edge = paneRects_[pr.first].right;
+                if (pt.x >= edge && pt.x <= edge + 12 &&
+                    pt.y >= paneRects_[pr.first].top && pt.y <= paneRects_[pr.first].bottom) {
                     SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
                     return TRUE;
                 }
