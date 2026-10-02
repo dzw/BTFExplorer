@@ -79,6 +79,7 @@ private:
     void SyncTreeToCurrentTab(bool showErrors = true);
     void CreatePane(Pane& p);        // 创建一个窗格（tab 容器 + 虚拟列表）
     void Navigate(const std::wstring& path, bool addHistory = true);
+    void NavigateFromSidebar(const std::wstring& path); // 侧栏跳转：分页被锁定时另开新分页
 
     // 列表（作用于激活窗格的当前分页）
     HWND  CurList() const;            // 激活窗格的 ListView

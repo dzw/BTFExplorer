@@ -7,3 +7,4 @@ build.bat
 /bin/
 /cmake-build/
 /.idea/
+/.codebuddy/*.png

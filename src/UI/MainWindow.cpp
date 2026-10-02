@@ -971,7 +971,9 @@ void MainWindow::TabContextMenu(HWND h, int idx, POINT screenPt)
     AppendMenuW(m, MF_STRING | dis, IDC_TM_CLOSE,  L"关闭(&C)");
     AppendMenuW(m, MF_STRING,      IDC_TM_OTHERS, L"关闭其他(&O)");
     AppendMenuW(m, MF_STRING,      IDC_TM_RIGHT,  L"关闭右边(&R)");
-    TrackPopupMenuEx(m, TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD,
+    // 不要加 TPM_RETURNCMD：那会让菜单直接返回命令 ID 而不发送 WM_COMMAND，
+    // 下面的 IDC_TM_* 分支就永远收不到，点了没反应。
+    TrackPopupMenuEx(m, TPM_LEFTALIGN | TPM_RIGHTBUTTON,
                      screenPt.x, screenPt.y, hwnd_, nullptr);
     DestroyMenu(m);
 }
@@ -1179,6 +1181,17 @@ void MainWindow::Navigate(const std::wstring& rawPath, bool addHistory)
     UpdateStatusBar();
     UpdatePaginationBar();
     UpdateRightTabLabels();
+}
+
+// 目录树 / 收藏 的跳转入口。
+// 当前分页被锁定时不改动它，而是在同一窗格里新开一个分页来打开目标目录。
+void MainWindow::NavigateFromSidebar(const std::wstring& path)
+{
+    if (path.empty()) return;
+    if (!CurTab().locked) { Navigate(path); return; }
+    size_t paneIdx = activePane_;
+    AddRightTab(false, paneIdx);   // 新建并激活分页（先不跳默认目录）
+    Navigate(path);                // 再在新分页里打开目标目录
 }
 
 void MainWindow::RefreshList()
@@ -2204,7 +2217,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                     LVITEMW it{}; it.iItem = ni->iItem; it.mask = LVIF_PARAM;
                     ListView_GetItem(favList_, &it);
                     auto* dir = reinterpret_cast<std::wstring*>(it.lParam);
-                    if (dir && !dir->empty()) Navigate(*dir);
+                    if (dir && !dir->empty()) NavigateFromSidebar(*dir);
                 }
             }
             else if (nm->code == NM_RCLICK) {
@@ -2221,7 +2234,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                     LVITEMW it{}; it.iItem = ni->iItem; it.mask = LVIF_PARAM;
                     ListView_GetItem(favList_, &it);
                     auto* dir = reinterpret_cast<std::wstring*>(it.lParam);
-                    if (dir && !dir->empty()) Navigate(*dir);
+                    if (dir && !dir->empty()) NavigateFromSidebar(*dir);
                 } else if (cmd == 2) {
                     OnRemoveFavorite();
                 }
@@ -2230,7 +2243,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         else {
             std::wstring selectedTreePath;
             if (directoryTree_.HandleNotification(nm, selectedTreePath)) {
-                if (!selectedTreePath.empty()) Navigate(selectedTreePath);
+                if (!selectedTreePath.empty()) NavigateFromSidebar(selectedTreePath);
             }
         }
         return 0;
