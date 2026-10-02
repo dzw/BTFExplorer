@@ -8,6 +8,7 @@ namespace shell {
 // path 为空时用当前目录 menuDir 生成背景菜单。
 // 返回是否执行了操作（用于刷新列表）。
 bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& menuDir,
-                     POINT ptScreen);
+                     POINT ptScreen, const std::wstring& customItem,
+                     bool& customItemSelected);
 
 } // namespace shell

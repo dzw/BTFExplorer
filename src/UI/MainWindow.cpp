@@ -58,10 +58,9 @@ MainWindow* MainWindow::Create(HINSTANCE hInst)
     if (!self->hwnd_) { delete self; return nullptr; }
 
     self->BuildChildren();
-    self->ApplySavedLayout();   // 窗格数量 / 品字形态：默认上次的布局
     self->PopulateDrives();
-    self->Navigate(L"C:\\Users\\Public", false);
-    ShowWindow(self->hwnd_, SW_SHOW);
+    self->RestoreSession();     // 恢复上次会话（窗格/分页/历史），无会话则默认 1 窗格
+    ShowWindow(self->hwnd_, self->startupShowCmd_);
     UpdateWindow(self->hwnd_);
     return self;
 }
@@ -399,6 +398,241 @@ void MainWindow::ApplySavedLayout()
     startupLayoutApplied_ = true;
     if (savedPaneCount_ > 1 && savedPaneCount_ != (int)panes_.size())
         SetPaneCount(savedPaneCount_);
+}
+
+// 销毁全部窗格与分页（窗格的 list 是 tab 的子窗口，随 DestroyWindow 一起没）
+void MainWindow::ResetAllPanes()
+{
+    while (!panes_.empty())
+        RemovePane(panes_.size() - 1);
+    tabs_.clear();
+    activePane_ = 0;
+    activeTab_ = 0;
+}
+
+// 退出时把当前所有窗格/分页/各自的历史写盘（UTF-8，与 favorites.txt 同目录）
+void MainWindow::SaveSession()
+{
+    std::wstring path = SessionFilePath();
+    FILE* f = _wfopen(path.c_str(), L"wb");
+    if (!f) return;
+    fwrite("\xEF\xBB\xBF", 1, 3, f);   // UTF-8 BOM
+
+    auto putLine = [&](const std::wstring& s) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(),
+                                    nullptr, 0, nullptr, nullptr);
+        if (n <= 0) return;
+        std::string buf(n, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(),
+                            &buf[0], n, nullptr, nullptr);
+        buf += '\n';
+        fwrite(buf.data(), 1, buf.size(), f);
+    };
+
+    putLine(L"sort=" + std::to_wstring(sortCol_) + L"," + std::to_wstring(sortAsc_ ? 1 : 0));
+    putLine(L"panes=" + std::to_wstring(panes_.size()));
+    putLine(L"tri=" + std::to_wstring(triLayout_));
+    putLine(L"sel=" + std::to_wstring(activeTab_));
+    putLine(L"sideWidth=" + std::to_wstring(sideWidth_));
+    WINDOWPLACEMENT placement{};
+    placement.length = sizeof(placement);
+    if (GetWindowPlacement(hwnd_, &placement)) {
+        const RECT& r = placement.rcNormalPosition;
+        putLine(L"window=" + std::to_wstring(r.left) + L"," +
+                std::to_wstring(r.top) + L"," + std::to_wstring(r.right) + L"," +
+                std::to_wstring(r.bottom) + L"," +
+                std::to_wstring(placement.showCmd == SW_SHOWMAXIMIZED ? 1 : 0));
+    }
+    std::wstring widths;
+    for (size_t i = 0; i < panes_.size(); ++i) {
+        if (i) widths += L",";
+        widths += std::to_wstring(panes_[i].width);
+    }
+    putLine(L"widths=" + widths);
+
+    for (size_t i = 0; i < tabs_.size(); ++i) {
+        const TabState& t = tabs_[i];
+        putLine(L"[tab]");
+        putLine(L"pane=" + std::to_wstring(t.pane));
+        putLine(L"locked=" + std::to_wstring(t.locked ? 1 : 0));
+        putLine(L"hist=" + std::to_wstring(t.histPos));
+        std::wstring hist = t.history.empty() ? t.dir : t.history[0];
+        for (size_t k = 1; k < t.history.size(); ++k) {
+            hist += L"|";
+            hist += t.history[k];
+        }
+        putLine(L"history=" + hist);
+    }
+    fclose(f);
+}
+
+// 启动恢复上次会话。命中且至少有一个分页则重建；否则沿用默认（1 窗格 + 默认目录）
+bool MainWindow::RestoreSession()
+{
+    // ---- 读盘 ----
+    std::wstring path = SessionFilePath();
+    FILE* f = _wfopen(path.c_str(), L"rb");
+    struct TabRec { int pane = 0; int locked = 0; int histPos = 0; std::vector<std::wstring> history; };
+    int paneCount = 1, tri = 1, sel = 0, sortCol = 0, sortAsc = 1;
+    int savedSideWidth = sideWidth_, windowMaximized = 0;
+    RECT savedWindowRect{};
+    bool hasSavedWindowRect = false;
+    std::vector<int> widths;
+    std::vector<TabRec> recs;
+    TabRec cur; bool inTab = false, ok = false;
+
+    if (f) {
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        std::string data; data.resize(sz > 0 ? sz : 0);
+        if (sz > 0) fread(&data[0], 1, sz, f);
+        fclose(f);
+        if (data.size() >= 3 && (unsigned char)data[0] == 0xEF &&
+            (unsigned char)data[1] == 0xBB && (unsigned char)data[2] == 0xBF)
+            data.erase(0, 3);
+        size_t pos = 0;
+        while (pos < data.size()) {
+            size_t eol = data.find('\n', pos);
+            std::string line = (eol == std::string::npos) ? data.substr(pos)
+                                                          : data.substr(pos, eol - pos);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            pos = (eol == std::string::npos) ? data.size() : eol + 1;
+            if (line.empty()) continue;
+            int wlen = MultiByteToWideChar(CP_UTF8, 0, line.data(), (int)line.size(), nullptr, 0);
+            if (wlen <= 0) continue;
+            std::wstring w(wlen, L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, line.data(), (int)line.size(), w.data(), wlen);
+            if (w == L"[tab]") { if (inTab) recs.push_back(cur); cur = TabRec(); inTab = true; continue; }
+            if (w.rfind(L"sort=", 0) == 0) { swscanf_s(w.c_str() + 5, L"%d,%d", &sortCol, &sortAsc); continue; }
+            if (w.rfind(L"panes=", 0) == 0) { swscanf_s(w.c_str() + 6, L"%d", &paneCount); continue; }
+            if (w.rfind(L"tri=", 0) == 0) { swscanf_s(w.c_str() + 4, L"%d", &tri); continue; }
+            if (w.rfind(L"sel=", 0) == 0) { swscanf_s(w.c_str() + 4, L"%d", &sel); continue; }
+            if (w.rfind(L"sideWidth=", 0) == 0) {
+                swscanf_s(w.c_str() + 10, L"%d", &savedSideWidth);
+                continue;
+            }
+            if (w.rfind(L"window=", 0) == 0) {
+                int left = 0, top = 0, right = 0, bottom = 0;
+                if (swscanf_s(w.c_str() + 7, L"%d,%d,%d,%d,%d",
+                              &left, &top, &right, &bottom, &windowMaximized) == 5 &&
+                    right > left && bottom > top) {
+                    savedWindowRect = { left, top, right, bottom };
+                    hasSavedWindowRect = true;
+                }
+                continue;
+            }
+            if (w.rfind(L"widths=", 0) == 0) {
+                std::wstring v = w.substr(7);
+                for (size_t p = 0; p <= v.size(); ) {
+                    size_t c = v.find(L',', p);
+                    std::wstring tok = (c == std::wstring::npos) ? v.substr(p) : v.substr(p, c - p);
+                    if (!tok.empty()) widths.push_back(_wtoi(tok.c_str()));
+                    if (c == std::wstring::npos) break;
+                    p = c + 1;
+                }
+                continue;
+            }
+            if (inTab) {
+                if (w.rfind(L"pane=", 0) == 0) cur.pane = _wtoi(w.c_str() + 5);
+                else if (w.rfind(L"locked=", 0) == 0) cur.locked = _wtoi(w.c_str() + 7);
+                else if (w.rfind(L"hist=", 0) == 0) cur.histPos = _wtoi(w.c_str() + 5);
+                else if (w.rfind(L"history=", 0) == 0) {
+                    std::wstring v = w.substr(8);
+                    cur.history.clear();
+                    if (v.empty()) cur.history.push_back(L"");
+                    for (size_t p = 0; p <= v.size(); ) {
+                        size_t c = v.find(L'|', p);
+                        cur.history.push_back((c == std::wstring::npos) ? v.substr(p) : v.substr(p, c - p));
+                        if (c == std::wstring::npos) break;
+                        p = c + 1;
+                    }
+                }
+            }
+        }
+        if (inTab) recs.push_back(cur);
+        ok = !recs.empty();
+    }
+
+    if (hasSavedWindowRect) {
+        WINDOWPLACEMENT placement{};
+        placement.length = sizeof(placement);
+        placement.showCmd = windowMaximized ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+        placement.rcNormalPosition = savedWindowRect;
+        if (!SetWindowPlacement(hwnd_, &placement))
+            SetWindowPos(hwnd_, nullptr, savedWindowRect.left, savedWindowRect.top,
+                         savedWindowRect.right - savedWindowRect.left,
+                         savedWindowRect.bottom - savedWindowRect.top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        startupShowCmd_ = windowMaximized ? SW_SHOWMAXIMIZED : SW_SHOW;
+    }
+    RECT clientRect{};
+    GetClientRect(hwnd_, &clientRect);
+    int maxSideWidth = clientRect.right - 260;
+    if (maxSideWidth < 150) maxSideWidth = 150;
+    sideWidth_ = (savedSideWidth < 150) ? 150 :
+                 (savedSideWidth > maxSideWidth ? maxSideWidth : savedSideWidth);
+
+    if (!ok) {
+        // 默认：沿用旧逻辑（favorites.txt 的 panes/tri + 默认目录）
+        ApplySavedLayout();
+        Navigate(L"C:\\Users\\Public", false);
+        return false;
+    }
+
+    // ---- 重建 ----
+    if (paneCount < 1) paneCount = 1;
+    if ((size_t)paneCount > recs.size()) paneCount = (int)recs.size(); // 每个窗格至少 1 分页
+    ResetAllPanes();
+    for (int i = 0; i < paneCount; ++i) {
+        panes_.emplace_back();
+        CreatePane(panes_.back());
+        if (i < (int)widths.size() && widths[i] > 0) panes_.back().width = widths[i];
+    }
+    for (const TabRec& r : recs) {
+        size_t pi = (size_t)r.pane;
+        if (pi >= panes_.size()) pi = panes_.size() - 1;
+        tabs_.emplace_back();
+        size_t idx = tabs_.size() - 1;
+        TabState& t = tabs_[idx];
+        t.pane = pi;
+        t.locked = (r.locked != 0);
+        t.history = r.history;
+        if (t.history.empty()) t.history.push_back(L"");
+        t.histPos = r.histPos;
+        if (t.histPos < 0) t.histPos = 0;
+        if ((size_t)t.histPos >= t.history.size()) t.histPos = (int)t.history.size() - 1;
+        t.dir = t.history[t.histPos];
+        t.pages->SetNotify([this]() { PostMessage(hwnd_, WM_APP_PAGELOADED, 0, 0); });
+        t.pages->OpenDirectory(t.dir, pageSize_);  // 预置加载器：之后切到该分页时 RequestPage 能命中
+        panes_[pi].tabs.push_back(idx);
+        std::wstring name = t.dir;
+        size_t s = name.find_last_of(L'\\');
+        if (s != std::wstring::npos && s + 1 < name.size()) name = name.substr(s + 1);
+        else if (name.size() >= 2 && name[1] == L':') name = name.substr(0, 2);
+        if (name.empty()) name = L"新建";
+        if (t.locked) name = L"[锁] " + name;
+        TCITEMW ti{};
+        ti.mask = TCIF_TEXT;
+        ti.pszText = const_cast<LPWSTR>(name.c_str());
+        SendMessageW(panes_[pi].tab, TCM_INSERTITEMW, panes_[pi].tabs.size() - 1, reinterpret_cast<LPARAM>(&ti));
+    }
+
+    // 去掉没有分页的空窗格（损坏的会话文件可能缺页），保证窗格连续
+    for (int i = (int)panes_.size() - 1; i >= 0; --i)
+        if (panes_[i].tabs.empty()) RemovePane(i);
+
+    // 排序 / 布局 / 品字形态
+    if (sortCol >= 0 && sortCol <= 3) { sortCol_ = sortCol; sortAsc_ = (sortAsc != 0); }
+    triLayout_ = (tri != 0) ? 1 : 0;
+    savedPaneCount_ = (int)panes_.size();
+
+    // 激活上次的分页
+    size_t act = (sel >= 0 && (size_t)sel < tabs_.size()) ? (size_t)sel : tabs_.size() - 1;
+    activeTab_ = act;
+    activePane_ = tabs_[act].pane;
+    SelectRightTab(act);
+    UpdateRightTabLabels();
+    Layout();
+    return true;
 }
 
 void MainWindow::SelectRightTab(size_t index)
@@ -1006,6 +1240,16 @@ static std::wstring FavoritesFilePath()
     return dir + L"\\favorites.txt";
 }
 
+std::wstring MainWindow::SessionFilePath()
+{
+    wchar_t buf[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    std::wstring dir(buf);
+    size_t s = dir.find_last_of(L'\\');
+    if (s != std::wstring::npos) dir.resize(s);
+    return dir + L"\\session.txt";
+}
+
 // 整个文件一次性读入并解析（不再用 1024 定长缓冲逐行 fgets——
 // 长路径的 UTF-8 多字节字符被拦腰截断会产生坏收藏项）。
 // 返回文件是否成功打开（内容可能为空）；out 收收藏路径。
@@ -1345,17 +1589,25 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
         TCHITTESTINFO ht{};
         ht.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         int idx = (int)SendMessageW(h, TCM_HITTEST, 0, reinterpret_cast<LPARAM>(&ht));
+        int pi = PaneOfTab(h);
         if (idx >= 0) {
             // 记录拖拽起点，但不拦截：继续走默认过程完成 tab 切换
-            for (size_t pi = 0; pi < panes_.size(); ++pi) {
-                if (panes_[pi].tab == h) {
-                    tabDragActive_ = true;
-                    tabDragPane_ = (int)pi;
-                    tabDragIndex_ = idx;
-                    SetCapture(h);
-                    break;
-                }
+            tabDragActive_ = true;
+            tabDragPane_ = pi;
+            tabDragIndex_ = idx;
+            SetCapture(h);
+        } else if (pi >= 0) {
+            // 分页栏空白区域：双击新建分页（不依赖 CS_DBLCLKS，自己测时间差）
+            DWORD now = GetMessageTime();
+            if (now - lastBlankClickTime_ <= (DWORD)GetDoubleClickTime() &&
+                abs(ht.pt.x - lastBlankClickPt_.x) <= GetSystemMetrics(SM_CXDOUBLECLK) &&
+                abs(ht.pt.y - lastBlankClickPt_.y) <= GetSystemMetrics(SM_CYDOUBLECLK)) {
+                lastBlankClickTime_ = 0;
+                AddRightTab(true, (size_t)pi);
+                return 0;
             }
+            lastBlankClickTime_ = now;
+            lastBlankClickPt_ = ht.pt;
         }
         break;
     }
@@ -1583,17 +1835,11 @@ LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         }
         std::wstring path;
         if (sel >= 0) path = PaneItemPath((size_t)pi, sel);
-        HMENU menu = CreatePopupMenu();
-        if (!path.empty())
-            AppendMenuW(menu, MF_STRING, 1, L"添加当前目录到收藏");
-        else
-            AppendMenuW(menu, MF_STRING, 1, L"添加此目录到收藏");
-        int addCmd = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                                      pt.x, pt.y, hwnd_, nullptr);
-        DestroyMenu(menu);
-        if (addCmd == 1) { OnAddFavorite(); return 0; }
-        if (shell::ShowContextMenu(hwnd_, path, path.empty() ? CurTab().dir : L"", pt))
+        bool addFavorite = false;
+        if (shell::ShowContextMenu(hwnd_, path, CurTab().dir, pt,
+                                  L"添加当前目录到收藏", addFavorite))
             RefreshList();
+        if (addFavorite) OnAddFavorite();
         return 0;
     }
     if (msg == WM_CHAR && wp == VK_DELETE) { /* Del 经 LVN_KEYDOWN 处理 */ }
@@ -1988,6 +2234,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         for (auto& t : tabs_) t.pages->Shutdown();
+        SaveSession();   // 记住这次打开的所有窗格/分页/历史，下次启动恢复
         PostQuitMessage(0);
         return 0;
     }

@@ -122,6 +122,7 @@ private:
 
     // 布局 / 交互
     int sideWidth_ = 220;          // 左侧面板宽度（可被分隔条拖动改变）
+    int startupShowCmd_ = SW_SHOW;
     bool draggingSplitter_ = false;
     int splitTop_ = 36;            // 分隔条可拖动的水平范围
     int splitBot_ = 0;
@@ -146,6 +147,8 @@ private:
     bool tabDragActive_ = false;        // 分页拖拽进行中
     int  tabDragPane_ = -1;             // 拖拽源窗格
     int  tabDragIndex_ = -1;            // 拖拽源窗格内的 tab 序号
+    DWORD lastBlankClickTime_ = 0;      // 分页栏空白区单击时间（双击检测用）
+    POINT lastBlankClickPt_ = {0, 0};   // 分页栏空白区单击位置（双击检测用）
 
     TabState& CurTab() { return tabs_[activeTab_]; }
     const TabState& CurTab() const { return tabs_[activeTab_]; }
@@ -163,6 +166,10 @@ private:
     TabState& PaneActiveTab(size_t pi); // 指定窗格当前显示的分页
     std::wstring PaneItemPath(size_t pi, int item); // 指定窗格某行的完整路径
     void ApplySavedLayout();            // 启动时恢复上次布局（默认倒品字形）
+    void ResetAllPanes();               // 销毁全部窗格/分页（启动恢复会话前清空）
+    static std::wstring SessionFilePath(); // 会话文件（与 favorites.txt 同目录）
+    void SaveSession();                 // 退出时保存全部分页/窗格/历史
+    bool RestoreSession();              // 启动时恢复上次会话（无则默认）；返回是否命中会话
     void SelectRightTab(size_t index);
     void SelectPane(size_t index);
     bool PaneHasDir(size_t paneIdx, const std::wstring& dir) const; // 该窗格是否已有同一目录的分页

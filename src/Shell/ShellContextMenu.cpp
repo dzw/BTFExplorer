@@ -6,10 +6,13 @@ namespace shell {
 
 static constexpr UINT CMD_FIRST = 1;
 static constexpr UINT CMD_LAST  = 0x7FFF;
+static constexpr UINT CMD_CUSTOM = CMD_LAST + 1;
 
 bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& menuDir,
-                     POINT ptScreen)
+                     POINT ptScreen, const std::wstring& customItem,
+                     bool& customItemSelected)
 {
+    customItemSelected = false;
     UniquePIDL pidl;
     ComPtr<IShellFolder> parent;
     PCUITEMID_CHILD child = nullptr;
@@ -49,9 +52,16 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
     if (!menu) return false;
     bool invoked = false;
     if (SUCCEEDED(cm->QueryContextMenu(menu, 0, CMD_FIRST, CMD_LAST, CMF_NORMAL))) {
+        if (!customItem.empty()) {
+            if (GetMenuItemCount(menu) > 0)
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING, CMD_CUSTOM, customItem.c_str());
+        }
         UINT cmd = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                     ptScreen.x, ptScreen.y, hwnd, nullptr);
-        if (cmd >= CMD_FIRST && cmd <= CMD_LAST) {
+        if (cmd == CMD_CUSTOM) {
+            customItemSelected = true;
+        } else if (cmd >= CMD_FIRST && cmd <= CMD_LAST) {
             CMINVOKECOMMANDINFOEX info = { sizeof(info) };
             info.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
             info.hwnd = hwnd;
