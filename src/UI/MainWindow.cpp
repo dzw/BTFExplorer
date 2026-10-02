@@ -28,6 +28,11 @@ static UINT GetTaskbarBroadcastMessage()
 // 自定义通知值：Edit 没有 EN_RETURN 常量，回车通知用这个
 static constexpr UINT EN_ADDR_RETURN = 0x1000;
 
+// 分隔条：kSplitGap 是真正留白的视觉宽度，kSplitHit 是鼠标命中区宽度
+// （命中区比留白宽，好抓；不改变布局）
+static constexpr int kSplitGap = 6;
+static constexpr int kSplitHit = 12;
+
 static LRESULT CALLBACK AddressProc(HWND h, UINT m, WPARAM wp, LPARAM lp); // 前向声明
 static LRESULT CALLBACK PaneTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp); // 分页拖拽 tab 子类化
 static LRESULT CALLBACK SideTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp);
@@ -1885,10 +1890,10 @@ void MainWindow::Layout()
     // 右侧多窗格网格布局：
     //   1 个：独占；2 个：左右；3 个：品/倒品（triLayout_）；4 个：田字形
     //   同排两个窗格的宽度按 Pane::width 比例分配（分隔条可拖）
-    int gx = sideW + 12;
+    int gx = sideW + kSplitGap;
     int gw = W - gx;
     int gh = listH;
-    const int S = 12; // 分隔条厚度
+    const int S = kSplitGap; // 分隔条厚度（视觉留白）
     paneRects_.clear();
     splitPairs_.clear();
 
@@ -2378,7 +2383,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                 auto& pr = splitPairs_[k];
                 int edge = paneRects_[pr.first].right;
                 int top = paneRects_[pr.first].top, bot = paneRects_[pr.first].bottom;
-                if (x >= edge && x <= edge + 12 && yy >= top && yy <= bot) {
+                if (x >= edge && x <= edge + kSplitHit && yy >= top && yy <= bot) {
                     paneSplitDragging_ = true;
                     paneSplitIndex_ = (int)k;
                     SetCapture(hwnd_);
@@ -2387,7 +2392,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                 }
             }
         }
-        if (x >= sideWidth_ && x <= sideWidth_ + 12 && yy >= splitTop_ && yy <= splitBot_) {
+        if (x >= sideWidth_ && x <= sideWidth_ + kSplitHit && yy >= splitTop_ && yy <= splitBot_) {
             draggingSplitter_ = true;
             SetCapture(hwnd_);
             SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
@@ -2406,7 +2411,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                 int leftEdge = paneRects_[a].left;
                 int want = x - leftEdge;
                 int minW = 160;
-                int maxW = paneRects_[b].right - minW - 12;
+                int maxW = paneRects_[b].right - minW - kSplitGap;
                 if (want < minW) want = minW;
                 if (want > maxW) want = maxW;
                 int delta = want - panes_[a].width;
@@ -2446,14 +2451,14 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             for (size_t k = 0; k < splitPairs_.size(); ++k) {
                 auto& pr = splitPairs_[k];
                 int edge = paneRects_[pr.first].right;
-                if (pt.x >= edge && pt.x <= edge + 12 &&
+                if (pt.x >= edge && pt.x <= edge + kSplitHit &&
                     pt.y >= paneRects_[pr.first].top && pt.y <= paneRects_[pr.first].bottom) {
                     SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
                     return TRUE;
                 }
             }
         }
-        if (pt.x >= sideWidth_ && pt.x <= sideWidth_ + 12 &&
+        if (pt.x >= sideWidth_ && pt.x <= sideWidth_ + kSplitHit &&
             pt.y >= splitTop_ && pt.y <= splitBot_) {
             SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
             return TRUE;
