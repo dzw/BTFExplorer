@@ -20,6 +20,12 @@ enum {
     IDC_TRI_PINTOP = 1024, IDC_TRI_PINDOWN = 1025,
     IDC_MENU_FILTERS = 1026,
     IDC_TREE_SYNC = 1027,
+    IDC_SETTINGS = 1028,
+    // 设置对话框内的控件
+    IDC_OPT_GRID = 1040, IDC_OPT_PANES1 = 1041, IDC_OPT_PANES2 = 1042,
+    IDC_OPT_PANES3 = 1043, IDC_OPT_PANES4 = 1044,
+    IDC_OPT_TRI_TOP = 1045, IDC_OPT_TRI_DOWN = 1046,
+    IDC_OPT_PAGESIZE = 1047, IDC_OPT_STARTUP = 1048,
     // 分页标题右键菜单：关闭 / 关闭其他 / 关闭右边 / 锁定
     IDC_TM_LOCK = 1030, IDC_TM_CLOSE = 1031, IDC_TM_OTHERS = 1032, IDC_TM_RIGHT = 1033,
 };
@@ -90,6 +96,8 @@ private:
     void OnColumnClick(int col);
     void ApplyCurrentSort();
     void InsertColumns(HWND list);   // 给指定列表建列
+    DWORD ListExStyle() const;       // 文件列表的扩展样式（受“显示网格线”开关控制）
+    void ApplyListStyles();          // 把当前开关状态套用到所有窗格列表
     int  EnsureIcon(FileEntry& e);       // 系统图像列表索引（懒取并缓存）
     bool SelectedPath(std::wstring& out) const;
     std::wstring CurrentPagePath(int item) const; // item -> full path
@@ -122,7 +130,7 @@ private:
     HWND status_ = nullptr, pagerPrev_ = nullptr, pagerNext_ = nullptr;
     HWND pagerFirst_ = nullptr, pagerLast_ = nullptr, pagerLabel_ = nullptr, pagerSize_ = nullptr;
     HWND btnBack_ = nullptr, btnFwd_ = nullptr, btnUp_ = nullptr, btnRefresh_ = nullptr;
-    HWND btnMenuFilters_ = nullptr;
+    HWND btnMenuFilters_ = nullptr, btnSettings_ = nullptr;
     HIMAGELIST imgList_ = nullptr;   // 取不到系统图像列表时的自建兜底
     HIMAGELIST sysImgs_ = nullptr;   // 系统图像列表（所有窗格共用）
     HFONT uiFont_ = nullptr;
@@ -197,4 +205,5 @@ private:
     size_t pageSize_ = 100;
     int sortCol_ = 0;      // 排序列（全局记住）
     bool sortAsc_ = true;
+    bool showGridLines_ = true;  // 文件列表是否画网格线（设置界面可关）
 };

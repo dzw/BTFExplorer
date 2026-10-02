@@ -30,8 +30,8 @@ static constexpr UINT EN_ADDR_RETURN = 0x1000;
 
 // 分隔条：kSplitGap 是真正留白的视觉宽度，kSplitHit 是鼠标命中区宽度
 // （命中区比留白宽，好抓；不改变布局）
-static constexpr int kSplitGap = 6;
-static constexpr int kSplitHit = 12;
+static constexpr int kSplitGap = 3;
+static constexpr int kSplitHit = 6;
 
 static LRESULT CALLBACK AddressProc(HWND h, UINT m, WPARAM wp, LPARAM lp); // 前向声明
 static LRESULT CALLBACK PaneTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp); // 分页拖拽 tab 子类化
@@ -362,6 +362,22 @@ void MainWindow::SyncTreeToCurrentTab(bool showErrors)
     directoryTree_.SyncToPath(CurTab().dir, showErrors);
 }
 
+// 文件列表的扩展样式。网格线由设置界面的“显示网格线”开关控制，关掉时
+// 只保留整行选中 + 双缓冲（双缓冲是拖分隔条不闪的前提，不能去掉）。
+DWORD MainWindow::ListExStyle() const
+{
+    DWORD style = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER;
+    if (showGridLines_) style |= LVS_EX_GRIDLINES;
+    return style;
+}
+
+// 把当前开关状态套用到所有窗格列表（切换网格线时用）
+void MainWindow::ApplyListStyles()
+{
+    for (auto& p : panes_)
+        if (p.list) ListView_SetExtendedListViewStyle(p.list, ListExStyle());
+}
+
 void MainWindow::CreatePane(Pane& p)
 {
     HINSTANCE hInst = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd_, GWLP_HINSTANCE));
@@ -379,8 +395,7 @@ void MainWindow::CreatePane(Pane& p)
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_OWNERDATA | LVS_SHAREIMAGELISTS,
         0, 0, 0, 0, p.tab, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_LIST_BASE + p.tag)), hInst, nullptr);
     if (uiFont_) SendMessageW(p.list, WM_SETFONT, (WPARAM)uiFont_, TRUE);
-    ListView_SetExtendedListViewStyle(p.list,
-        LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_GRIDLINES);
+    ListView_SetExtendedListViewStyle(p.list, ListExStyle());
     BuildImageList(p.list);
     InsertColumns(p.list);
 
@@ -1848,8 +1863,14 @@ void MainWindow::Layout()
     int W = rc.right, H = rc.bottom;
     int y = 0;
 
+    // 摆子控件时**不要**逐个立即重绘。原来用 MoveWindow(..., TRUE)，拖分隔条时每个
+    // 鼠标移动都会让几十个控件各自同步重绘一次，中间态全被看见 -> 整个界面闪动。
+    // 现在只挪不画（SWP_NOREDRAW），全部摆好后由末尾一次 RedrawWindow 统一刷新，
+    // 和资源管理器的做法一致：只呈现最终状态。
     auto place = [&](HWND h, int x, int yy, int w, int hh) {
-        MoveWindow(h, x, yy, w, hh, TRUE);
+        if (h == nullptr) return;
+        SetWindowPos(h, nullptr, x, yy, w, hh,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
     };
 
     // 工具栏行
@@ -1975,6 +1996,10 @@ void MainWindow::Layout()
 
     // 状态栏自动布局
     SendMessageW(status_, WM_SIZE, 0, MAKELPARAM(W, H));
+
+    // 所有子控件都已就位，统一重绘一次（只呈现最终状态，避免中间态闪动）
+    RedrawWindow(hwnd_, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN);
 }
 
 LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
@@ -2415,10 +2440,13 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                 if (want < minW) want = minW;
                 if (want > maxW) want = maxW;
                 int delta = want - panes_[a].width;
-                panes_[a].width += delta;
-                panes_[b].width -= delta;
-                if (panes_[b].width < 160) panes_[b].width = 160;
-                Layout();
+                // 宽度没变（例如鼠标停在最小/最大限制处）就不做全量重排
+                if (delta != 0) {
+                    panes_[a].width += delta;
+                    panes_[b].width -= delta;
+                    if (panes_[b].width < 160) panes_[b].width = 160;
+                    Layout();
+                }
             }
             return 0;
         }
@@ -2426,8 +2454,8 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             int x = static_cast<int>(GET_X_LPARAM(lp));
             RECT rc; GetClientRect(hwnd_, &rc);
             int maxW = rc.right - 260;                 // 右侧至少留 260px
-            sideWidth_ = (x < 150) ? 150 : (x > maxW ? maxW : x);
-            Layout();
+            int nw = (x < 150) ? 150 : (x > maxW ? maxW : x);
+            if (nw != sideWidth_) { sideWidth_ = nw; Layout(); }
             return 0;
         }
         break;
