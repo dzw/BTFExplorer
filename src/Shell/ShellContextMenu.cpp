@@ -1,12 +1,55 @@
 #include "ShellContextMenu.h"
 #include "ShellUtil.h"
 #include <shlobj.h>
+#include <cwctype>
 
 namespace shell {
 
 static constexpr UINT CMD_FIRST = 1;
 static constexpr UINT CMD_LAST  = 0x7FFF;
 static constexpr UINT CMD_CUSTOM = CMD_LAST + 1;
+
+static bool IsHiddenProviderItem(const std::wstring& text)
+{
+    // static const wchar_t* const hiddenNames[] = {
+    //     L"snagit", L"techsmith", L"tortoisesvn",
+    //     L"百度云", L"百度网盘", L"baidu",
+    //     L"腾讯云", L"腾讯微云", L"微云", L"tencent", L"weiyun"
+    // };
+    // std::wstring normalized = text;
+    // for (wchar_t& ch : normalized)
+    //     ch = static_cast<wchar_t>(std::towlower(ch));
+    // for (const wchar_t* name : hiddenNames) {
+    //     if (normalized.find(name) != std::wstring::npos)
+    //         return true;
+    // }
+    return false;
+}
+
+static bool FilterProviderItems(HMENU menu)
+{
+    bool removed = false;
+    for (int i = GetMenuItemCount(menu) - 1; i >= 0; --i) {
+        wchar_t text[512]{};
+        MENUITEMINFOW item{};
+        item.cbSize = sizeof(item);
+        item.fMask = MIIM_STRING | MIIM_SUBMENU;
+        item.dwTypeData = text;
+        item.cch = static_cast<UINT>(std::size(text));
+        if (!GetMenuItemInfoW(menu, static_cast<UINT>(i), TRUE, &item))
+            continue;
+
+        if (IsHiddenProviderItem(text)) {
+            DeleteMenu(menu, static_cast<UINT>(i), MF_BYPOSITION);
+            removed = true;
+        } else if (item.hSubMenu && FilterProviderItems(item.hSubMenu)) {
+            if (GetMenuItemCount(item.hSubMenu) == 0)
+                DeleteMenu(menu, static_cast<UINT>(i), MF_BYPOSITION);
+            removed = true;
+        }
+    }
+    return removed;
+}
 
 bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& menuDir,
                      POINT ptScreen, const std::wstring& customItem,
@@ -52,6 +95,7 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
     if (!menu) return false;
     bool invoked = false;
     if (SUCCEEDED(cm->QueryContextMenu(menu, 0, CMD_FIRST, CMD_LAST, CMF_NORMAL))) {
+        FilterProviderItems(menu);
         if (!customItem.empty()) {
             if (GetMenuItemCount(menu) > 0)
                 AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
