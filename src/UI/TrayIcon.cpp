@@ -39,9 +39,14 @@ void TrayIcon::Remove()
 
 bool TrayIcon::RestoreAfterTaskbarRestart()
 {
-    if (!visible_) return true;
+    if (!visible_) return true;   // 图标本来就不在通知区，无需恢复
     registered_ = false;
-    return AddToShell();
+    if (!AddToShell()) {
+        WriteAppLog(L"TRAY_ICON restore after taskbar restart FAILED");
+        return false;
+    }
+    WriteAppLog(L"TRAY_ICON restored after taskbar restart (icon is resident again)");
+    return true;
 }
 
 bool TrayIcon::AddToShell()
