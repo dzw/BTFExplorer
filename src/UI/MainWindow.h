@@ -19,6 +19,7 @@ enum {
     IDC_TRI_PINTOP = 1024, IDC_TRI_PINDOWN = 1025,
     IDC_MENU_FILTERS = 1026,
     IDC_TREE_SYNC = 1027,
+    IDC_TRAY_OPEN = 1040, IDC_TRAY_SETTINGS = 1041, IDC_TRAY_EXIT = 1042,
     // 分页标题右键菜单：关闭 / 关闭其他 / 关闭右边 / 锁定
     IDC_TM_LOCK = 1030, IDC_TM_CLOSE = 1031, IDC_TM_OTHERS = 1032, IDC_TM_RIGHT = 1033,
 };
@@ -106,9 +107,15 @@ private:
     void OnRename();
     void OnClipboard(bool cut, bool copyOnly = false);
     void OnPaste();
+    bool AddTrayIcon();
+    void RemoveTrayIcon();
+    void ShowFromTray();
+    void ShowTrayMenu();
+    void OpenSettings();
 
     // 数据
     HWND hwnd_ = nullptr, address_ = nullptr;
+    bool trayIconAdded_ = false;
     DirectoryTree directoryTree_;
     HWND tab_ = nullptr, favList_ = nullptr, btnTreeSync_ = nullptr; // 左侧 Tab / 收藏 / 树同步
     HWND btnNewTab_ = nullptr;                 // 激活窗格的 “+” 新增分页按钮

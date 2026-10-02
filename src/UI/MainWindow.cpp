@@ -6,6 +6,7 @@
 #include <shellapi.h>
 #include <cstdio>
 #include <algorithm>
+#include <vector>
 
 #pragma comment(lib, "Comctl32.lib")
 #pragma comment(lib, "Shlwapi.lib")
@@ -14,6 +15,16 @@ static constexpr int WM_APP_PAGELOADED = WM_APP + 1;
 static constexpr UINT WM_APP_WIN_E = WM_APP + 2;   // Win+E 被拦截后激活本窗口
 static constexpr int WM_APP_CLOSE_TAB = WM_APP + 3; // 中键点击分页 -> 延后到主窗口关闭
 static constexpr int WM_APP_MOVE_TAB  = WM_APP + 4; // 拖拽分页 -> 延后到主窗口移动
+static constexpr UINT WM_APP_TRAYICON = WM_APP + 5;
+static constexpr UINT TRAY_ICON_ID = 1;
+static constexpr wchar_t STARTUP_RUN_KEY[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static constexpr wchar_t STARTUP_VALUE_NAME[] = L"PagedExplorer";
+
+static UINT TaskbarCreatedMessage()
+{
+    static const UINT message = RegisterWindowMessageW(L"TaskbarCreated");
+    return message;
+}
 
 // 自定义通知值：Edit 没有 EN_RETURN 常量，回车通知用这个
 static constexpr UINT EN_ADDR_RETURN = 0x1000;
@@ -60,9 +71,183 @@ MainWindow* MainWindow::Create(HINSTANCE hInst)
 
     self->BuildChildren();
     self->RestoreSession();     // 恢复上次会话（窗格/分页/历史），无会话则默认 1 窗格
+    if (!self->AddTrayIcon()) {
+        MessageBoxW(self->hwnd_, L"无法创建系统托盘图标。最小化到托盘和托盘菜单将不可用。",
+                    L"PagedExplorer", MB_OK | MB_ICONWARNING);
+    }
     ShowWindow(self->hwnd_, self->startupShowCmd_);
     UpdateWindow(self->hwnd_);
     return self;
+}
+
+bool MainWindow::AddTrayIcon()
+{
+    NOTIFYICONDATAW data{};
+    data.cbSize = sizeof(data);
+    data.hWnd = hwnd_;
+    data.uID = TRAY_ICON_ID;
+    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    data.uCallbackMessage = WM_APP_TRAYICON;
+    data.hIcon = reinterpret_cast<HICON>(GetClassLongPtrW(hwnd_, GCLP_HICONSM));
+    if (!data.hIcon) data.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wcscpy_s(data.szTip, L"PagedExplorer");
+    if (!Shell_NotifyIconW(NIM_ADD, &data)) return false;
+
+    data.uVersion = NOTIFYICON_VERSION_4;
+    Shell_NotifyIconW(NIM_SETVERSION, &data);
+    trayIconAdded_ = true;
+    return true;
+}
+
+void MainWindow::RemoveTrayIcon()
+{
+    if (!trayIconAdded_) return;
+    NOTIFYICONDATAW data{};
+    data.cbSize = sizeof(data);
+    data.hWnd = hwnd_;
+    data.uID = TRAY_ICON_ID;
+    Shell_NotifyIconW(NIM_DELETE, &data);
+    trayIconAdded_ = false;
+}
+
+void MainWindow::ShowFromTray()
+{
+    ShowWindow(hwnd_, IsIconic(hwnd_) ? SW_RESTORE : SW_SHOW);
+    SetForegroundWindow(hwnd_);
+    if (activePane_ < panes_.size()) SetFocus(CurList());
+}
+
+void MainWindow::ShowTrayMenu()
+{
+    HMENU menu = CreatePopupMenu();
+    if (!menu) {
+        MessageBoxW(hwnd_, L"无法创建托盘菜单。", L"PagedExplorer", MB_OK | MB_ICONERROR);
+        return;
+    }
+    AppendMenuW(menu, MF_STRING, IDC_TRAY_OPEN, L"打开应用");
+    AppendMenuW(menu, MF_STRING, IDC_TRAY_SETTINGS, L"设置");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, IDC_TRAY_EXIT, L"退出");
+
+    POINT pt{};
+    GetCursorPos(&pt);
+    SetForegroundWindow(hwnd_);
+    UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                                  pt.x, pt.y, 0, hwnd_, nullptr);
+    DestroyMenu(menu);
+    if (command) PostMessageW(hwnd_, WM_COMMAND, MAKEWPARAM(command, 0), 0);
+}
+
+static bool GetStartupEnabled(bool& enabled)
+{
+    enabled = false;
+    HKEY key = nullptr;
+    LSTATUS status = RegOpenKeyExW(HKEY_CURRENT_USER, STARTUP_RUN_KEY, 0, KEY_QUERY_VALUE, &key);
+    if (status == ERROR_FILE_NOT_FOUND) return true;
+    if (status != ERROR_SUCCESS) {
+        wchar_t message[160];
+        swprintf_s(message, L"读取 Windows 启动设置失败（错误码 %ld）。", status);
+        MessageBoxW(nullptr, message, L"PagedExplorer", MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    DWORD type = 0;
+    status = RegQueryValueExW(key, STARTUP_VALUE_NAME, nullptr, &type, nullptr, nullptr);
+    RegCloseKey(key);
+    if (status == ERROR_FILE_NOT_FOUND) return true;
+    if (status != ERROR_SUCCESS) {
+        wchar_t message[160];
+        swprintf_s(message, L"读取 Windows 启动设置失败（错误码 %ld）。", status);
+        MessageBoxW(nullptr, message, L"PagedExplorer", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    enabled = type == REG_SZ || type == REG_EXPAND_SZ;
+    return true;
+}
+
+static bool SetStartupEnabled(bool enabled)
+{
+    HKEY key = nullptr;
+    LSTATUS status = RegCreateKeyExW(HKEY_CURRENT_USER, STARTUP_RUN_KEY, 0, nullptr, 0,
+                                     KEY_SET_VALUE, nullptr, &key, nullptr);
+    if (status != ERROR_SUCCESS) {
+        wchar_t message[160];
+        swprintf_s(message, L"打开 Windows 启动设置失败（错误码 %ld）。", status);
+        MessageBoxW(nullptr, message, L"PagedExplorer", MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    if (enabled) {
+        std::vector<wchar_t> path(512);
+        DWORD length = 0;
+        for (;;) {
+            length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+            if (length == 0) {
+                status = GetLastError();
+                break;
+            }
+            if (length < path.size() - 1) {
+                std::wstring command = L"\"" + std::wstring(path.data(), length) + L"\"";
+                status = RegSetValueExW(key, STARTUP_VALUE_NAME, 0, REG_SZ,
+                    reinterpret_cast<const BYTE*>(command.c_str()),
+                    static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+                break;
+            }
+            if (path.size() >= 32768) {
+                status = ERROR_INSUFFICIENT_BUFFER;
+                break;
+            }
+            path.resize(path.size() * 2);
+        }
+    } else {
+        status = RegDeleteValueW(key, STARTUP_VALUE_NAME);
+        if (status == ERROR_FILE_NOT_FOUND) status = ERROR_SUCCESS;
+    }
+    RegCloseKey(key);
+
+    if (status != ERROR_SUCCESS) {
+        wchar_t message[160];
+        swprintf_s(message, L"保存 Windows 启动设置失败（错误码 %ld）。", status);
+        MessageBoxW(nullptr, message, L"PagedExplorer", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    return true;
+}
+
+void MainWindow::OpenSettings()
+{
+    bool startupEnabled = false;
+    if (!GetStartupEnabled(startupEnabled)) return;
+
+    TASKDIALOG_BUTTON buttons[] = {
+        { IDOK, L"保存" },
+        { IDCANCEL, L"取消" },
+    };
+    BOOL verificationChecked = startupEnabled ? TRUE : FALSE;
+    TASKDIALOGCONFIG config{};
+    config.cbSize = sizeof(config);
+    config.hwndParent = hwnd_;
+    config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION;
+    if (startupEnabled) config.dwFlags |= TDF_VERIFICATION_FLAG_CHECKED;
+    config.pszWindowTitle = L"PagedExplorer 设置";
+    config.pszMainInstruction = L"启动选项";
+    config.pszContent = L"选择是否在登录 Windows 时自动运行本应用。";
+    config.cButtons = _countof(buttons);
+    config.pButtons = buttons;
+    config.nDefaultButton = IDOK;
+    config.pszVerificationText = L"Windows 启动时运行本应用";
+    config.pfVerificationFlag = &verificationChecked;
+
+    int button = 0;
+    HRESULT hr = TaskDialogIndirect(&config, &button, nullptr, nullptr);
+    if (FAILED(hr)) {
+        wchar_t message[160];
+        swprintf_s(message, L"无法打开设置窗口（错误码 0x%08X）。",
+                   static_cast<unsigned int>(hr));
+        MessageBoxW(hwnd_, message, L"PagedExplorer", MB_OK | MB_ICONERROR);
+        return;
+    }
+    if (button == IDOK) SetStartupEnabled(verificationChecked != FALSE);
 }
 
 void MainWindow::BuildChildren()
@@ -1761,9 +1946,36 @@ LRESULT CALLBACK MainWindow::ListViewProcStatic(HWND h, UINT m, WPARAM wp, LPARA
 
 LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (msg == TaskbarCreatedMessage()) {
+        trayIconAdded_ = false;
+        if (!AddTrayIcon()) {
+            MessageBoxW(hwnd_, L"系统托盘恢复后无法重新创建 PagedExplorer 图标。",
+                        L"PagedExplorer", MB_OK | MB_ICONWARNING);
+        }
+        return 0;
+    }
+
     switch (msg) {
     case WM_SIZE:
-        if (wp != SIZE_MINIMIZED) Layout();
+        if (wp == SIZE_MINIMIZED) {
+            ShowWindow(hwnd_, SW_HIDE);
+        } else {
+            Layout();
+        }
+        return 0;
+
+    case WM_APP_TRAYICON:
+        switch (LOWORD(lp)) {
+        case WM_RBUTTONUP:
+        case WM_CONTEXTMENU:
+            ShowTrayMenu();
+            return 0;
+        case WM_LBUTTONDBLCLK:
+        case NIN_SELECT:
+        case NIN_KEYSELECT:
+            ShowFromTray();
+            return 0;
+        }
         return 0;
 
     case WM_KEYDOWN: // Ctrl+方向键：切换右侧分页
@@ -1955,6 +2167,15 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         case IDC_MENU_FILTERS:
             shell::OpenContextMenuFilterSettings(hwnd_);
             return 0;
+        case IDC_TRAY_OPEN:
+            ShowFromTray();
+            return 0;
+        case IDC_TRAY_SETTINGS:
+            OpenSettings();
+            return 0;
+        case IDC_TRAY_EXIT:
+            DestroyWindow(hwnd_);
+            return 0;
         case IDC_FIRST: CurTab().curPage = 0; RefreshList(); return 0;
         case IDC_PREV:  if (CurTab().curPage > 0) { --CurTab().curPage; RefreshList(); } return 0;
         case IDC_NEXT:
@@ -2134,6 +2355,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
     }
 
     case WM_DESTROY:
+        RemoveTrayIcon();
         for (auto& t : tabs_) t.pages->Shutdown();
         SaveSession();   // 记住这次打开的所有窗格/分页/历史，下次启动恢复
         PostQuitMessage(0);

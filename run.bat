@@ -7,5 +7,5 @@ cd /d "%~dp0"
 @REM    call build.bat || exit /b 1
 @REM  )
 
-start "" build\PagedExplorer.exe
+start "" bin\Release\PagedExplorer.exe
 endlocal

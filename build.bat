@@ -24,3 +24,6 @@ if not "%BUILD_RESULT%"=="0" (
 )
 echo Build OK: bin\Release\PagedExplorer.exe
 endlocal
+
+
+@REM  D:\msys64\ucrt64\bin\cmake.EXE -DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=TRUE --no-warn-unused-cli -S D:/APrj/BinDir -B d:/APrj/BinDir/build -G "Visual Studio 17 2022" -T host=x64 -A x64
