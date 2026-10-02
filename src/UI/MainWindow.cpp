@@ -264,7 +264,7 @@ void MainWindow::SyncTreeToCurrentTab(bool showErrors)
             nodePath += L'\\';
     }
 
-    size_t pos = nodePath.size();
+    size_t pos = target.size() >= 3 && target[2] == L'\\' ? 3 : 2;
     while (pos < target.size()) {
         while (pos < target.size() && target[pos] == L'\\') ++pos;
         if (pos >= target.size()) break;
@@ -278,15 +278,20 @@ void MainWindow::SyncTreeToCurrentTab(bool showErrors)
         ExpandTreeNode(node);
         TreeView_Expand(tree_, node, TVE_EXPAND);
         HTREEITEM child = nullptr;
+        std::wstring actualChildPath;
         for (HTREEITEM candidate = TreeView_GetChild(tree_, node); candidate;
              candidate = TreeView_GetNextSibling(tree_, candidate)) {
+            wchar_t childName[512]{};
             TVITEMW item{};
             item.hItem = candidate;
-            item.mask = TVIF_PARAM;
-            if (!TreeView_GetItem(tree_, &item) || !item.lParam) continue;
-            const auto* candidatePath = reinterpret_cast<const std::wstring*>(item.lParam);
-            if (_wcsicmp(candidatePath->c_str(), childPath.c_str()) == 0) {
+            item.mask = TVIF_TEXT | TVIF_PARAM;
+            item.pszText = childName;
+            item.cchTextMax = static_cast<int>(std::size(childName));
+            if (!TreeView_GetItem(tree_, &item)) continue;
+            if (_wcsicmp(childName, component.c_str()) == 0) {
                 child = candidate;
+                if (item.lParam)
+                    actualChildPath = *reinterpret_cast<const std::wstring*>(item.lParam);
                 break;
             }
         }
@@ -303,7 +308,10 @@ void MainWindow::SyncTreeToCurrentTab(bool showErrors)
             insert.item.iImage = insert.item.iSelectedImage = icon >= 0 ? icon : 0;
             insert.item.cChildren = 1;
             child = TreeView_InsertItem(tree_, &insert);
-            if (!child) delete insertedPath;
+            if (child)
+                actualChildPath = childPath;
+            else
+                delete insertedPath;
         }
         if (!child) {
             if (!showErrors) return;
@@ -312,7 +320,7 @@ void MainWindow::SyncTreeToCurrentTab(bool showErrors)
             return;
         }
         node = child;
-        nodePath = std::move(childPath);
+        nodePath = actualChildPath.empty() ? std::move(childPath) : std::move(actualChildPath);
         pos = end;
     }
 
