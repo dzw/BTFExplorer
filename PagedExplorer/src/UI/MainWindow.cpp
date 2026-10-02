@@ -997,26 +997,40 @@ static std::wstring FavoritesFilePath()
     return dir + L"\\favorites.txt";
 }
 
-void MainWindow::LoadFavorites()
+// 整个文件一次性读入并解析（不再用 1024 定长缓冲逐行 fgets——
+// 长路径的 UTF-8 多字节字符被拦腰截断会产生坏收藏项）。
+// 返回文件是否成功打开（内容可能为空）；out 收收藏路径。
+bool MainWindow::ReadFavoritesFromDisk(std::vector<std::wstring>& out)
 {
-    favorites_.clear();
+    out.clear();
     std::wstring path = FavoritesFilePath();
     FILE* f = nullptr;
-    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) { RefreshFavoritesList(); return; }
-    // UTF-8 逐行读取；配置行 sort=/panes=/tri= 可出现在任意位置
-    char line[1024];
-    while (fgets(line, sizeof(line), f)) {
-        size_t n = strlen(line);
-        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
-        if (!n) continue;
-        int wlen = MultiByteToWideChar(CP_UTF8, 0, line, (int)n, nullptr, 0);
-        if (wlen <= 0) continue;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return false;
+
+    std::string data;
+    char buf[8192];
+    size_t r;
+    while ((r = fread(buf, 1, sizeof(buf), f)) > 0) data.append(buf, r);
+    fclose(f);
+
+    // 去掉 UTF-8 BOM
+    if (data.size() >= 3 && (unsigned char)data[0] == 0xEF &&
+        (unsigned char)data[1] == 0xBB && (unsigned char)data[2] == 0xBF)
+        data.erase(0, 3);
+
+    // 按行解析；配置行 sort=/panes=/tri= 可出现在任意位置
+    size_t pos = 0;
+    while (pos < data.size()) {
+        size_t eol = data.find('\n', pos);
+        if (eol == std::string::npos) eol = data.size();
+        std::string line = data.substr(pos, eol - pos);
+        pos = eol + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (line.empty()) continue;
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, line.data(), (int)line.size(), nullptr, 0);
+        if (wlen <= 0) continue; // 无效 UTF-8 行跳过，不产生坏数据
         std::wstring w(wlen, L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, line, (int)n, w.data(), wlen);
-        // 去掉 UTF-8 BOM：文件以 BOM 开头时首字符是 U+FEFF，
-        // 否则 "sort=" 配置行会被误判成一条收藏路径（收藏夹出现 "sort=1,1" 的根源）
-        if (!w.empty() && w[0] == 0xFEFF) w.erase(0, 1);
-        // 配置行不作为收藏项（兼容旧版污染的数据）
+        MultiByteToWideChar(CP_UTF8, 0, line.data(), (int)line.size(), w.data(), wlen);
         if (w.rfind(L"sort=", 0) == 0) {
             int col = 0, asc = 1;
             swscanf_s(w.c_str() + 5, L"%d,%d", &col, &asc);
@@ -1035,14 +1049,42 @@ void MainWindow::LoadFavorites()
             triLayout_ = t ? 1 : 0;
             continue;
         }
-        favorites_.push_back(std::move(w));
+        out.push_back(std::move(w));
     }
-    fclose(f);
+    return true;
+}
+
+void MainWindow::LoadFavorites()
+{
+    // 先解析到临时列表，成功才替换内存——文件打不开/解析失败时
+    // 绝不清空现有收藏（旧版在这里 clear，之后任意一次保存就把空列表写盘，
+    // 收藏永久丢失）。
+    std::vector<std::wstring> parsed;
+    if (ReadFavoritesFromDisk(parsed))
+        favorites_ = std::move(parsed);
     RefreshFavoritesList();
 }
 
 void MainWindow::SaveFavorites()
 {
+    // 防丢失保护：内存列表为空但磁盘上还有收藏时（加载失败/时序竞态），
+    // 先从磁盘取回，避免把收藏写没。
+    if (favorites_.empty()) {
+        std::vector<std::wstring> disk;
+        if (ReadFavoritesFromDisk(disk) && !disk.empty())
+            favorites_ = std::move(disk);
+    }
+    SaveFavoritesCore(false);
+}
+
+void MainWindow::SaveFavoritesCore(bool allowEmptyFavorites)
+{
+    // 非显式删除场景下拒绝把有收藏的文件覆盖成空文件
+    if (!allowEmptyFavorites && favorites_.empty()) {
+        std::vector<std::wstring> disk;
+        if (ReadFavoritesFromDisk(disk) && !disk.empty())
+            return; // 磁盘还有收藏且内存为空：保持磁盘原样
+    }
     std::wstring path = FavoritesFilePath();
     FILE* f = nullptr;
     if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return;
@@ -1109,7 +1151,8 @@ void MainWindow::OnRemoveFavorite()
     }());
     delete p;
     favorites_.erase(favorites_.begin() + sel);
-    SaveFavorites();
+    // 显式删除：允许写空文件（绕过防丢失保护，否则删掉的最后一条会被“恢复”）
+    SaveFavoritesCore(favorites_.empty());
     RefreshFavoritesList();
 }
 

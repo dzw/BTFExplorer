@@ -95,7 +95,9 @@ private:
 
     // 收藏
     void LoadFavorites();
-    void SaveFavorites();
+    void SaveFavorites();          // 保存（带防丢失保护：内存为空时保住磁盘收藏）
+    void SaveFavoritesCore(bool allowEmptyFavorites); // 显式删除最后一条时传 true
+    bool ReadFavoritesFromDisk(std::vector<std::wstring>& out); // 整文件读入，解析成功才返回 true
     void RefreshFavoritesList();
     void OnAddFavorite();
     void OnRemoveFavorite();
