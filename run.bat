@@ -1,3 +1,4 @@
+pskill PagedExplorer
 @echo off
 setlocal
 cd /d "%~dp0"
@@ -8,4 +9,5 @@ cd /d "%~dp0"
 @REM  )
 
 start "" bin\Release\PagedExplorer.exe
+echo Log file: "%LOCALAPPDATA%\PagedExplorer\PagedExplorer.log"
 endlocal

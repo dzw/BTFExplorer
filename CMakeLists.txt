@@ -13,8 +13,10 @@ add_executable(PagedExplorer WIN32
     src/Shell/ShellFileOperation.cpp
     src/Shell/ShellUtil.cpp
     src/Pagination/PageManager.cpp
+    src/Util/AppLog.cpp
     src/UI/DirectoryTree.cpp
     src/UI/MainWindow.cpp
+    src/UI/TrayIcon.cpp
 )
 
 target_compile_features(PagedExplorer PRIVATE cxx_std_20)

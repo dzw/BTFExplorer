@@ -6,3 +6,4 @@ build.bat
 /obj/
 /bin/
 /cmake-build/
+/.idea/

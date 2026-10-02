@@ -3,7 +3,9 @@
 #include <objbase.h>
 #include <shellapi.h>
 #include <cstdio>
+#include <vector>
 #include "../UI/MainWindow.h"
+#include "../Util/AppLog.h"
 
 #pragma comment(linker, "/manifestdependency:\"type='win32' \
 name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
@@ -39,6 +41,13 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
 {
+    std::vector<wchar_t> exePath(32768);
+    DWORD exeLength = GetModuleFileNameW(nullptr, exePath.data(),
+                                        static_cast<DWORD>(exePath.size()));
+    WriteAppLog(exeLength > 0 && exeLength < exePath.size()
+        ? (L"START exe=" + std::wstring(exePath.data(), exeLength)).c_str()
+        : L"START exe path unavailable");
+
     // 解析命令行：取第一个参数（自己处理引号/空白，比手工去引号可靠——
     // 诸如 "D:\dir" 后跟空格的命令行，靠 back()==L'"' 判断会漏删引号）
     std::wstring target;
@@ -54,6 +63,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
     // 单实例：若 PagedExplorer 已在运行，把参数转发给已有实例并激活后退出
     HANDLE hMutex = CreateMutexW(nullptr, FALSE, L"PagedExplorer_SingleInstance");
     if (hMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        WriteAppLog(L"SECOND_INSTANCE forwarding or activating the existing instance");
         for (int i = 0; i < 20; ++i) {            // 等待首个实例创建好窗口
             HWND h = FindWindowW(L"PagedExplorerMain", nullptr);
             if (h) {
@@ -75,7 +85,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
     }
 
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    if (FAILED(hr)) { if (hMutex) CloseHandle(hMutex); return 1; }
+    if (FAILED(hr)) {
+        WriteAppLog(L"CoInitializeEx failed");
+        if (hMutex) CloseHandle(hMutex);
+        return 1;
+    }
 
     // 加速键：焦点在列表/地址栏等子控件上时也能生效（Alt+消息不会自动转到主窗口）
     //   Alt+方向键导航，Alt+1~4 切窗格数量，Alt+小键盘8/2 切品字形态
@@ -108,19 +122,28 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
 
         // 安装全局低层键盘钩子，拦截 Win+E 替换系统资源管理器
         g_hHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, hInst, 0);
+        WriteAppLog(g_hHook ? L"KEYBOARD_HOOK installed" : L"KEYBOARD_HOOK installation failed");
 
         MSG msg;
-        while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        BOOL messageResult = 0;
+        while ((messageResult = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
             // 先让加速键处理（Alt+方向键），未命中再正常分发
             if (!TranslateAcceleratorW(w->Hwnd(), hAccel, &msg)) {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
+        if (messageResult == 0) {
+            WriteAppLog(L"MESSAGE_LOOP received WM_QUIT");
+        } else {
+            WriteAppLog(L"MESSAGE_LOOP GetMessage failed");
+        }
         ret = 0;
 
         if (g_hHook) { UnhookWindowsHookEx(g_hHook); g_hHook = nullptr; }
         g_mainHwnd = nullptr;
+    } else {
+        WriteAppLog(L"STARTUP_FAILED MainWindow::Create returned null");
     }
 
     if (hAccel) DestroyAcceleratorTable(hAccel);
