@@ -664,21 +664,30 @@ void MainWindow::InsertColumns(HWND list)
 // 去掉结尾多余 \（根盘符 "C:\" 除外）
 static std::wstring NormalizePath(const std::wstring& in)
 {
-    if (in.empty()) return in;
+    // 保险：截断嵌入的 '\0'（转发路径异常时末尾可能带 '\0'，后续拼 pattern 会失效）
+    std::wstring s(in.c_str());
+    // 去掉首尾的引号与空白（外部启动器可能传 "D:\dir" + 空格 之类的形式）
+    {
+        size_t b = s.find_first_not_of(L" \t\"\"");
+        size_t e = s.find_last_not_of(L" \t\"\"");
+        if (b == std::wstring::npos) return {};
+        s = s.substr(b, e - b + 1);
+    }
+    if (s.empty()) return s;
     std::wstring out;
-    out.reserve(in.size());
+    out.reserve(s.size());
     size_t i = 0;
-    if (in.size() >= 2 && in[0] == L'\\' && in[1] == L'\\') { // UNC 前缀保留
+    if (s.size() >= 2 && s[0] == L'\\' && s[1] == L'\\') { // UNC 前缀保留
         out += L"\\\\";
         i = 2;
     }
     bool prevSlash = false;
-    for (; i < in.size(); ++i) {
-        if (in[i] == L'\\' || in[i] == L'/') {
+    for (; i < s.size(); ++i) {
+        if (s[i] == L'\\' || s[i] == L'/') {
             if (!prevSlash) out += L'\\';
             prevSlash = true;
         } else {
-            out += in[i];
+            out += s[i];
             prevSlash = false;
         }
     }
@@ -1847,8 +1856,9 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
     case WM_COPYDATA: { // 二次实例转发来的路径
         auto* cds = reinterpret_cast<COPYDATASTRUCT*>(lp);
         if (cds && cds->lpData && cds->cbData > 0) {
-            std::wstring path(static_cast<const wchar_t*>(cds->lpData),
-                              cds->cbData / sizeof(wchar_t));
+            // 发送方 cbData 含结尾 '\0'；按 C 字符串构造，别把 '\0' 带进字符串，
+            // 否则 dir 末尾的嵌入 '\0' 会让枚举 pattern 变成目录本身（列表只剩目录一项）
+            std::wstring path(static_cast<const wchar_t*>(cds->lpData));
             OpenTarget(path);
             if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
             // 与 WM_APP_WIN_E 相同：借前台线程输入权限置前

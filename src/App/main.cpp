@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <objbase.h>
+#include <cstdio>
 #include "../UI/MainWindow.h"
 
 #pragma comment(linker, "/manifestdependency:\"type='win32' \
@@ -37,13 +38,21 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
 {
+    // 解析命令行：取第一个参数（自己处理引号/空白，比手工去引号可靠——
+    // 诸如 "D:\dir" 后跟空格的命令行，靠 back()==L'"' 判断会漏删引号）
+    std::wstring target;
+    {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (argv) {
+            if (argc > 1 && argv[1]) target = argv[1];
+            LocalFree(argv);
+        }
+    }
+
     // 单实例：若 PagedExplorer 已在运行，把参数转发给已有实例并激活后退出
     HANDLE hMutex = CreateMutexW(nullptr, FALSE, L"PagedExplorer_SingleInstance");
     if (hMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-        std::wstring target = lpCmdLine ? lpCmdLine : L"";
-        // 去掉引号
-        if (!target.empty() && target.front() == L'"') target.erase(0, 1);
-        if (!target.empty() && target.back() == L'"') target.pop_back();
         for (int i = 0; i < 20; ++i) {            // 等待首个实例创建好窗口
             HWND h = FindWindowW(L"PagedExplorerMain", nullptr);
             if (h) {
