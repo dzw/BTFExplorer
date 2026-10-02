@@ -77,6 +77,7 @@ MainWindow* MainWindow::Create(HINSTANCE hInst)
     if (!self->hwnd_) { delete self; return nullptr; }
 
     self->BuildChildren();
+    self->EnsureTrayIcon();     // 图标常驻：启动就挂上，窗口显示与否通知区都有
     self->RestoreSession();     // 恢复上次会话（窗格/分页/历史），无会话则默认 1 窗格
     self->SyncPagerSizeCombo(); // 会话里恢复的“每页项数”要反映到分页栏下拉框
     ShowWindow(self->hwnd_, self->startupShowCmd_);
@@ -84,9 +85,18 @@ MainWindow* MainWindow::Create(HINSTANCE hInst)
     return self;
 }
 
+void MainWindow::EnsureTrayIcon()
+{
+    if (trayIcon_.Visible()) return;   // 已经常驻了
+    bool added = trayIcon_.Add(hwnd_,
+        reinterpret_cast<HICON>(GetClassLongPtrW(hwnd_, GCLP_HICONSM)));
+    if (!added)
+        WriteAppLog(L"TRAY_ICON ensure failed (Shell_NotifyIcon NIM_ADD failed)");
+}
+
 void MainWindow::ShowFromTray()
 {
-    trayIcon_.Remove();
+    // 图标常驻：这里不再 Remove，否则窗口一显示图标就从通知区消失了
     ShowWindow(hwnd_, IsIconic(hwnd_) ? SW_RESTORE : SW_SHOW);
     BringWindowToTop(hwnd_);
     SetForegroundWindow(hwnd_);
@@ -96,9 +106,8 @@ void MainWindow::ShowFromTray()
 void MainWindow::HideToTray()
 {
     WriteAppLog(L"HIDE_TO_TRAY requested");
-    bool added = trayIcon_.Add(hwnd_,
-        reinterpret_cast<HICON>(GetClassLongPtrW(hwnd_, GCLP_HICONSM)));
-    if (!added) {
+    EnsureTrayIcon();                  // 常驻图标；万一之前掉了（例如任务栏重启）这里补上
+    if (!trayIcon_.Visible()) {
         WriteAppLog(L"HIDE_TO_TRAY failed because tray icon creation failed");
         MessageBoxW(hwnd_, L"无法创建系统托盘图标，应用仍保持打开。",
                     L"PagedExplorer", MB_OK | MB_ICONWARNING);
@@ -2348,7 +2357,6 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
 
     // Win+E 被全局钩子拦截后，激活本窗口（还原最小化 / 置前）
     case WM_APP_WIN_E: {
-        trayIcon_.Remove();
         if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
         else if (!IsWindowVisible(hwnd_)) ShowWindow(hwnd_, SW_SHOW);
         // SetForegroundWindow 只有在前台进程才有权限；Win+E 时前台属于

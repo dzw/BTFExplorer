@@ -42,7 +42,8 @@ target_link_libraries(PagedExplorer PRIVATE
 )
 
 if(MSVC)
-    target_compile_options(PagedExplorer PRIVATE /W4 /sdl /utf-8)
+    # /FS：允许多个 cl.exe 并行写同一个 pdb（MSBuild 默认 /m 并行，否则偶发 C1041）
+    target_compile_options(PagedExplorer PRIVATE /W4 /sdl /utf-8 /FS)
 endif()
 
 set_target_properties(PagedExplorer PROPERTIES

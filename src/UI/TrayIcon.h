@@ -14,6 +14,7 @@ public:
 
     bool Add(HWND owner, HICON icon);
     void Remove();
+    bool Visible() const { return visible_; }   // 图标是否已在通知区
     bool RestoreAfterTaskbarRestart();
     TrayAction HandleCallback(LPARAM event);
 

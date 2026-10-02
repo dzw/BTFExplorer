@@ -114,6 +114,7 @@ private:
     void OnPaste();
     void HideToTray();
     void ShowFromTray();
+    void EnsureTrayIcon();      // 图标常驻：确保通知区里有图标（幂等）
     void OpenSettings();
 
     // 数据
