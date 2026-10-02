@@ -79,6 +79,7 @@ MainWindow* MainWindow::Create(HINSTANCE hInst)
 
     self->BuildChildren();
     self->RestoreSession();     // 恢复上次会话（窗格/分页/历史），无会话则默认 1 窗格
+    self->SyncPagerSizeCombo(); // 会话里恢复的“每页项数”要反映到分页栏下拉框
     ShowWindow(self->hwnd_, self->startupShowCmd_);
     UpdateWindow(self->hwnd_);
     return self;
@@ -185,39 +186,215 @@ static bool SetStartupEnabled(bool enabled)
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// 设置
+// ---------------------------------------------------------------------------
+// TaskDialog 最多只能带一个勾选项，装不下多个开关，所以像“重命名”一样自建一个
+// 对话框窗口，把所有开关集中到一处。
+static bool g_setGrid = true;      // 显示网格线
+static int  g_setPanes = 1;        // 窗格数量 1~4
+static int  g_setTri = 1;          // 三窗格排列：0=品字形 1=倒品字形
+static int  g_setPageSel = 1;      // 每页项数在 combo 里的下标
+static bool g_setStartup = false;  // 开机自启动
+static bool g_setApplied = false;  // 用户是否按了“确定”
+
+static const int kSetPageSizes[4] = { 50, 100, 200, 500 };
+
+// 一组连续 radio 里当前选中的是第几个（都没选时返回 0）
+static int RadioChecked(HWND parent, int firstId, int count)
+{
+    for (int i = 0; i < count; ++i)
+        if (Button_GetCheck(GetDlgItem(parent, firstId + i)) == BST_CHECKED)
+            return i;
+    return 0;
+}
+
+// 注意：勾选状态要放在 **wParam**（即用 Button_SetCheck）。BM_SETCHECK 的 MSDN
+// 措辞写成 lParam，但实际按 lParam 传会被静默忽略，表现为“设了没反应”。
+static void SetRadio(HWND parent, int id, bool on)
+{
+    Button_SetCheck(GetDlgItem(parent, id), on ? BST_CHECKED : BST_UNCHECKED);
+}
+
+// 只有三窗格时“排列方式”才有意义
+static void UpdateTriEnabled(HWND dlg)
+{
+    bool on = (RadioChecked(dlg, IDC_OPT_PANES1, 4) + 1) == 3;
+    EnableWindow(GetDlgItem(dlg, IDC_OPT_TRI_TOP), on);
+    EnableWindow(GetDlgItem(dlg, IDC_OPT_TRI_DOWN), on);
+}
+
+static LRESULT CALLBACK SettingsDlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
+{
+    switch (m) {
+    case WM_COMMAND: {
+        int id = LOWORD(wp);
+        if (id == IDOK || id == IDCANCEL) {
+            if (id == IDOK) {
+                g_setGrid    = (Button_GetCheck(GetDlgItem(h, IDC_OPT_GRID)) == BST_CHECKED);
+                g_setPanes   = RadioChecked(h, IDC_OPT_PANES1, 4) + 1;
+                g_setTri     = RadioChecked(h, IDC_OPT_TRI_TOP, 2);
+                g_setPageSel = (int)SendMessageW(GetDlgItem(h, IDC_OPT_PAGESIZE),
+                                                 CB_GETCURSEL, 0, 0);
+                if (g_setPageSel < 0 || g_setPageSel > 3) g_setPageSel = 1;
+                g_setStartup = (Button_GetCheck(GetDlgItem(h, IDC_OPT_STARTUP)) == BST_CHECKED);
+                g_setApplied = true;
+            }
+            DestroyWindow(h);
+            return 0;
+        }
+        if (id >= IDC_OPT_PANES1 && id <= IDC_OPT_PANES4) { UpdateTriEnabled(h); return 0; }
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+
 void MainWindow::OpenSettings()
 {
     bool startupEnabled = false;
     if (!GetStartupEnabled(startupEnabled)) return;
 
-    TASKDIALOG_BUTTON buttons[] = {
-        { IDOK, L"保存" },
-        { IDCANCEL, L"取消" },
-    };
-    BOOL verificationChecked = startupEnabled ? TRUE : FALSE;
-    TASKDIALOGCONFIG config{};
-    config.cbSize = sizeof(config);
-    config.hwndParent = hwnd_;
-    config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION;
-    if (startupEnabled) config.dwFlags |= TDF_VERIFICATION_FLAG_CHECKED;
-    config.pszWindowTitle = L"PagedExplorer 设置";
-    config.pszMainInstruction = L"启动选项";
-    config.pszContent = L"选择是否在登录 Windows 时自动运行本应用。";
-    config.cButtons = _countof(buttons);
-    config.pButtons = buttons;
-    config.nDefaultButton = IDOK;
-    config.pszVerificationText = L"Windows 启动时运行本应用";
+    // 取当前值作为初始状态
+    g_setGrid    = showGridLines_;
+    g_setPanes   = (panes_.empty() ? 1 : (int)panes_.size());
+    if (g_setPanes < 1) g_setPanes = 1;
+    if (g_setPanes > 4) g_setPanes = 4;
+    g_setTri     = (triLayout_ == 0) ? 0 : 1;
+    g_setPageSel = 1;
+    for (int i = 0; i < 4; ++i)
+        if ((int)pageSize_ == kSetPageSizes[i]) { g_setPageSel = i; break; }
+    g_setStartup = startupEnabled;
+    g_setApplied = false;
 
-    int button = 0;
-    HRESULT hr = TaskDialogIndirect(&config, &button, nullptr, &verificationChecked);
-    if (FAILED(hr)) {
-        wchar_t message[160];
-        swprintf_s(message, L"无法打开设置窗口（错误码 0x%08X）。",
-                   static_cast<unsigned int>(hr));
-        MessageBoxW(hwnd_, message, L"PagedExplorer", MB_OK | MB_ICONERROR);
-        return;
+    const wchar_t* DLG_CLASS = L"PagedExplorerSettingsBox";
+    HINSTANCE hInst = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd_, GWLP_HINSTANCE));
+    static ATOM cls = 0;
+    if (!cls) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = SettingsDlgProc;
+        wc.hInstance = hInst;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        wc.lpszClassName = DLG_CLASS;
+        cls = RegisterClassW(&wc);
     }
-    if (button == IDOK) SetStartupEnabled(verificationChecked != FALSE);
+
+    const int DW = 404, DH = 286;
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, DLG_CLASS, L"设置",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, 0, 0, DW, DH, hwnd_, nullptr, hInst, nullptr);
+    if (!dlg) return;
+    RECT rm; GetWindowRect(hwnd_, &rm);
+    SetWindowPos(dlg, nullptr,
+        (rm.left + rm.right) / 2 - DW / 2, (rm.top + rm.bottom) / 2 - DH / 2,
+        0, 0, SWP_NOSIZE | SWP_NOZORDER);
+
+    auto lab = [&](const wchar_t* t, int x, int y, int w) {
+        HWND h = CreateWindowExW(0, WC_STATICW, t, WS_CHILD | WS_VISIBLE, x, y, w, 20,
+                                 dlg, nullptr, hInst, nullptr);
+        if (uiFont_) SendMessageW(h, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+        return h;
+    };
+    auto chk = [&](const wchar_t* t, int id, int x, int y) {
+        HWND h = CreateWindowExW(0, WC_BUTTONW, t,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
+            x, y, 260, 22, dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), hInst, nullptr);
+        if (uiFont_) SendMessageW(h, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+        return h;
+    };
+    auto rad = [&](const wchar_t* t, int id, int x, int y, bool groupStart) {
+        DWORD st = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON;
+        if (groupStart) st |= WS_GROUP;
+        HWND h = CreateWindowExW(0, WC_BUTTONW, t, st, x, y, 120, 22, dlg,
+                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), hInst, nullptr);
+        if (uiFont_) SendMessageW(h, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+        return h;
+    };
+
+    // ---- 列表 ----
+    lab(L"列表", 20, 12, 200);
+    HWND cGrid = chk(L"显示网格线（关闭后列表不再画横竖线）", IDC_OPT_GRID, 34, 34);
+    Button_SetCheck(cGrid, g_setGrid ? BST_CHECKED : BST_UNCHECKED);
+
+    lab(L"文件列表每页项数：", 34, 62, 150);
+    HWND cPage = CreateWindowExW(0, WC_COMBOBOXW, L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | CBS_DROPDOWNLIST,
+        190, 60, 120, 200, dlg,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_OPT_PAGESIZE)), hInst, nullptr);
+    if (uiFont_) SendMessageW(cPage, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+    for (int n : kSetPageSizes) {
+        wchar_t buf[32]; wsprintfW(buf, L"%d / 页", n);
+        SendMessageW(cPage, CB_ADDSTRING, 0, (LPARAM)buf);
+    }
+    SendMessageW(cPage, CB_SETCURSEL, g_setPageSel, 0);
+
+    // ---- 窗格布局 ----
+    lab(L"窗格布局", 20, 96, 200);
+    lab(L"窗格数量：", 34, 120, 80);
+    for (int i = 0; i < 4; ++i) {
+        wchar_t t[8]; wsprintfW(t, L"%d", i + 1);
+        rad(t, IDC_OPT_PANES1 + i, 118 + i * 42, 118, i == 0);
+        SetRadio(dlg, IDC_OPT_PANES1 + i, g_setPanes == i + 1);
+    }
+    lab(L"三窗格排列：", 34, 148, 90);
+    rad(L"品字形（1 上 2 下）", IDC_OPT_TRI_TOP, 130, 146, true);
+    rad(L"倒品字形（2 上 1 下）", IDC_OPT_TRI_DOWN, 268, 146, false);
+    SetRadio(dlg, IDC_OPT_TRI_TOP, g_setTri == 0);
+    SetRadio(dlg, IDC_OPT_TRI_DOWN, g_setTri == 1);
+
+    // ---- 启动 ----
+    lab(L"启动", 20, 182, 200);
+    HWND cStart = chk(L"Windows 启动时运行本应用", IDC_OPT_STARTUP, 34, 204);
+    Button_SetCheck(cStart, g_setStartup ? BST_CHECKED : BST_UNCHECKED);
+
+    HWND ok = CreateWindowExW(0, WC_BUTTONW, L"确定",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_DEFPUSHBUTTON,
+        214, DH - 40, 84, 26, dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), hInst, nullptr);
+    CreateWindowExW(0, WC_BUTTONW, L"取消",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        306, DH - 40, 84, 26, dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), hInst, nullptr);
+    if (uiFont_) SendMessageW(ok, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+    SendMessageW(dlg, DM_SETDEFID, IDOK, 0);
+    UpdateTriEnabled(dlg);
+
+    ShowWindow(dlg, SW_SHOW);
+    EnableWindow(hwnd_, FALSE); // 模态
+
+    MSG m;
+    while (IsWindow(dlg) && GetMessageW(&m, nullptr, 0, 0) > 0) {
+        if (m.message == WM_KEYDOWN && (m.wParam == VK_RETURN || m.wParam == VK_ESCAPE)
+            && (GetParent(m.hwnd) == dlg || m.hwnd == dlg)) {
+            SendMessageW(dlg, WM_COMMAND,
+                MAKEWPARAM(m.wParam == VK_RETURN ? IDOK : IDCANCEL, 0), 0);
+            continue;
+        }
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
+    }
+    EnableWindow(hwnd_, TRUE);
+    SetFocus(CurList());
+
+    if (!g_setApplied) return;   // 点了取消，什么都不改
+
+    // ---- 应用改动 ----
+    if (g_setGrid != showGridLines_) {
+        showGridLines_ = g_setGrid;
+        ApplyListStyles();
+    }
+    if (g_setStartup != startupEnabled)
+        SetStartupEnabled(g_setStartup);
+
+    int newSize = kSetPageSizes[g_setPageSel];
+    if (newSize != (int)pageSize_) {
+        pageSize_ = (size_t)newSize;
+        SyncPagerSizeCombo();   // 同步分页栏的下拉框
+        CurTab().curPage = 0;
+        Navigate(CurTab().dir, false);
+    }
+    if (g_setTri != triLayout_)
+        SetTriLayout(g_setTri);
+    if (g_setPanes != (int)panes_.size())
+        SetPaneCount(g_setPanes);
 }
 
 void MainWindow::BuildChildren()
@@ -242,6 +419,7 @@ void MainWindow::BuildChildren()
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"↑", IDC_UP, &btnUp_);
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"刷新", IDC_REFRESH, &btnRefresh_);
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"菜单过滤词", IDC_MENU_FILTERS, &btnMenuFilters_);
+    mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"设置", IDC_SETTINGS, &btnSettings_);
     mk(WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, WC_EDITW, L"", IDC_ADDRESS, &address_);
     // 子类化地址栏：原过程存 GWLP_USERDATA，回车跳转靠 AddressProc
     SetWindowLongPtrW(address_, GWLP_USERDATA,
@@ -376,6 +554,18 @@ void MainWindow::ApplyListStyles()
 {
     for (auto& p : panes_)
         if (p.list) ListView_SetExtendedListViewStyle(p.list, ListExStyle());
+}
+
+// 每页项数变化或从会话恢复后，让分页栏的下拉框跟上（否则显示的还是旧档位）
+void MainWindow::SyncPagerSizeCombo()
+{
+    if (!pagerSize_) return;
+    for (int i = 0; i < 4; ++i)
+        if ((int)pageSize_ == kSetPageSizes[i]) {
+            SendMessageW(pagerSize_, CB_SETCURSEL, i, 0);
+            return;
+        }
+    SendMessageW(pagerSize_, CB_SETCURSEL, 1, 0);
 }
 
 void MainWindow::CreatePane(Pane& p)
@@ -604,6 +794,9 @@ void MainWindow::SaveSession()
     putLine(L"tri=" + std::to_wstring(triLayout_));
     putLine(L"sel=" + std::to_wstring(activeTab_));
     putLine(L"sideWidth=" + std::to_wstring(sideWidth_));
+    // 设置界面里的开关也要记住，重启后继续生效
+    putLine(L"grid=" + std::to_wstring(showGridLines_ ? 1 : 0));
+    putLine(L"pageSize=" + std::to_wstring(pageSize_));
     // 记录窗口位置/尺寸。
     // 非最大化/最小化时改用 GetWindowRect 取“真实屏幕矩形”，这样能正确捕获
     // Aero Snap（Win+←/→）后的半屏位置/尺寸；若用 GetWindowPlacement 的
@@ -733,6 +926,16 @@ bool MainWindow::RestoreSession()
                     if (c == std::wstring::npos) break;
                     p = c + 1;
                 }
+                continue;
+            }
+            if (w.rfind(L"grid=", 0) == 0) {
+                showGridLines_ = (_wtoi(w.c_str() + 5) != 0);
+                continue;
+            }
+            if (w.rfind(L"pageSize=", 0) == 0) {
+                int v = _wtoi(w.c_str() + 9);
+                // 只接受下拉框里真实存在的档位，避免手改文件后把分页搞坏
+                if (v == 50 || v == 100 || v == 200 || v == 500) pageSize_ = (size_t)v;
                 continue;
             }
             if (inTab) {
@@ -1878,10 +2081,13 @@ void MainWindow::Layout()
     place(btnFwd_,   48, y + 4, 40, 26);
     place(btnUp_,    92, y + 4, 40, 26);
     place(btnRefresh_,136, y + 4, 50, 26);
-    int filterButtonX = W - 110;
+    int filterButtonX = W - 190;              // 菜单过滤词按钮左缘（要给右侧“设置”腾位）
     if (filterButtonX < 274) filterButtonX = 274;
+    int settingsX = W - 82;                  // “设置”按钮固定贴右边
+    if (settingsX < filterButtonX + 112) settingsX = filterButtonX + 112;
     place(address_, 194, y + 6, filterButtonX - 198, 24);
     place(btnMenuFilters_, filterButtonX, y + 4, 106, 26);
+    place(btnSettings_, settingsX, y + 4, 76, 26);
     y += 36;
 
     // 状态栏占据底部一条，先量出它的高度，分页栏放在它上面
@@ -2320,6 +2526,9 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         case IDC_REFRESH: RefreshList(); return 0;
         case IDC_MENU_FILTERS:
             shell::OpenContextMenuFilterSettings(hwnd_);
+            return 0;
+        case IDC_SETTINGS:
+            OpenSettings();
             return 0;
         case IDC_FIRST: CurTab().curPage = 0; RefreshList(); return 0;
         case IDC_PREV:  if (CurTab().curPage > 0) { --CurTab().curPage; RefreshList(); } return 0;

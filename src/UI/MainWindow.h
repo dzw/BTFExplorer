@@ -98,6 +98,7 @@ private:
     void InsertColumns(HWND list);   // 给指定列表建列
     DWORD ListExStyle() const;       // 文件列表的扩展样式（受“显示网格线”开关控制）
     void ApplyListStyles();          // 把当前开关状态套用到所有窗格列表
+    void SyncPagerSizeCombo();       // 每页项数变化/恢复后，同步分页栏下拉框
     int  EnsureIcon(FileEntry& e);       // 系统图像列表索引（懒取并缓存）
     bool SelectedPath(std::wstring& out) const;
     std::wstring CurrentPagePath(int item) const; // item -> full path
