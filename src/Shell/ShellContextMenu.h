@@ -11,4 +11,7 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
                      POINT ptScreen, const std::wstring& customItem,
                      bool& customItemSelected);
 
+// Opens the editable UTF-8 filter list in Notepad, creating it with defaults if needed.
+bool OpenContextMenuFilterSettings(HWND owner);
+
 } // namespace shell

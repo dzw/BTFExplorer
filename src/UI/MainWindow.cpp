@@ -20,6 +20,7 @@ static constexpr UINT EN_ADDR_RETURN = 0x1000;
 
 static LRESULT CALLBACK AddressProc(HWND h, UINT m, WPARAM wp, LPARAM lp); // 前向声明
 static LRESULT CALLBACK PaneTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp); // 分页拖拽 tab 子类化
+static LRESULT CALLBACK SideTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp);
 
 // ListView 列
 enum { COL_NAME = 0, COL_TYPE, COL_SIZE, COL_MTIME };
@@ -86,6 +87,7 @@ void MainWindow::BuildChildren()
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"→", IDC_FORWARD, &btnFwd_);
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"↑", IDC_UP, &btnUp_);
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"刷新", IDC_REFRESH, &btnRefresh_);
+    mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"菜单过滤词", IDC_MENU_FILTERS, &btnMenuFilters_);
     mk(WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, WC_EDITW, L"", IDC_ADDRESS, &address_);
     // 子类化地址栏：原过程存 GWLP_USERDATA，回车跳转靠 AddressProc
     SetWindowLongPtrW(address_, GWLP_USERDATA,
@@ -139,6 +141,9 @@ void MainWindow::CreateSidePanel()
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | TCS_TABS,
         0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TAB)), hInst, nullptr);
     if (uiFont_) SendMessageW(tab_, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+    WNDPROC tabOld = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+        tab_, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&SideTabProc)));
+    SetWindowLongPtrW(tab_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(tabOld));
 
     auto addTab = [&](const wchar_t* text, int id) {
         TCITEMW ti{};
@@ -152,6 +157,10 @@ void MainWindow::CreateSidePanel()
 
     // 树和收藏列表都是 tab_ 的子窗口，显示由 SwitchSideTab 控制
     CreateTree();
+    btnTreeSync_ = CreateWindowExW(0, WC_BUTTONW, L"定位",
+        WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
+        0, 0, 0, 0, tab_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TREE_SYNC)), hInst, nullptr);
+    if (uiFont_) SendMessageW(btnTreeSync_, WM_SETFONT, (WPARAM)uiFont_, TRUE);
     favList_ = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
         WS_CHILD | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER | LVS_SINGLESEL,
         0, 0, 0, 0, tab_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_FAVLIST)), hInst, nullptr);
@@ -167,6 +176,7 @@ void MainWindow::SwitchSideTab(int index)
 {
     // 显示/隐藏 tab 页内容（树、收藏列表都是 tab_ 的子窗口）
     ShowWindow(tree_, index == 0 ? SW_SHOW : SW_HIDE);
+    ShowWindow(btnTreeSync_, index == 0 ? SW_SHOW : SW_HIDE);
     ShowWindow(favList_, index == 1 ? SW_SHOW : SW_HIDE);
     SendMessageW(tab_, TCM_SETCURSEL, index, 0);
     if (index == 1) LoadFavorites();
@@ -205,6 +215,111 @@ void MainWindow::CreateTree()
         SHGetFileInfoW(L"C:\\", 0, &fi, sizeof(fi), SHGFI_SYSICONINDEX | SHGFI_SMALLICON));
     if (sys)
         TreeView_SetImageList(tree_, sys, TVSIL_NORMAL);
+}
+
+void MainWindow::SyncTreeToCurrentTab(bool showErrors)
+{
+    std::wstring target = CurTab().dir;
+    if (target.empty()) return;
+    for (wchar_t& ch : target)
+        if (ch == L'/') ch = L'\\';
+    if (target.rfind(L"\\\\?\\UNC\\", 0) == 0)
+        target = L"\\\\" + target.substr(8);
+    else if (target.rfind(L"\\\\?\\", 0) == 0 || target.rfind(L"\\??\\", 0) == 0)
+        target.erase(0, 4);
+
+    HTREEITEM node = nullptr;
+    for (HTREEITEM root = TreeView_GetRoot(tree_); root; root = TreeView_GetNextSibling(tree_, root)) {
+        TVITEMW item{};
+        item.hItem = root;
+        item.mask = TVIF_PARAM;
+        if (!TreeView_GetItem(tree_, &item) || !item.lParam) continue;
+        const auto* rootPath = reinterpret_cast<const std::wstring*>(item.lParam);
+        std::wstring comparableRoot = *rootPath;
+        for (wchar_t& ch : comparableRoot)
+            if (ch == L'/') ch = L'\\';
+        if (comparableRoot.size() >= 2 && comparableRoot[1] == L':' &&
+            target.size() >= 2 && target[1] == L':' &&
+            _wcsnicmp(target.c_str(), comparableRoot.c_str(), 2) == 0) {
+            node = root;
+            break;
+        }
+    }
+
+    if (!node) {
+        if (!showErrors) return;
+        MessageBoxW(hwnd_, L"当前路径不在目录树的本地磁盘范围内。", L"同步目录树",
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    std::wstring nodePath;
+    {
+        TVITEMW item{};
+        item.hItem = node;
+        item.mask = TVIF_PARAM;
+        if (!TreeView_GetItem(tree_, &item) || !item.lParam) return;
+        nodePath = *reinterpret_cast<const std::wstring*>(item.lParam);
+        if (nodePath.size() == 2 && nodePath[1] == L':')
+            nodePath += L'\\';
+    }
+
+    size_t pos = nodePath.size();
+    while (pos < target.size()) {
+        while (pos < target.size() && target[pos] == L'\\') ++pos;
+        if (pos >= target.size()) break;
+        size_t end = target.find(L'\\', pos);
+        if (end == std::wstring::npos) end = target.size();
+        std::wstring component = target.substr(pos, end - pos);
+        std::wstring childPath = nodePath;
+        if (!childPath.empty() && childPath.back() != L'\\') childPath += L'\\';
+        childPath += component;
+
+        ExpandTreeNode(node);
+        TreeView_Expand(tree_, node, TVE_EXPAND);
+        HTREEITEM child = nullptr;
+        for (HTREEITEM candidate = TreeView_GetChild(tree_, node); candidate;
+             candidate = TreeView_GetNextSibling(tree_, candidate)) {
+            TVITEMW item{};
+            item.hItem = candidate;
+            item.mask = TVIF_PARAM;
+            if (!TreeView_GetItem(tree_, &item) || !item.lParam) continue;
+            const auto* candidatePath = reinterpret_cast<const std::wstring*>(item.lParam);
+            if (_wcsicmp(candidatePath->c_str(), childPath.c_str()) == 0) {
+                child = candidate;
+                break;
+            }
+        }
+
+        if (!child && GetFileAttributesW(childPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            int icon = shell::SysIconIndexForEntry(childPath, true);
+            TVINSERTSTRUCTW insert{};
+            insert.hParent = node;
+            insert.hInsertAfter = TVI_SORT;
+            insert.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_IMAGE | TVIF_SELECTEDIMAGE | TVIF_CHILDREN;
+            insert.item.pszText = component.data();
+            auto* insertedPath = new std::wstring(childPath);
+            insert.item.lParam = reinterpret_cast<LPARAM>(insertedPath);
+            insert.item.iImage = insert.item.iSelectedImage = icon >= 0 ? icon : 0;
+            insert.item.cChildren = 1;
+            child = TreeView_InsertItem(tree_, &insert);
+            if (!child) delete insertedPath;
+        }
+        if (!child) {
+            if (!showErrors) return;
+            std::wstring message = L"无法在目录树中找到目录：\r\n" + childPath;
+            MessageBoxW(hwnd_, message.c_str(), L"同步目录树", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        node = child;
+        nodePath = std::move(childPath);
+        pos = end;
+    }
+
+    syncingTreeSelection_ = true;
+    TreeView_SelectItem(tree_, node);
+    syncingTreeSelection_ = false;
+    TreeView_EnsureVisible(tree_, node);
 }
 
 void MainWindow::CreatePane(Pane& p)
@@ -647,6 +762,7 @@ void MainWindow::SelectRightTab(size_t index)
     SendMessageW(p.tab, TCM_SETCURSEL, p.active, 0);
     SetWindowTextW(address_, t.dir.c_str());
     RefreshList();
+    SyncTreeToCurrentTab(false);
 }
 
 void MainWindow::SelectPane(size_t index)
@@ -658,6 +774,7 @@ void MainWindow::SelectPane(size_t index)
     activeTab_ = p.tabs[p.active];
     SetWindowTextW(address_, CurTab().dir.c_str());
     RefreshList();
+    SyncTreeToCurrentTab(false);
 }
 
 void MainWindow::MoveTabToPane(size_t tabIndex, size_t paneIdx)
@@ -1572,6 +1689,17 @@ static LRESULT CALLBACK AddressProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 // 分页拖拽：子类化窗格 tab 控件，按住 tab 头拖到另一窗格即移动
 // （拖拽状态存主窗口，tab 过程通过 GWLP_USERDATA 找回 MainWindow）
 // ---------------------------------------------------------------------------
+static LRESULT CALLBACK SideTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
+{
+    WNDPROC orig = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    if (!orig) return DefWindowProcW(h, m, wp, lp);
+    if (m == WM_COMMAND || m == WM_NOTIFY) {
+        HWND parent = GetParent(h);
+        if (parent) return SendMessageW(parent, m, wp, lp);
+    }
+    return CallWindowProcW(orig, h, m, wp, lp);
+}
+
 static LRESULT CALLBACK PaneTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 {
     if (!IsWindow(h)) return 0; // 窗格被销毁后可能还有残余消息，别再往下走
@@ -1702,7 +1830,10 @@ void MainWindow::Layout()
     place(btnFwd_,   48, y + 4, 40, 26);
     place(btnUp_,    92, y + 4, 40, 26);
     place(btnRefresh_,136, y + 4, 50, 26);
-    place(address_,  194, y + 6, W - 200, 24);
+    int filterButtonX = W - 110;
+    if (filterButtonX < 274) filterButtonX = 274;
+    place(address_, 194, y + 6, filterButtonX - 198, 24);
+    place(btnMenuFilters_, filterButtonX, y + 4, 106, 26);
     y += 36;
 
     // 状态栏占据底部一条，先量出它的高度，分页栏放在它上面
@@ -1720,9 +1851,14 @@ void MainWindow::Layout()
     RECT rt{};
     SendMessageW(tab_, TCM_GETITEMRECT, 0, reinterpret_cast<LPARAM>(&rt));
     int tabH = rt.bottom - rt.top;
-    int innerH = listH - tabH - 12;
-    place(tree_, 4, tabH + 6, sideW - 8, innerH);
-    place(favList_, 4, tabH + 6, sideW - 8, innerH);
+    int treeTop = tabH + 6;
+    int innerH = listH - treeTop - 6;
+    int sideContentH = listH - tabH - 12;
+    place(btnTreeSync_, sideW - 42, treeTop + 2, 36, 20);
+    place(tree_, 4, treeTop, sideW - 8, innerH);
+    SetWindowPos(btnTreeSync_, HWND_TOP, sideW - 42, treeTop + 2, 36, 20,
+                 SWP_NOACTIVATE);
+    place(favList_, 4, tabH + 6, sideW - 8, sideContentH);
 
     // 右侧多窗格网格布局：
     //   1 个：独占；2 个：左右；3 个：品/倒品（triLayout_）；4 个：田字形
@@ -2012,7 +2148,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             else if (nm->code == TVN_SELCHANGEDW) {
                 auto* ti = reinterpret_cast<NMTREEVIEWW*>(nm);
                 auto* path = reinterpret_cast<std::wstring*>(ti->itemNew.lParam);
-                if (path && !path->empty()) Navigate(*path);
+                if (!syncingTreeSelection_ && path && !path->empty()) Navigate(*path);
             }
         }
         return 0;
@@ -2043,6 +2179,9 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             else
                 AddRightTab(true);  // 普通点击：当前窗格加一个分页
             return 0;
+        case IDC_TREE_SYNC:
+            SyncTreeToCurrentTab();
+            return 0;
         case IDC_TM_CLOSE:  CloseRightTab(menuTab_); return 0;
         case IDC_TM_OTHERS: CloseOtherTabs(menuTab_); return 0;
         case IDC_TM_RIGHT:  CloseRightTabs(menuTab_); return 0;
@@ -2054,6 +2193,9 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         case IDC_TRI_PINTOP:  SetTriLayout(0); return 0; // 品字形：1 上 2 下
         case IDC_TRI_PINDOWN: SetTriLayout(1); return 0; // 倒品字形：2 上 1 下
         case IDC_REFRESH: RefreshList(); return 0;
+        case IDC_MENU_FILTERS:
+            shell::OpenContextMenuFilterSettings(hwnd_);
+            return 0;
         case IDC_FIRST: CurTab().curPage = 0; RefreshList(); return 0;
         case IDC_PREV:  if (CurTab().curPage > 0) { --CurTab().curPage; RefreshList(); } return 0;
         case IDC_NEXT:

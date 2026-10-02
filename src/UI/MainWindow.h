@@ -16,6 +16,8 @@ enum {
     IDC_TAB = 1016, IDC_FAVLIST = 1017, IDC_RIGHTTAB = 1018, IDC_NEWTAB = 1019,
     IDC_LAYOUT1 = 1020, IDC_LAYOUT2 = 1021, IDC_LAYOUT3 = 1022, IDC_LAYOUT4 = 1023,
     IDC_TRI_PINTOP = 1024, IDC_TRI_PINDOWN = 1025,
+    IDC_MENU_FILTERS = 1026,
+    IDC_TREE_SYNC = 1027,
     // 分页标题右键菜单：关闭 / 关闭其他 / 关闭右边 / 锁定
     IDC_TM_LOCK = 1030, IDC_TM_CLOSE = 1031, IDC_TM_OTHERS = 1032, IDC_TM_RIGHT = 1033,
 };
@@ -73,6 +75,7 @@ private:
     void CreateSidePanel();          // 左侧 Tab 容器：目录树 / 收藏
     void SwitchSideTab(int index);   // 切换 tab 显示
     void CreateTree();
+    void SyncTreeToCurrentTab(bool showErrors = true);
     void CreatePane(Pane& p);        // 创建一个窗格（tab 容器 + 虚拟列表）
     void Navigate(const std::wstring& path, bool addHistory = true);
 
@@ -110,12 +113,13 @@ private:
 
     // 数据
     HWND hwnd_ = nullptr, tree_ = nullptr, address_ = nullptr;
-    HWND tab_ = nullptr, favList_ = nullptr;   // 左侧 Tab 容器 + 收藏列表
+    HWND tab_ = nullptr, favList_ = nullptr, btnTreeSync_ = nullptr; // 左侧 Tab / 收藏 / 树同步
     HWND btnNewTab_ = nullptr;                 // 激活窗格的 “+” 新增分页按钮
     std::vector<std::wstring> favorites_;      // 收藏的目录路径
     HWND status_ = nullptr, pagerPrev_ = nullptr, pagerNext_ = nullptr;
     HWND pagerFirst_ = nullptr, pagerLast_ = nullptr, pagerLabel_ = nullptr, pagerSize_ = nullptr;
     HWND btnBack_ = nullptr, btnFwd_ = nullptr, btnUp_ = nullptr, btnRefresh_ = nullptr;
+    HWND btnMenuFilters_ = nullptr;
     HIMAGELIST imgList_ = nullptr;   // 取不到系统图像列表时的自建兜底
     HIMAGELIST sysImgs_ = nullptr;   // 系统图像列表（所有窗格共用）
     HFONT uiFont_ = nullptr;
@@ -124,6 +128,7 @@ private:
     int sideWidth_ = 220;          // 左侧面板宽度（可被分隔条拖动改变）
     int startupShowCmd_ = SW_SHOW;
     bool draggingSplitter_ = false;
+    bool syncingTreeSelection_ = false;
     int splitTop_ = 36;            // 分隔条可拖动的水平范围
     int splitBot_ = 0;
 
