@@ -2,3 +2,7 @@
 PagedExplorer/src/UI/MainWindow.h
 .tmpbak
 /build
+build.bat
+/obj/
+/bin/
+/cmake-build/

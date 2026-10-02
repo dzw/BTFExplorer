@@ -34,7 +34,19 @@
 
 ## 编译
 
+### CMake
+
+```powershell
+cmake -S . -B cmake-build -G "Visual Studio 17 2022" -A x64
+cmake --build cmake-build --config Release
+```
+
+生成文件位于 `cmake-build/bin/Release/PagedExplorer.exe`。
+
+### Visual Studio
+
 Visual Studio 2022/2026，打开 `PagedExplorer.sln`，选择 `x64`，直接生成。
+也可以运行 `build.bat`，通过 MSBuild 构建解决方案。
 
 说明：这是第一版原型，Shell 原生右键菜单、图标和文件操作已经接入；后续可继续加入缩略图、搜索、标签页、拖放、真正的 Shell Namespace 扩展等。
 
