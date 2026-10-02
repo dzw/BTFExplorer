@@ -49,8 +49,12 @@ MainWindow* MainWindow::Create(HINSTANCE hInst)
     wc.lpfnWndProc = &MainWindow::WndProcStatic;
     wc.hInstance = hInst;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-    wc.hIconSm = wc.hIcon;
+    // 应用程序图标（资源 IDI_APP_ICON，提取自 Q-Dir，见 src/Resources/PagedExplorer.rc）
+    HICON hAppIcon = reinterpret_cast<HICON>(LoadImageW(
+        hInst, MAKEINTRESOURCE(101), IMAGE_ICON,
+        GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
+    wc.hIcon = hAppIcon ? hAppIcon : LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hIconSm = wc.hIcon;   // 托盘/标题栏小图标：系统用大图标缩放派生
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     wc.lpszClassName = L"PagedExplorerMain";
     RegisterClassExW(&wc);

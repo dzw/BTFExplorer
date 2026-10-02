@@ -40,6 +40,9 @@
     <ClCompile Include="src\UI\TrayIcon.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ResourceCompile Include="src\Resources\PagedExplorer.rc" />
+  </ItemGroup>
+  <ItemGroup>
     <ClInclude Include="src\UI\DirectoryTree.h" />
     <ClInclude Include="src\UI\MainWindow.h" />
     <ClInclude Include="src\UI\TrayIcon.h" />

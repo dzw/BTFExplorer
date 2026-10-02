@@ -1,0 +1,4 @@
+// 应用程序图标：从 Q-Dir 提取（见 tools/extract_qdir_icon.py）。
+// rc.exe 会从本 .rc 所在目录查找 "app.ico"，因此无需额外配置包含路径。
+#define IDI_APP_ICON 101
+IDI_APP_ICON ICON "app.ico"
