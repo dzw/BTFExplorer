@@ -37,6 +37,7 @@
     <ClCompile Include="src\Util\AppLog.cpp" />
     <ClCompile Include="src\UI\DirectoryTree.cpp" />
     <ClCompile Include="src\UI\MainWindow.cpp" />
+    <ClCompile Include="src\UI\SettingsDialog.cpp" />
     <ClCompile Include="src\UI\TrayIcon.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -45,6 +46,7 @@
   <ItemGroup>
     <ClInclude Include="src\UI\DirectoryTree.h" />
     <ClInclude Include="src\UI\MainWindow.h" />
+    <ClInclude Include="src\UI\SettingsDialog.h" />
     <ClInclude Include="src\UI\TrayIcon.h" />
     <ClInclude Include="src\Util\AppLog.h" />
   </ItemGroup>
