@@ -27,6 +27,19 @@
     <ClCompile><WarningLevel>Level4</WarningLevel><SDLCheck>true</SDLCheck><LanguageStandard>stdcpp20</LanguageStandard><PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
     <Link><SubSystem>Windows</SubSystem><AdditionalDependencies>Comctl32.lib;Shell32.lib;Ole32.lib;OleAut32.lib;Shlwapi.lib;Propsys.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
   </ItemDefinitionGroup>
-  <ItemGroup><ClCompile Include="src\main.cpp" /></ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\App\main.cpp" />
+    <ClCompile Include="src\Shell\ShellContextMenu.cpp" />
+    <ClCompile Include="src\Shell\ShellEnumerator.cpp" />
+    <ClCompile Include="src\Shell\ShellFileOperation.cpp" />
+    <ClCompile Include="src\Shell\ShellUtil.cpp" />
+    <ClCompile Include="src\Pagination\PageManager.cpp" />
+    <ClCompile Include="src\UI\DirectoryTree.cpp" />
+    <ClCompile Include="src\UI\MainWindow.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\UI\DirectoryTree.h" />
+    <ClInclude Include="src\UI\MainWindow.h" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

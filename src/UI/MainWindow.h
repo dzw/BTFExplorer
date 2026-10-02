@@ -6,6 +6,7 @@
 #include <vector>
 #include "../Pagination/PageManager.h"
 #include "../FileModel/FileEntry.h"
+#include "DirectoryTree.h"
 
 // 控件 ID（主窗口与 main.cpp 的加速键 / 单实例逻辑共享）
 enum {
@@ -74,7 +75,6 @@ private:
     void Layout();
     void CreateSidePanel();          // 左侧 Tab 容器：目录树 / 收藏
     void SwitchSideTab(int index);   // 切换 tab 显示
-    void CreateTree();
     void SyncTreeToCurrentTab(bool showErrors = true);
     void CreatePane(Pane& p);        // 创建一个窗格（tab 容器 + 虚拟列表）
     void Navigate(const std::wstring& path, bool addHistory = true);
@@ -92,10 +92,6 @@ private:
     bool SelectedPath(std::wstring& out) const;
     std::wstring CurrentPagePath(int item) const; // item -> full path
 
-    // 树
-    void PopulateDrives();
-    void ExpandTreeNode(HTREEITEM item);
-
     // 收藏
     void LoadFavorites();
     void SaveFavorites();          // 保存（带防丢失保护：内存为空时保住磁盘收藏）
@@ -112,7 +108,8 @@ private:
     void OnPaste();
 
     // 数据
-    HWND hwnd_ = nullptr, tree_ = nullptr, address_ = nullptr;
+    HWND hwnd_ = nullptr, address_ = nullptr;
+    DirectoryTree directoryTree_;
     HWND tab_ = nullptr, favList_ = nullptr, btnTreeSync_ = nullptr; // 左侧 Tab / 收藏 / 树同步
     HWND btnNewTab_ = nullptr;                 // 激活窗格的 “+” 新增分页按钮
     std::vector<std::wstring> favorites_;      // 收藏的目录路径
@@ -128,7 +125,6 @@ private:
     int sideWidth_ = 220;          // 左侧面板宽度（可被分隔条拖动改变）
     int startupShowCmd_ = SW_SHOW;
     bool draggingSplitter_ = false;
-    bool syncingTreeSelection_ = false;
     int splitTop_ = 36;            // 分隔条可拖动的水平范围
     int splitBot_ = 0;
 
