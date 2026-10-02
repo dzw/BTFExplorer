@@ -99,6 +99,7 @@ void MainWindow::HideToTray()
                     L"PagedExplorer", MB_OK | MB_ICONWARNING);
         return;
     }
+    SaveSession();   // 收进托盘前先落盘，保证下次重启能恢复窗口尺寸/位置
     ShowWindow(hwnd_, SW_HIDE);
     WriteAppLog(L"HIDE_TO_TRAY window hidden");
 }
@@ -587,10 +588,14 @@ void MainWindow::SaveSession()
     placement.length = sizeof(placement);
     if (GetWindowPlacement(hwnd_, &placement)) {
         const RECT& r = placement.rcNormalPosition;
-        putLine(L"window=" + std::to_wstring(r.left) + L"," +
+        std::wstring wline = L"window=" + std::to_wstring(r.left) + L"," +
                 std::to_wstring(r.top) + L"," + std::to_wstring(r.right) + L"," +
                 std::to_wstring(r.bottom) + L"," +
-                std::to_wstring(placement.showCmd == SW_SHOWMAXIMIZED ? 1 : 0));
+                std::to_wstring(placement.showCmd == SW_SHOWMAXIMIZED ? 1 : 0);
+        putLine(wline);
+        WriteAppLog((L"SAVE session window rect: " + wline).c_str());
+    } else {
+        WriteAppLog(L"SAVE GetWindowPlacement FAILED; no window= line written");
     }
     std::wstring widths;
     for (size_t i = 0; i < panes_.size(); ++i) {
@@ -622,6 +627,8 @@ bool MainWindow::RestoreSession()
     std::wstring path = SessionFilePath();
     FILE* f = nullptr;
     _wfopen_s(&f, path.c_str(), L"rb");
+    WriteAppLog((L"RESTORE session file path=" + path +
+        (f ? L" (opened)" : L" (NOT opened)")).c_str());
     struct TabRec { int pane = 0; int locked = 0; int histPos = 0; std::vector<std::wstring> history; };
     int paneCount = 1, tri = 1, sel = 0, sortCol = 0, sortAsc = 1;
     int savedSideWidth = sideWidth_, windowMaximized = 0;
@@ -667,6 +674,12 @@ bool MainWindow::RestoreSession()
                     right > left && bottom > top) {
                     savedWindowRect = { left, top, right, bottom };
                     hasSavedWindowRect = true;
+                    WriteAppLog((L"RESTORE parsed window rect: left=" + std::to_wstring(left) +
+                        L" top=" + std::to_wstring(top) + L" right=" + std::to_wstring(right) +
+                        L" bottom=" + std::to_wstring(bottom) +
+                        L" max=" + std::to_wstring(windowMaximized)).c_str());
+                } else {
+                    WriteAppLog(L"RESTORE window= line present but parse failed or invalid (right<=left or bottom<=top)");
                 }
                 continue;
             }
@@ -701,18 +714,54 @@ bool MainWindow::RestoreSession()
         if (inTab) recs.push_back(cur);
         ok = !recs.empty();
     }
+    if (!f) WriteAppLog(L"RESTORE session file not opened (no saved session)");
 
     if (hasSavedWindowRect) {
+        // 诊断：恢复前的当前窗口矩形（Create 时设定的默认尺寸）
+        {
+            WINDOWPLACEMENT curWp{}; curWp.length = sizeof(curWp);
+            if (GetWindowPlacement(hwnd_, &curWp)) {
+                const RECT& r = curWp.rcNormalPosition;
+                WriteAppLog((L"RESTORE pre-restore window rect: left=" + std::to_wstring(r.left) +
+                    L" top=" + std::to_wstring(r.top) + L" right=" + std::to_wstring(r.right) +
+                    L" bottom=" + std::to_wstring(r.bottom)).c_str());
+            }
+        }
+        // 防御：保存的矩形若不在任何显示器上（显示器断开 / 分辨率或 DPI 变化），
+        // 夹到主显示器工作区，避免窗口落到屏幕外而“看起来没恢复尺寸”
+        if (!MonitorFromRect(&savedWindowRect, MONITOR_DEFAULTTONULL)) {
+            WriteAppLog(L"RESTORE saved window rect off-screen; clamping to primary work area");
+            RECT wa{}; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+            int wdt = savedWindowRect.right - savedWindowRect.left;
+            int hgt = savedWindowRect.bottom - savedWindowRect.top;
+            if (wdt > wa.right - wa.left) wdt = wa.right - wa.left;
+            if (hgt > wa.bottom - wa.top) hgt = wa.bottom - wa.top;
+            savedWindowRect = { wa.left, wa.top, wa.left + wdt, wa.top + hgt };
+        }
         WINDOWPLACEMENT placement{};
         placement.length = sizeof(placement);
         placement.showCmd = windowMaximized ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
         placement.rcNormalPosition = savedWindowRect;
-        if (!SetWindowPlacement(hwnd_, &placement))
+        BOOL placed = SetWindowPlacement(hwnd_, &placement);
+        WriteAppLog((L"RESTORE SetWindowPlacement ret=" + std::to_wstring(placed ? 1 : 0) +
+            L" err=" + std::to_wstring(placed ? 0 : GetLastError())).c_str());
+        if (!placed)
             SetWindowPos(hwnd_, nullptr, savedWindowRect.left, savedWindowRect.top,
                          savedWindowRect.right - savedWindowRect.left,
                          savedWindowRect.bottom - savedWindowRect.top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
+        // 验证实际生效的矩形
+        WINDOWPLACEMENT after{}; after.length = sizeof(after);
+        if (GetWindowPlacement(hwnd_, &after)) {
+            const RECT& r = after.rcNormalPosition;
+            WriteAppLog((L"RESTORE applied window rect: left=" + std::to_wstring(r.left) +
+                L" top=" + std::to_wstring(r.top) + L" right=" + std::to_wstring(r.right) +
+                L" bottom=" + std::to_wstring(r.bottom) +
+                L" showCmd=" + std::to_wstring(after.showCmd)).c_str());
+        }
         startupShowCmd_ = windowMaximized ? SW_SHOWMAXIMIZED : SW_SHOW;
+    } else {
+        WriteAppLog(L"RESTORE no saved window rect; using default window size");
     }
     RECT clientRect{};
     GetClientRect(hwnd_, &clientRect);
@@ -722,6 +771,7 @@ bool MainWindow::RestoreSession()
                  (savedSideWidth > maxSideWidth ? maxSideWidth : savedSideWidth);
 
     if (!ok) {
+        WriteAppLog(L"RESTORE no tabs in session; using default layout (no window restore)");
         // 默认：沿用旧逻辑（favorites.txt 的 panes/tri + 默认目录）
         ApplySavedLayout();
         Navigate(L"C:\\Users\\Public", false);
@@ -1931,6 +1981,12 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_SIZE:
         if (wp != SIZE_MINIMIZED) Layout();
+        return 0;
+
+    // 用户拖动/缩放结束后落盘一次，保证窗口尺寸与位置在进程重启后被恢复
+    case WM_EXITSIZEMOVE:
+        WriteAppLog(L"WM_EXITSIZEMOVE: saving session (window move/resize ended)");
+        SaveSession();
         return 0;
 
     case WM_CLOSE:

@@ -5,7 +5,7 @@
       "name": "Launch PagedExplorer",
       "type": "cppvsdbg",
       "request": "launch",
-      "program": "${workspaceFolder}\\build\\PagedExplorer.exe",
+      "program": "${workspaceFolder}\\bin\\Release\\PagedExplorer.exe",
       "args": [],
       "stopAtEntry": false,
       "cwd": "${workspaceFolder}",
