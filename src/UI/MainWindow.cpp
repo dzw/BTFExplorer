@@ -584,18 +584,35 @@ void MainWindow::SaveSession()
     putLine(L"tri=" + std::to_wstring(triLayout_));
     putLine(L"sel=" + std::to_wstring(activeTab_));
     putLine(L"sideWidth=" + std::to_wstring(sideWidth_));
+    // 记录窗口位置/尺寸。
+    // 非最大化/最小化时改用 GetWindowRect 取“真实屏幕矩形”，这样能正确捕获
+    // Aero Snap（Win+←/→）后的半屏位置/尺寸；若用 GetWindowPlacement 的
+    // rcNormalPosition，Snap 窗口会返回未 Snap 前的旧矩形，导致重启后不恢复。
+    RECT r{};
+    int maxFlag = 0;
     WINDOWPLACEMENT placement{};
     placement.length = sizeof(placement);
-    if (GetWindowPlacement(hwnd_, &placement)) {
-        const RECT& r = placement.rcNormalPosition;
+    bool gp = (GetWindowPlacement(hwnd_, &placement) != 0);
+    bool maximized = gp && (placement.showCmd == SW_SHOWMAXIMIZED);
+    bool minimized = gp && (placement.showCmd == SW_SHOWMINIMIZED);
+    if (maximized) {
+        r = placement.rcNormalPosition;   // 最大化：存“还原”矩形，重启后恢复为最大化
+        maxFlag = 1;
+    } else if (minimized) {
+        r = placement.rcNormalPosition;   // 最小化：存正常矩形，避免存图标位置
+    } else if (!GetWindowRect(hwnd_, &r) && gp) {
+        r = placement.rcNormalPosition;
+    }
+    if (r.right > r.left && r.bottom > r.top) {
         std::wstring wline = L"window=" + std::to_wstring(r.left) + L"," +
                 std::to_wstring(r.top) + L"," + std::to_wstring(r.right) + L"," +
-                std::to_wstring(r.bottom) + L"," +
-                std::to_wstring(placement.showCmd == SW_SHOWMAXIMIZED ? 1 : 0);
+                std::to_wstring(r.bottom) + L"," + std::to_wstring(maxFlag);
         putLine(wline);
-        WriteAppLog((L"SAVE session window rect: " + wline).c_str());
+        WriteAppLog((L"SAVE session window rect (src=" +
+            std::wstring(maximized ? L"max" : (minimized ? L"min" : L"screen")) +
+            L"): " + wline).c_str());
     } else {
-        WriteAppLog(L"SAVE GetWindowPlacement FAILED; no window= line written");
+        WriteAppLog(L"SAVE window rect invalid; no window= line written");
     }
     std::wstring widths;
     for (size_t i = 0; i < panes_.size(); ++i) {
@@ -623,6 +640,10 @@ void MainWindow::SaveSession()
 // 启动恢复上次会话。命中且至少有一个分页则重建；否则沿用默认（1 窗格 + 默认目录）
 bool MainWindow::RestoreSession()
 {
+    // 恢复期间抑制 SaveSession（SetWindowPlacement 会触发 WM_WINDOWPOSCHANGED），
+    // 避免刚恢复完又立刻把“恢复后的矩形”写回，造成无意义写盘/潜在递归。
+    struct RestoreGuard { bool* p; RestoreGuard(bool* p_) : p(p_) { *p_ = true; } ~RestoreGuard() { *p = false; } };
+    RestoreGuard guard(&restoreInProgress_);
     // ---- 读盘 ----
     std::wstring path = SessionFilePath();
     FILE* f = nullptr;
@@ -919,6 +940,8 @@ void MainWindow::UpdateRightTabLabels()
             SendMessageW(p.tab, TCM_SETITEMW, k, reinterpret_cast<LPARAM>(&ti));
         }
     }
+    // 标题宽度变化会移动最后一个 tab 头右缘：立即同步 “+” 按钮，避免重叠/错位
+    UpdateNewTabButton();
 }
 
 // 分页在本窗格里的序号（找不到返回 SIZE_MAX）
@@ -1776,6 +1799,28 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
     return CallWindowProcW(orig, h, m, wp, lp);
 }
 
+// 依据激活窗格“最后一个分页头”的实际位置摆放 “+” 按钮。
+// 分页标题会随导航变化（长度不同 -> tab 宽度变化），且标题是异步更新的，
+// 所以不能只在 Layout() 里算一次，否则按钮会停在旧宽度处、与 tab 头重叠。
+void MainWindow::UpdateNewTabButton()
+{
+    if (btnNewTab_ == nullptr || activePane_ >= panes_.size()) return;
+    Pane& p = panes_[activePane_];
+    int cnt = (int)SendMessageW(p.tab, TCM_GETITEMCOUNT, 0, 0);
+    if (cnt <= 0) return;
+    RECT rl{};
+    if (!SendMessageW(p.tab, TCM_GETITEMRECT, cnt - 1, reinterpret_cast<LPARAM>(&rl)))
+        return;
+    // tab 客户区坐标 -> 主窗口坐标（不手写边框偏移）
+    POINT tl{ rl.left, rl.top }, br{ rl.right, rl.bottom };
+    MapWindowPoints(p.tab, hwnd_, &tl, 1);
+    MapWindowPoints(p.tab, hwnd_, &br, 1);
+    int x = br.x + 6;                       // 紧贴最后一个 tab 头右侧
+    int y = tl.y + ((br.y - tl.y) - 22) / 2; // 与该 tab 头垂直居中
+    p.lastTabRight = x;
+    SetWindowPos(btnNewTab_, HWND_TOP, x, y, 26, 22, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
 // ---------------------------------------------------------------------------
 // 消息处理
 // ---------------------------------------------------------------------------
@@ -1892,17 +1937,10 @@ void MainWindow::Layout()
         rtabH = rrt.bottom - rrt.top;
         // list 是 p.tab 的子窗口，坐标相对 p.tab 客户区
         place(p.list, 4, rtabH + 6, w - 8, hh - rtabH - 12);
-
-        // “+” 按钮放在该窗格最后一个 tab 头右侧
-        RECT rl{};
-        int cnt = (int)SendMessageW(p.tab, TCM_GETITEMCOUNT, 0, 0);
-        if (cnt > 0) SendMessageW(p.tab, TCM_GETITEMRECT, cnt - 1, reinterpret_cast<LPARAM>(&rl));
-        p.lastTabRight = r.left + rl.right + 6;
     }
 
-    // “+” 按钮跟随激活窗格
-    if (activePane_ < panes_.size())
-        place(btnNewTab_, panes_[activePane_].lastTabRight, y + 3, 26, 22);
+    // “+” 按钮跟随激活窗格最后一个分页头（位置在 UpdateNewTabButton 里算）
+    UpdateNewTabButton();
 
     // 记录分隔条可拖动的水平区间（供命中测试）
     splitTop_ = y;
@@ -1943,6 +1981,11 @@ LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     if (msg == WM_CHAR && wp == VK_DELETE) { /* Del 经 LVN_KEYDOWN 处理 */ }
+    if (pi >= 0 && msg == WM_KEYDOWN && wp == VK_ESCAPE) {
+        // 列表聚焦时 ESC 同样等同于点关闭按钮：收进托盘
+        HideToTray();
+        return 0;
+    }
     // 每个窗格各自保存原过程，别用别窗格的
     WNDPROC orig = (pi >= 0) ? panes_[pi].listOld : nullptr;
     if (orig) return CallWindowProcW(orig, h, msg, wp, lp);
@@ -1989,6 +2032,26 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         SaveSession();
         return 0;
 
+    case WM_WINDOWPOSCHANGED: {
+        // Aero Snap（Win+←/→/↑）等由系统触发的尺寸/位置变化不会触发 WM_EXITSIZEMOVE，
+        // 必须在窗口实际位置改变时落盘，否则重启后无法恢复 Snap 后的半屏尺寸/位置。
+        // 限流 300ms 并在矩形无变化时跳过，避免拖动过程中频繁写盘。
+        if (!restoreInProgress_) {
+            RECT now{};
+            if (GetWindowRect(hwnd_, &now) &&
+                (now.left != lastSavedWinRect_.left || now.top != lastSavedWinRect_.top ||
+                 now.right != lastSavedWinRect_.right || now.bottom != lastSavedWinRect_.bottom)) {
+                DWORD t = GetTickCount();
+                if (t - lastSaveTick_ > 300) {
+                    lastSaveTick_ = t;
+                    lastSavedWinRect_ = now;
+                    SaveSession();
+                }
+            }
+        }
+        break;
+    }
+
     case WM_CLOSE:
         WriteAppLog(L"WM_CLOSE received");
         HideToTray();
@@ -2021,6 +2084,19 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         if ((GetKeyState(VK_CONTROL) & 0x8000) && wp == VK_RIGHT) {
             if (activeTab_ + 1 < tabs_.size()) SelectRightTab(activeTab_ + 1);
             return 0;
+        }
+        if (wp == VK_ESCAPE) {
+            // 与标题栏“关闭”按钮（X）一致：收进托盘。
+            // 仅在非文本编辑态拦截——编辑框/组合框聚焦时的 ESC 交给控件自身处理，
+            // 避免正在输入路径时误关窗口。
+            HWND f = GetFocus();
+            if (f == hwnd_ || f == nullptr) { HideToTray(); return 0; }
+            wchar_t cls[32] = { 0 };
+            GetClassNameW(f, cls, 31);
+            if (_wcsicmp(cls, L"Edit") != 0 && _wcsicmp(cls, L"ComboBox") != 0) {
+                HideToTray();
+                return 0;
+            }
         }
         break;
 

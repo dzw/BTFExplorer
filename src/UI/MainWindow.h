@@ -129,6 +129,9 @@ private:
     // 布局 / 交互
     int sideWidth_ = 220;          // 左侧面板宽度（可被分隔条拖动改变）
     int startupShowCmd_ = SW_SHOW;
+    bool restoreInProgress_ = false;     // 恢复会话期间抑制 SaveSession，避免递归/重复写盘
+    RECT lastSavedWinRect_{};            // 上次落盘的窗口矩形（用于跳过重排时的重复写）
+    DWORD lastSaveTick_ = 0;             // 上次落盘时刻（限流，避免拖动时频繁写盘）
     bool draggingSplitter_ = false;
     int splitTop_ = 36;            // 分隔条可拖动的水平范围
     int splitBot_ = 0;
@@ -183,6 +186,7 @@ private:
     void CloseRightTab(size_t index);
     void MoveTabToPane(size_t tabIndex, size_t paneIdx); // 分页拖拽移动
     void UpdateRightTabLabels();
+    void UpdateNewTabButton();  // 依据当前激活窗格最后一个分页头的位置摆放 “+” 按钮
     size_t PaneTabPos(size_t paneIdx, size_t tabIndex) const; // 分页在本窗格中的序号
     void TabContextMenu(HWND h, int idx, POINT screenPt);     // 分页标题右键菜单
     void CloseOtherTabs(size_t keepTabIndex);                 // 关闭同一窗格的其它分页
