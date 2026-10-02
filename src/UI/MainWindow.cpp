@@ -414,8 +414,8 @@ void MainWindow::ResetAllPanes()
 void MainWindow::SaveSession()
 {
     std::wstring path = SessionFilePath();
-    FILE* f = _wfopen(path.c_str(), L"wb");
-    if (!f) return;
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return;
     fwrite("\xEF\xBB\xBF", 1, 3, f);   // UTF-8 BOM
 
     auto putLine = [&](const std::wstring& s) {
@@ -471,7 +471,8 @@ bool MainWindow::RestoreSession()
 {
     // ---- 读盘 ----
     std::wstring path = SessionFilePath();
-    FILE* f = _wfopen(path.c_str(), L"rb");
+    FILE* f = nullptr;
+    _wfopen_s(&f, path.c_str(), L"rb");
     struct TabRec { int pane = 0; int locked = 0; int histPos = 0; std::vector<std::wstring> history; };
     int paneCount = 1, tri = 1, sel = 0, sortCol = 0, sortAsc = 1;
     int savedSideWidth = sideWidth_, windowMaximized = 0;

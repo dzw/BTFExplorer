@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <objbase.h>
+#include <shellapi.h>
 #include <cstdio>
 #include "../UI/MainWindow.h"
 

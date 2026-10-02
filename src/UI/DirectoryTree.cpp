@@ -1,5 +1,6 @@
 #include "DirectoryTree.h"
 #include "../Shell/ShellUtil.h"
+#include <shellapi.h>
 #include <cwchar>
 #include <iterator>
 
