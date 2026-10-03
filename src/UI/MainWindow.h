@@ -85,11 +85,13 @@ private:
     void CreatePane(Pane& p);        // 创建一个窗格（tab 容器 + 虚拟列表）
     void Navigate(const std::wstring& path, bool addHistory = true);
     void NavigateFromSidebar(const std::wstring& path); // 侧栏跳转：分页被锁定时另开新分页
+    void OpenDirInNewTab(const std::wstring& path);     // 目录树中键：总是新开分页打开
 
     // 列表（作用于激活窗格的当前分页）
     HWND  CurList() const;            // 激活窗格的 ListView
     void RefreshList();               // 重新请求当前页
     void RefreshListFromDisk();       // 文件增删改后：清分页缓存再刷新（防旧缓存）
+    void InvalidateTabStrips();       // 焦点窗格变化后重画各窗格分页栏（焦点行淡粉绿）
     void OnPageLoaded();              // 后台加载完成（已 PostMessage 转到 UI 线程）
     void UpdateStatusBar();
     void UpdatePaginationBar();

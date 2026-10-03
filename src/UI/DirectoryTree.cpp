@@ -19,7 +19,43 @@ HWND DirectoryTree::Create(HWND parent, int controlId, HFONT font)
         SHGetFileInfoW(L"C:\\", 0, &fileInfo, sizeof(fileInfo),
                        SHGFI_SYSICONINDEX | SHGFI_SMALLICON));
     if (images) TreeView_SetImageList(hwnd_, images, TVSIL_NORMAL);
+
+    // 子类化：TreeView 没有中键点击通知，中键在子类过程里捕获
+    SetWindowLongPtrW(hwnd_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+    defaultProc_ = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(hwnd_, GWLP_WNDPROC,
+        reinterpret_cast<LONG_PTR>(&DirectoryTree::TreeProcStatic)));
     return hwnd_;
+}
+
+LRESULT CALLBACK DirectoryTree::TreeProcStatic(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    auto* self = reinterpret_cast<DirectoryTree*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    if (self && self->hwnd_ == h) return self->TreeProc(h, msg, wp, lp);
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+LRESULT DirectoryTree::TreeProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_MBUTTONDOWN && onMiddleClick_) {
+        // 中键点在节点上（图标/文字，不含展开按钮）-> 回调路径
+        TVHITTESTINFO hit{};
+        hit.pt = { (int)(short)LOWORD(lp), (int)(short)HIWORD(lp) };
+        if (TreeView_HitTest(h, &hit) && (hit.flags & TVHT_ONITEM) && hit.hItem) {
+            TVITEMW item{};
+            item.hItem = hit.hItem;
+            item.mask = TVIF_PARAM;
+            if (TreeView_GetItem(h, &item) && item.lParam) {
+                onMiddleClick_(*reinterpret_cast<const std::wstring*>(item.lParam));
+                return 0;
+            }
+        }
+    }
+    return CallWindowProcW(defaultProc_, h, msg, wp, lp);
+}
+
+void DirectoryTree::SetMiddleClickCallback(std::function<void(const std::wstring&)> callback)
+{
+    onMiddleClick_ = std::move(callback);
 }
 
 void DirectoryTree::PopulateDrives()

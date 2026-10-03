@@ -18,6 +18,12 @@ static constexpr UINT WM_APP_WIN_E = WM_APP + 2;   // Win+E 被拦截后激活�
 static constexpr int WM_APP_CLOSE_TAB = WM_APP + 3; // 中键点击分页 -> 延后到主窗口关闭
 static constexpr int WM_APP_MOVE_TAB  = WM_APP + 4; // 拖拽分页 -> 延后到主窗口移动
 static constexpr int WM_APP_ADD_TAB   = WM_APP + 6; // 双击空白新建分页 -> 延后到主窗口添加（+5 是托盘回调）
+static constexpr int WM_APP_TREE_NEWTAB = WM_APP + 7; // 目录树中键 -> 延后到主窗口新开分页
+
+// 当前焦点窗格顶部分页栏的整行底色（淡粉绿）：涂在分页头之间的空隙上，
+// 分页头本身保持系统外观（见 PaneTabHandler 的 WM_PAINT）
+static constexpr COLORREF kActiveTabStripColor = RGB(213, 234, 223);
+                                                      // （wParam = new std::wstring*，主窗口负责释放）
 
 static UINT GetTaskbarBroadcastMessage()
 {
@@ -248,6 +254,13 @@ void MainWindow::CreateSidePanel()
     // 树和收藏列表都是 tab_ 的子窗口，显示由 SwitchSideTab 控制
     directoryTree_.Create(tab_, IDC_TREE, uiFont_);
     directoryTree_.PopulateDrives();
+    // 目录树中键点击：在当前活动窗格新开分页打开该目录。
+    // 不能在树的窗口过程里直接 AddRightTab（Layout 会重入树/页签控件导致
+    // COMCTL32 崩溃，同双击新建分页的修复），堆上带路径延后到主窗口处理。
+    directoryTree_.SetMiddleClickCallback([this](const std::wstring& path) {
+        PostMessageW(hwnd_, WM_APP_TREE_NEWTAB,
+                     reinterpret_cast<WPARAM>(new std::wstring(path)), 0);
+    });
     btnTreeSync_ = CreateWindowExW(0, WC_BUTTONW, L"定",//定位
         WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
         0, 0, 0, 0, tab_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TREE_SYNC)), hInst, nullptr);
@@ -863,6 +876,7 @@ void MainWindow::SelectRightTab(size_t index)
         if (p.tabs[k] == index) { p.active = k; break; }
     SendMessageW(p.tab, TCM_SETCURSEL, p.active, 0);
     SetWindowTextW(address_, t.dir.c_str());
+    InvalidateTabStrips();
     RefreshList();
     SyncTreeToCurrentTab(false);
 }
@@ -875,8 +889,16 @@ void MainWindow::SelectPane(size_t index)
     activePane_ = index;
     activeTab_ = p.tabs[p.active];
     SetWindowTextW(address_, CurTab().dir.c_str());
+    InvalidateTabStrips();
     RefreshList();
     SyncTreeToCurrentTab(false);
+}
+
+// 焦点窗格变化后重画各窗格分页栏（只有焦点窗格的整行是淡粉绿）
+void MainWindow::InvalidateTabStrips()
+{
+    for (auto& p : panes_)
+        InvalidateRect(p.tab, nullptr, FALSE);
 }
 
 void MainWindow::MoveTabToPane(size_t tabIndex, size_t paneIdx)
@@ -1189,6 +1211,14 @@ void MainWindow::NavigateFromSidebar(const std::wstring& path)
     size_t paneIdx = activePane_;
     AddRightTab(false, paneIdx);   // 新建并激活分页（先不跳默认目录）
     Navigate(path);                // 再在新分页里打开目标目录
+}
+
+// 目录树中键点击：无论当前分页是否锁定，总是在当前活动窗格新开一个分页打开目录
+void MainWindow::OpenDirInNewTab(const std::wstring& path)
+{
+    if (path.empty()) return;
+    AddRightTab(false, activePane_);   // 新建并激活分页（先不跳默认目录）
+    Navigate(path);                    // 再在新分页里打开目标目录
 }
 
 void MainWindow::RefreshList()
@@ -1799,6 +1829,10 @@ static LRESULT CALLBACK PaneTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     if (!IsWindow(h)) return 0; // 窗格被销毁后可能还有残余消息，别再往下走
     WNDPROC orig = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(h, GWLP_USERDATA));
     if (!orig) return DefWindowProcW(h, m, wp, lp);
+    if (m == WM_COMMAND || m == WM_NOTIFY) {
+        HWND parent = GetParent(h);
+        if (parent) return SendMessageW(parent, m, wp, lp);
+    }
     auto* self = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(GetParent(h), GWLP_USERDATA));
     if (self) return self->PaneTabHandler(h, m, wp, lp, orig);
     return CallWindowProcW(orig, h, m, wp, lp);
@@ -1807,6 +1841,41 @@ static LRESULT CALLBACK PaneTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC orig)
 {
     switch (m) {
+    case WM_PAINT: {
+        // 当前焦点窗格：分页栏整行底色涂淡粉绿。先让控件按主题画完，
+        // 再只覆盖分页头之外的空隙（行背景），分页头本身保持原样。
+        LRESULT r = CallWindowProcW(orig, h, m, wp, lp);
+        int pi = PaneOfTab(h);
+        if (pi < 0 || (size_t)pi != activePane_) return r;
+        HDC hdc = GetDC(h);
+        if (!hdc) return r;
+        RECT rc{};
+        GetClientRect(h, &rc);
+        int cnt = (int)SendMessageW(h, TCM_GETITEMCOUNT, 0, 0);
+        int rowH = 24;
+        HRGN tabs = CreateRectRgn(0, 0, 0, 0);
+        for (int i = 0; i < cnt; ++i) {
+            RECT ti{};
+            if (SendMessageW(h, TCM_GETITEMRECT, (WPARAM)i, (LPARAM)&ti)) {
+                rowH = ti.bottom + 3;              // 分页头行的高度（含底部边距）
+                HRGN tr = CreateRectRgn(ti.left, ti.top, ti.right, ti.bottom);
+                CombineRgn(tabs, tabs, tr, RGN_OR);
+                DeleteObject(tr);
+            }
+        }
+        if (rowH > rc.bottom) rowH = rc.bottom;
+        HRGN full = CreateRectRgn(rc.left, rc.top, rc.right, rc.top + rowH);
+        HRGN gaps = CreateRectRgn(0, 0, 0, 0);
+        CombineRgn(gaps, full, tabs, RGN_DIFF);
+        HBRUSH br = CreateSolidBrush(kActiveTabStripColor);
+        FillRgn(hdc, gaps, br);
+        DeleteObject(br);
+        DeleteObject(gaps);
+        DeleteObject(full);
+        DeleteObject(tabs);
+        ReleaseDC(h, hdc);
+        return r;
+    }
     case WM_LBUTTONDBLCLK: {
         // 分页栏空白区双击 = 新建分页。tab 控件类带 CS_DBLCLKS，双击的第二次
         // 点击以本消息到达。不在这里直接 AddRightTab：那会在 tab 控件自己的
@@ -2558,8 +2627,16 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                     int i = (start + k) % n;
                     const std::wstring& name = t.pageItems[i].name;
                     if (name.size() >= plen &&
-                        _wcsnicmp(name.c_str(), prefix, plen) == 0)
+                        _wcsnicmp(name.c_str(), prefix, plen) == 0) {
+                        // 自己完成选中+滚动：不能只依赖返回值（实测控件对转发
+                        // 过来的通知结果处理并不可靠）
+                        HWND lv = nm->hwndFrom;
+                        ListView_SetItemState(lv, i,
+                                              LVIS_SELECTED | LVIS_FOCUSED,
+                                              LVIS_SELECTED | LVIS_FOCUSED);
+                        ListView_EnsureVisible(lv, i, FALSE);
                         return i;                        // 返回匹配下标（不是 0！）
+                    }
                 }
                 return -1;
             }
@@ -2722,6 +2799,15 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         if (static_cast<size_t>(wp) < panes_.size())
             AddRightTab(true, static_cast<size_t>(wp));
         return 0;
+
+    case WM_APP_TREE_NEWTAB: {  // 目录树中键（延后到这里真正新建，见 CreateSidePanel）
+        auto* path = reinterpret_cast<std::wstring*>(wp);
+        if (path) {
+            OpenDirInNewTab(*path);
+            delete path;
+        }
+        return 0;
+    }
 
     case WM_APP_PAGELOADED:
         OnPageLoaded();
