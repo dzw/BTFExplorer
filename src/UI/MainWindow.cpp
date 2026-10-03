@@ -468,6 +468,12 @@ void MainWindow::AddRightTab(bool navigateToDefault, size_t paneIdx)
         Navigate(L"C:\\");
     else
         SelectRightTab(idx);
+
+    // 虚拟列表在父级 tab 重排后不一定会重新绘制项目；显式刷新各窗格，
+    // 否则其他窗格可能要等到获得焦点才显示已有内容。
+    for (const Pane& pane : panes_)
+        if (pane.list)
+            RedrawWindow(pane.list, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
 }
 
 void MainWindow::AddPane()
