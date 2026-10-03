@@ -16,6 +16,7 @@ enum {
     IDC_FIRST = 1010, IDC_PREV = 1011, IDC_NEXT = 1012, IDC_LAST = 1013,
     IDC_PAGE_SIZE = 1014, IDC_PAGER_LABEL = 1015,
     IDC_TAB = 1016, IDC_FAVLIST = 1017, IDC_RIGHTTAB = 1018, IDC_NEWTAB = 1019,
+    IDC_NEWTAB_BASE = 1200,    // 每个窗格一个“+”按钮，命令 ID = IDC_NEWTAB_BASE + 窗格 tag
     IDC_LAYOUT1 = 1020, IDC_LAYOUT2 = 1021, IDC_LAYOUT3 = 1022, IDC_LAYOUT4 = 1023,
     IDC_TRI_PINTOP = 1024, IDC_TRI_PINDOWN = 1025,
     IDC_MENU_FILTERS = 1026,
@@ -49,6 +50,7 @@ struct Pane {
     std::vector<size_t> tabs;                // 本窗格持有的 TabState 下标
     size_t active = 0;                       // 本窗格当前显示的分页
     int lastTabRight = 0;                    // 最后一个 tab 头右缘（“+”按钮定位用）
+    HWND btnNewTab = nullptr;                // 本窗格的“+”新增分页按钮
 };
 
 // 资源管理器主窗口：树 + 虚拟 ListView + 地址栏 + 分页栏 + 状态栏
@@ -122,7 +124,6 @@ private:
     TrayIcon trayIcon_;
     DirectoryTree directoryTree_;
     HWND tab_ = nullptr, favList_ = nullptr, btnTreeSync_ = nullptr; // 左侧 Tab / 收藏 / 树同步
-    HWND btnNewTab_ = nullptr;                 // 激活窗格的 “+” 新增分页按钮
     std::vector<std::wstring> favorites_;      // 收藏的目录路径
     HWND status_ = nullptr, pagerPrev_ = nullptr, pagerNext_ = nullptr;
     HWND pagerFirst_ = nullptr, pagerLast_ = nullptr, pagerLabel_ = nullptr, pagerSize_ = nullptr;
@@ -192,7 +193,7 @@ private:
     void CloseRightTab(size_t index);
     void MoveTabToPane(size_t tabIndex, size_t paneIdx); // 分页拖拽移动
     void UpdateRightTabLabels();
-    void UpdateNewTabButton();  // 依据当前激活窗格最后一个分页头的位置摆放 “+” 按钮
+    void UpdateNewTabButtons(); // 每个窗格的“+”按钮贴在其最后一个分页头右侧
     size_t PaneTabPos(size_t paneIdx, size_t tabIndex) const; // 分页在本窗格中的序号
     void TabContextMenu(HWND h, int idx, POINT screenPt);     // 分页标题右键菜单
     void CloseOtherTabs(size_t keepTabIndex);                 // 关闭同一窗格的其它分页

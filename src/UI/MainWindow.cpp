@@ -134,24 +134,26 @@ void MainWindow::OpenSettings()
     if (!settings::GetAutoStart(data.autoStart)) return;
     const bool prevAutoStart = data.autoStart;
 
-    if (settings::Show(hwnd_, uiFont_, data)) {   // 取消时 data 不会被改动
-        if (data.gridLines != showGridLines_) {
-            showGridLines_ = data.gridLines;
+    // “确定/应用”时即时套用；“取消”不走到 apply。
+    auto apply = [&](const SettingsData& d) {
+        if (d.gridLines != showGridLines_) {
+            showGridLines_ = d.gridLines;
             ApplyListStyles();
         }
-        if (data.autoStart != prevAutoStart)
-            settings::SetAutoStart(data.autoStart);
-        if (data.pageSize != (int)pageSize_) {
-            pageSize_ = (size_t)data.pageSize;
+        if (d.autoStart != prevAutoStart)
+            settings::SetAutoStart(d.autoStart);
+        if (d.pageSize != (int)pageSize_) {
+            pageSize_ = (size_t)d.pageSize;
             SyncPagerSizeCombo();                 // 同步分页栏的下拉框
             CurTab().curPage = 0;
             Navigate(CurTab().dir, false);
         }
-        if (data.triLayout != triLayout_)
-            SetTriLayout(data.triLayout);
-        if (data.paneCount != (int)panes_.size())
-            SetPaneCount(data.paneCount);
-    }
+        if (d.triLayout != triLayout_)
+            SetTriLayout(d.triLayout);
+        if (d.paneCount != (int)panes_.size())
+            SetPaneCount(d.paneCount);
+    };
+    settings::Show(hwnd_, uiFont_, data, apply);
     SetFocus(CurList());
 }
 
@@ -192,10 +194,6 @@ void MainWindow::BuildChildren()
     // 右侧窗格（文件列表）：首个窗格 + 一个分页
     panes_.emplace_back();
     CreatePane(panes_[0]);
-    btnNewTab_ = CreateWindowExW(0, WC_BUTTONW, L"+",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        0, 0, 26, 22, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_NEWTAB)), hInst, nullptr);
-    if (uiFont_) SendMessageW(btnNewTab_, WM_SETFONT, (WPARAM)uiFont_, TRUE);
     tabs_.emplace_back();
     tabs_[0].pane = 0;
     tabs_[0].pages->SetNotify([this]() { PostMessage(hwnd_, WM_APP_PAGELOADED, 0, 0); });
@@ -346,6 +344,12 @@ void MainWindow::CreatePane(Pane& p)
     p.listOld = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(p.list, GWLP_WNDPROC,
         reinterpret_cast<LONG_PTR>(&MainWindow::ListViewProcStatic)));
     SetWindowLongPtrW(p.list, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+
+    // 本窗格自己的“+”按钮（每个窗格一个，贴在最后一个分页头右侧）
+    p.btnNewTab = CreateWindowExW(0, WC_BUTTONW, L"+",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        0, 0, 26, 22, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_NEWTAB_BASE + p.tag)), hInst, nullptr);
+    if (uiFont_) SendMessageW(p.btnNewTab, WM_SETFONT, (WPARAM)uiFont_, TRUE);
 }
 
 // 分配当前未被占用的窗格编号（最多同时 4 个窗格，编号池 0~7 足够）
@@ -369,6 +373,7 @@ void MainWindow::RemovePane(size_t idx)
         tabDragIndex_ = -1;
     }
     DestroyWindow(panes_[idx].tab);
+    if (panes_[idx].btnNewTab) DestroyWindow(panes_[idx].btnNewTab);
     panes_.erase(panes_.begin() + idx);
     for (auto& t : tabs_)
         if (t.pane > idx) --t.pane;
@@ -918,8 +923,8 @@ void MainWindow::UpdateRightTabLabels()
             SendMessageW(p.tab, TCM_SETITEMW, k, reinterpret_cast<LPARAM>(&ti));
         }
     }
-    // 标题宽度变化会移动最后一个 tab 头右缘：立即同步 “+” 按钮，避免重叠/错位
-    UpdateNewTabButton();
+    // 标题宽度变化会移动最后一个 tab 头右缘：立即同步各窗格“+”按钮，避免重叠/错位
+    UpdateNewTabButtons();
 }
 
 // 分页在本窗格里的序号（找不到返回 SIZE_MAX）
@@ -1794,23 +1799,27 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
 // 依据激活窗格“最后一个分页头”的实际位置摆放 “+” 按钮。
 // 分页标题会随导航变化（长度不同 -> tab 宽度变化），且标题是异步更新的，
 // 所以不能只在 Layout() 里算一次，否则按钮会停在旧宽度处、与 tab 头重叠。
-void MainWindow::UpdateNewTabButton()
+void MainWindow::UpdateNewTabButtons()
 {
-    if (btnNewTab_ == nullptr || activePane_ >= panes_.size()) return;
-    Pane& p = panes_[activePane_];
-    int cnt = (int)SendMessageW(p.tab, TCM_GETITEMCOUNT, 0, 0);
-    if (cnt <= 0) return;
-    RECT rl{};
-    if (!SendMessageW(p.tab, TCM_GETITEMRECT, cnt - 1, reinterpret_cast<LPARAM>(&rl)))
-        return;
-    // tab 客户区坐标 -> 主窗口坐标（不手写边框偏移）
-    POINT tl{ rl.left, rl.top }, br{ rl.right, rl.bottom };
-    MapWindowPoints(p.tab, hwnd_, &tl, 1);
-    MapWindowPoints(p.tab, hwnd_, &br, 1);
-    int x = br.x + 6;                       // 紧贴最后一个 tab 头右侧
-    int y = tl.y + ((br.y - tl.y) - 22) / 2; // 与该 tab 头垂直居中
-    p.lastTabRight = x;
-    SetWindowPos(btnNewTab_, HWND_TOP, x, y, 26, 22, SWP_NOZORDER | SWP_NOACTIVATE);
+    for (size_t i = 0; i < panes_.size(); ++i) {
+        Pane& p = panes_[i];
+        if (p.btnNewTab == nullptr || p.tab == nullptr) continue;
+        int cnt = (int)SendMessageW(p.tab, TCM_GETITEMCOUNT, 0, 0);
+        if (cnt <= 0) { ShowWindow(p.btnNewTab, SW_HIDE); continue; }
+        RECT rl{};
+        if (!SendMessageW(p.tab, TCM_GETITEMRECT, cnt - 1, reinterpret_cast<LPARAM>(&rl))) {
+            ShowWindow(p.btnNewTab, SW_HIDE); continue;
+        }
+        // tab 客户区坐标 -> 主窗口坐标（不手写边框偏移）
+        POINT tl{ rl.left, rl.top }, br{ rl.right, rl.bottom };
+        MapWindowPoints(p.tab, hwnd_, &tl, 1);
+        MapWindowPoints(p.tab, hwnd_, &br, 1);
+        int x = br.x + 6;                       // 紧贴最后一个 tab 头右侧
+        int y = tl.y + ((br.y - tl.y) - 22) / 2; // 与该 tab 头垂直居中
+        p.lastTabRight = x;
+        SetWindowPos(p.btnNewTab, HWND_TOP, x, y, 26, 22,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1940,8 +1949,8 @@ void MainWindow::Layout()
         place(p.list, 4, rtabH + 6, w - 8, hh - rtabH - 12);
     }
 
-    // “+” 按钮跟随激活窗格最后一个分页头（位置在 UpdateNewTabButton 里算）
-    UpdateNewTabButton();
+    // 每个窗格的“+”按钮贴在其最后一个分页头右侧（UpdateNewTabButtons 里算）
+    UpdateNewTabButtons();
 
     // 记录分隔条可拖动的水平区间（供命中测试）
     splitTop_ = y;
@@ -1967,6 +1976,12 @@ void MainWindow::Layout()
 LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     int pi = PaneOfList(h);
+    // 只有真正的用户输入（点击/按键）才激活窗格并同步目录树；
+    // 鼠标移动、悬停重绘、tooltip 等带来的消息一律不切换。
+    if (pi >= 0 && (size_t)pi != activePane_ &&
+        (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN ||
+         msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN))
+        SelectPane((size_t)pi);
     if (pi >= 0 && msg == WM_CONTEXTMENU) {
         // 右键菜单：在列表空白/条目上弹出 Explorer 风格菜单
         if ((size_t)pi != activePane_) SelectPane((size_t)pi); // 先激活该窗格
@@ -2157,9 +2172,19 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         // 多窗格：窗格被删除后控件 ID 与下标不再对应，统一用 hwnd 反查窗格
         int pi = PaneOfList(nm->hwndFrom);
         if (pi >= 0) {
-            // 操作非激活窗格 -> 先激活它（重绘除外，避免中途切换数据源造成重入）
-            if ((size_t)pi != activePane_ && nm->code != LVN_GETDISPINFOW)
-                SelectPane((size_t)pi);
+            // 操作非激活窗格 -> 先激活它。只认真正的用户交互通知（点击/键盘/点列头）：
+            // 鼠标移动、悬停引起的重绘（NM_CUSTOMDRAW）、tooltip 等通知一律不切换窗格。
+            switch (nm->code) {
+            case NM_CLICK:
+            case NM_DBLCLK:
+            case NM_RCLICK:
+            case NM_RDBLCLK:
+            case NM_RETURN:
+            case LVN_COLUMNCLICK:
+            case LVN_KEYDOWN:
+                if ((size_t)pi != activePane_) SelectPane((size_t)pi);
+                break;
+            }
             if (nm->code == LVN_GETDISPINFOW) {
                 auto* di = reinterpret_cast<NMLVDISPINFOW*>(nm);
                 TabState& vt = PaneActiveTab((size_t)pi); // 取本窗格自己的分页数据
@@ -2272,12 +2297,22 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             if (p != std::wstring::npos && p > 2) Navigate(dir.substr(0, p));
             return 0;
         }
-        case IDC_NEWTAB:
-            if ((GetKeyState(VK_CONTROL) & 0x8000) && panes_.size() < 4)
-                AddPane();          // Ctrl+点击：新增窗格（最多 4 个）
-            else
-                AddRightTab(true);  // 普通点击：当前窗格加一个分页
-            return 0;
+        default:
+            // 每个窗格一个“+”按钮，命令 ID 落在 IDC_NEWTAB_BASE..+7 区间
+            if (id >= IDC_NEWTAB_BASE && id < IDC_NEWTAB_BASE + 8) {
+                int tag = id - IDC_NEWTAB_BASE;
+                int paneIdx = -1;
+                for (size_t i = 0; i < panes_.size(); ++i)
+                    if (panes_[i].tag == tag) { paneIdx = (int)i; break; }
+                if (paneIdx >= 0) {
+                    if ((GetKeyState(VK_CONTROL) & 0x8000) && panes_.size() < 4)
+                        AddPane();                        // Ctrl+点击：新增窗格（最多 4 个）
+                    else
+                        AddRightTab(true, (size_t)paneIdx); // 普通点击：在该窗格加一个分页
+                }
+                return 0;
+            }
+            break;
         case IDC_TREE_SYNC:
             SyncTreeToCurrentTab();
             return 0;

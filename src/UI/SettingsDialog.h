@@ -1,5 +1,6 @@
 #pragma once
 #include <windows.h>
+#include <functional>
 
 // 文件列表 / 分页栏 / 设置界面共用的“每页项数”档位；顺序即下拉框顺序
 inline constexpr int kPageSizes[4] = { 50, 100, 200, 500 };
@@ -29,8 +30,9 @@ bool GetAutoStart(bool& enabled);
 void SetAutoStart(bool enabled);
 
 // 模态显示设置对话框。owner 为父窗口，font 为界面字体（可为 nullptr）。
-// 返回 true  = 用户按了“确定”，data 已回写；
-// 返回 false = 用户取消（或窗口创建失败），data 不会被修改。
-bool Show(HWND owner, HFONT font, SettingsData& data);
+// onApply 在“确定”或“应用”被点击时调用（data 为当前对话框中的设置），用于即时生效；
+// “取消”不会调用它。返回 true  = 用户按了“确定”；false = 取消（或窗口创建失败）。
+bool Show(HWND owner, HFONT font, SettingsData& data,
+         std::function<void(const SettingsData&)> onApply);
 
 } // namespace settings

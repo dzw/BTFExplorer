@@ -15,6 +15,7 @@ enum {
     IDC_OPT_PANES3 = 1043, IDC_OPT_PANES4 = 1044,
     IDC_OPT_TRI_TOP = 1045, IDC_OPT_TRI_DOWN = 1046,
     IDC_OPT_PAGESIZE = 1047, IDC_OPT_STARTUP = 1048,
+    IDC_OPT_APPLY = 1049,   // “应用”按钮（即时生效，对话框不关闭）
 };
 
 constexpr wchar_t kDlgClass[] = L"PagedExplorerSettingsBox";
@@ -30,6 +31,7 @@ struct State {
     int  pageIndex = 1;    // 每页项数在 combo 里的下标
     bool applied = false;  // 用户是否按了“确定”
     HFONT font = nullptr;  // 主窗口的界面字体
+    std::function<void(const SettingsData&)> apply; // “确定/应用”时即时套用
 };
 State g;
 
@@ -62,6 +64,20 @@ void ApplyFont(HWND h)
     if (g.font) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), TRUE);
 }
 
+// 把当前控件状态读回 g.data / g.pageIndex
+void ReadControls(HWND h)
+{
+    g.data.gridLines = (Button_GetCheck(GetDlgItem(h, IDC_OPT_GRID)) == BST_CHECKED);
+    g.data.paneCount = RadioChecked(h, IDC_OPT_PANES1, 4) + 1;
+    g.data.triLayout = RadioChecked(h, IDC_OPT_TRI_TOP, 2);
+    g.pageIndex      = (int)SendMessageW(GetDlgItem(h, IDC_OPT_PAGESIZE),
+                                         CB_GETCURSEL, 0, 0);
+    if (g.pageIndex < 0 || g.pageIndex >= kPageSizeCount)
+        g.pageIndex = PageSizeToIndex(g.data.pageSize);
+    g.data.pageSize  = kPageSizes[g.pageIndex];
+    g.data.autoStart = (Button_GetCheck(GetDlgItem(h, IDC_OPT_STARTUP)) == BST_CHECKED);
+}
+
 LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 {
     switch (m) {
@@ -69,18 +85,16 @@ LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         int id = LOWORD(wp);
         if (id == IDOK || id == IDCANCEL) {
             if (id == IDOK) {
-                g.data.gridLines = (Button_GetCheck(GetDlgItem(h, IDC_OPT_GRID)) == BST_CHECKED);
-                g.data.paneCount = RadioChecked(h, IDC_OPT_PANES1, 4) + 1;
-                g.data.triLayout = RadioChecked(h, IDC_OPT_TRI_TOP, 2);
-                g.pageIndex      = (int)SendMessageW(GetDlgItem(h, IDC_OPT_PAGESIZE),
-                                                     CB_GETCURSEL, 0, 0);
-                if (g.pageIndex < 0 || g.pageIndex >= kPageSizeCount)
-                    g.pageIndex = PageSizeToIndex(g.data.pageSize);
-                g.data.pageSize  = kPageSizes[g.pageIndex];
-                g.data.autoStart = (Button_GetCheck(GetDlgItem(h, IDC_OPT_STARTUP)) == BST_CHECKED);
+                ReadControls(h);
+                if (g.apply) g.apply(g.data);   // 即时套用
                 g.applied = true;
             }
             DestroyWindow(h);
+            return 0;
+        }
+        if (id == IDC_OPT_APPLY) {
+            ReadControls(h);
+            if (g.apply) g.apply(g.data);       // 即时套用，对话框保持打开
             return 0;
         }
         if (id >= IDC_OPT_PANES1 && id <= IDC_OPT_PANES4) { UpdateTriEnabled(h); return 0; }
@@ -162,12 +176,14 @@ void SetAutoStart(bool enabled)
     }
 }
 
-bool Show(HWND owner, HFONT font, SettingsData& data)
+bool Show(HWND owner, HFONT font, SettingsData& data,
+           std::function<void(const SettingsData&)> onApply)
 {
     g.data = data;
     g.pageIndex = PageSizeToIndex(data.pageSize);
     g.applied = false;
     g.font = font;
+    g.apply = std::move(onApply);
 
     HINSTANCE hInst = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(owner, GWLP_HINSTANCE));
     static ATOM cls = 0;
@@ -253,6 +269,9 @@ bool Show(HWND owner, HFONT font, SettingsData& data)
     CreateWindowExW(0, WC_BUTTONW, L"取消",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
         306, kDlgH - 40, 84, 26, dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), hInst, nullptr);
+    CreateWindowExW(0, WC_BUTTONW, L"应用",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        122, kDlgH - 40, 84, 26, dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_OPT_APPLY)), hInst, nullptr);
     ApplyFont(ok);
     SendMessageW(dlg, DM_SETDEFID, IDOK, 0);
     UpdateTriEnabled(dlg);
