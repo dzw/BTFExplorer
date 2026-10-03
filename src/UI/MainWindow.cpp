@@ -125,12 +125,12 @@ void MainWindow::HideToTray()
 void MainWindow::OpenSettings()
 {
     SettingsData data;
-    data.gridLines = showGridLines_;
+    data.gridLines  = showGridLines_;
+    data.pagination = paginationEnabled_;
     data.paneCount = (int)panes_.size();
     if (data.paneCount < 1) data.paneCount = 1;
     if (data.paneCount > 4) data.paneCount = 4;
     data.triLayout = triLayout_;
-    data.pageSize  = (int)pageSize_;
     if (!settings::GetAutoStart(data.autoStart)) return;
     const bool prevAutoStart = data.autoStart;
 
@@ -142,11 +142,11 @@ void MainWindow::OpenSettings()
         }
         if (d.autoStart != prevAutoStart)
             settings::SetAutoStart(d.autoStart);
-        if (d.pageSize != (int)pageSize_) {
-            pageSize_ = (size_t)d.pageSize;
-            SyncPagerSizeCombo();                 // 同步分页栏的下拉框
+        if (d.pagination != paginationEnabled_) {
+            paginationEnabled_ = d.pagination;
             CurTab().curPage = 0;
-            Navigate(CurTab().dir, false);
+            Navigate(CurTab().dir, false);  // 用新的页大小重新加载
+            Layout();                       // 显示/隐藏整条分页栏
         }
         if (d.triLayout != triLayout_)
             SetTriLayout(d.triLayout);
@@ -350,6 +350,12 @@ void MainWindow::CreatePane(Pane& p)
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
         0, 0, 26, 22, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_NEWTAB_BASE + p.tag)), hInst, nullptr);
     if (uiFont_) SendMessageW(p.btnNewTab, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+
+    // 本窗格右上角的“▾”：外部工具下拉菜单（CMD / PowerShell / VSCode 等，见 tools.txt）
+    p.btnTools = CreateWindowExW(0, WC_BUTTONW, L"▾",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        0, 0, 24, 20, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TOOLS_BASE + p.tag)), hInst, nullptr);
+    if (uiFont_) SendMessageW(p.btnTools, WM_SETFONT, (WPARAM)uiFont_, TRUE);
 }
 
 // 分配当前未被占用的窗格编号（最多同时 4 个窗格，编号池 0~7 足够）
@@ -374,6 +380,7 @@ void MainWindow::RemovePane(size_t idx)
     }
     DestroyWindow(panes_[idx].tab);
     if (panes_[idx].btnNewTab) DestroyWindow(panes_[idx].btnNewTab);
+    if (panes_[idx].btnTools) DestroyWindow(panes_[idx].btnTools);
     panes_.erase(panes_.begin() + idx);
     for (auto& t : tabs_)
         if (t.pane > idx) --t.pane;
@@ -555,6 +562,7 @@ void MainWindow::SaveSession()
     putLine(L"sideWidth=" + std::to_wstring(sideWidth_));
     // 设置界面里的开关也要记住，重启后继续生效
     putLine(L"grid=" + std::to_wstring(showGridLines_ ? 1 : 0));
+    putLine(L"pagination=" + std::to_wstring(paginationEnabled_ ? 1 : 0));
     putLine(L"pageSize=" + std::to_wstring(pageSize_));
     // 记录窗口位置/尺寸。
     // 非最大化/最小化时改用 GetWindowRect 取“真实屏幕矩形”，这样能正确捕获
@@ -691,6 +699,10 @@ bool MainWindow::RestoreSession()
                 showGridLines_ = (_wtoi(w.c_str() + 5) != 0);
                 continue;
             }
+            if (w.rfind(L"pagination=", 0) == 0) {
+                paginationEnabled_ = (_wtoi(w.c_str() + 11) != 0);
+                continue;
+            }
             if (w.rfind(L"pageSize=", 0) == 0) {
                 int v = _wtoi(w.c_str() + 9);
                 // 只接受下拉框里真实存在的档位，避免手改文件后把分页搞坏
@@ -806,7 +818,7 @@ bool MainWindow::RestoreSession()
         if ((size_t)t.histPos >= t.history.size()) t.histPos = (int)t.history.size() - 1;
         t.dir = t.history[t.histPos];
         t.pages->SetNotify([this]() { PostMessage(hwnd_, WM_APP_PAGELOADED, 0, 0); });
-        t.pages->OpenDirectory(t.dir, pageSize_);  // 预置加载器：之后切到该分页时 RequestPage 能命中
+        t.pages->OpenDirectory(t.dir, EffectivePageSize());  // 预置加载器：之后切到该分页时 RequestPage 能命中
         panes_[pi].tabs.push_back(idx);
         std::wstring name = t.dir;
         size_t s = name.find_last_of(L'\\');
@@ -1160,7 +1172,7 @@ void MainWindow::Navigate(const std::wstring& rawPath, bool addHistory)
         }
     }
 
-    t.pages->OpenDirectory(path, pageSize_);
+    t.pages->OpenDirectory(path, EffectivePageSize());
     ListView_SetItemCountEx(CurList(), 0, 0);
     UpdateStatusBar();
     UpdatePaginationBar();
@@ -1211,7 +1223,9 @@ void MainWindow::UpdateStatusBar()
 {
     wchar_t buf[160];
     unsigned long long total = CurTab().pages->TotalCount();
-    if (total > 0)
+    if (total > 0 && !paginationEnabled_)
+        wsprintfW(buf, L"共 %I64u 项（未分页）", total);
+    else if (total > 0)
         wsprintfW(buf, L"共 %I64u 项   第 %I64u / %zu 页   每页 %zu 项",
             total, static_cast<unsigned long long>(CurTab().curPage + 1), CurTab().pages->PageCount(), pageSize_);
     else
@@ -1221,6 +1235,7 @@ void MainWindow::UpdateStatusBar()
 
 void MainWindow::UpdatePaginationBar()
 {
+    if (!paginationEnabled_) return;   // 分页栏整条已隐藏
     wchar_t buf[80];
     unsigned long long total = CurTab().pages->TotalCount();
     if (total > 0)
@@ -1308,6 +1323,19 @@ bool MainWindow::SelectedPath(std::wstring& out) const
     if (sel < 0) return false;
     out = CurrentPagePath(sel);
     return !out.empty();
+}
+
+std::vector<std::wstring> MainWindow::SelectedPaths() const
+{
+    std::vector<std::wstring> out;
+    int sel = -1;
+    for (;;) {
+        sel = ListView_GetNextItem(CurList(), sel, LVNI_SELECTED);
+        if (sel < 0) break;
+        std::wstring p = CurrentPagePath(sel);
+        if (!p.empty()) out.push_back(std::move(p));
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1513,11 +1541,11 @@ void MainWindow::OnRemoveFavorite()
 // ---------------------------------------------------------------------------
 // 键盘操作
 // ---------------------------------------------------------------------------
-void MainWindow::OnDelete()
+void MainWindow::OnDelete(bool toRecycleBin)
 {
-    std::wstring path;
-    if (!SelectedPath(path)) return;
-    if (shell::ExecuteFileOp(hwnd_, shell::FileOp::Delete, path, L""))
+    auto paths = SelectedPaths();
+    if (paths.empty()) return;
+    if (shell::ExecuteFileOpMulti(hwnd_, shell::FileOp::Delete, paths, L"", toRecycleBin))
         RefreshList();
 }
 
@@ -1619,38 +1647,111 @@ void MainWindow::OnRename()
         RefreshList();
 }
 
-void MainWindow::OnClipboard(bool cut, bool copyOnly)
+// 把文件路径列表放进剪贴板（CF_HDROP + Preferred DropEffect），与资源管理器
+// 完全互通：本程序/资源管理器里复制或剪切的文件，两边都能互相粘贴
+static void SetFileClipboard(HWND hwnd, const std::vector<std::wstring>& paths, bool cut)
 {
-    std::wstring path;
-    if (!SelectedPath(path)) return;
-    if (!OpenClipboard(hwnd_)) return;
+    if (paths.empty() || !OpenClipboard(hwnd)) return;
     EmptyClipboard();
-    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (path.size() + 2) * sizeof(wchar_t));
+
+    // CF_HDROP：DROPFILES 头 + 双 '\0' 结尾的宽字符路径串
+    SIZE_T chars = 0;
+    for (const auto& p : paths) chars += p.size() + 1;
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE,
+                            sizeof(DROPFILES) + (chars + 1) * sizeof(wchar_t));
     if (h) {
-        auto* p = static_cast<wchar_t*>(GlobalLock(h));
-        wcscpy_s(p, path.size() + 2, path.c_str());
-        GlobalUnlock(h);
-        SetClipboardData(CF_UNICODETEXT, h);
+        auto* df = static_cast<DROPFILES*>(GlobalLock(h));
+        if (df) {
+            df->pFiles = sizeof(DROPFILES);
+            df->fWide = TRUE;
+            auto* w = reinterpret_cast<wchar_t*>(df + 1);
+            for (const auto& p : paths) {
+                size_t n = p.size() + 1;
+                wmemcpy(w, p.c_str(), n);
+                w += n;
+            }
+            *w = L'\0';                       // 列表以双 '\0' 结束
+            GlobalUnlock(h);
+            if (!SetClipboardData(CF_HDROP, h)) GlobalFree(h); // 成功后归系统所有
+        } else {
+            GlobalFree(h);
+        }
+    }
+
+    // 剪切/复制语义
+    UINT pe = RegisterClipboardFormatW(L"Preferred DropEffect");
+    HGLOBAL he = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
+    if (he) {
+        auto* effect = static_cast<DWORD*>(GlobalLock(he));
+        if (effect) {
+            *effect = cut ? DROPEFFECT_MOVE : DROPEFFECT_COPY;
+            GlobalUnlock(he);
+            if (!SetClipboardData(pe, he)) GlobalFree(he);
+        } else {
+            GlobalFree(he);
+        }
     }
     CloseClipboard();
-    // 记录 cut/copy 状态供粘贴使用（简化：静态存储）
-    static std::wstring clipPath;
-    static bool clipCut = false;
-    clipPath = path;
-    clipCut = cut && !copyOnly;
-    (void)clipPath; (void)clipCut;
+}
+
+void MainWindow::OnClipboard(bool cut)
+{
+    auto paths = SelectedPaths();
+    if (paths.empty()) return;
+    SetFileClipboard(hwnd_, paths, cut);
 }
 
 void MainWindow::OnPaste()
 {
-    if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return;
-    if (!OpenClipboard(hwnd_)) return;
-    HANDLE h = GetClipboardData(CF_UNICODETEXT);
-    std::wstring src = h ? static_cast<const wchar_t*>(GlobalLock(h)) : L"";
-    if (h) GlobalUnlock(h);
-    CloseClipboard();
-    if (src.empty()) return;
-    if (shell::ExecuteFileOp(hwnd_, shell::FileOp::Copy, src, CurTab().dir))
+    std::vector<std::wstring> srcs;
+    bool move = false;
+
+    if (IsClipboardFormatAvailable(CF_HDROP)) {
+        // 标准文件剪贴板：本程序/资源管理器复制或剪切的内容都走这里
+        if (!OpenClipboard(hwnd_)) return;
+        HANDLE h = GetClipboardData(CF_HDROP);
+        if (h) {
+            auto* drop = static_cast<HDROP>(GlobalLock(h));
+            if (drop) {
+                UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+                for (UINT i = 0; i < n; ++i) {
+                    UINT len = DragQueryFileW(drop, i, nullptr, 0); // 不含结尾 '\0'
+                    std::wstring p(len, L'\0');
+                    if (DragQueryFileW(drop, i, p.data(), len + 1) > 0)
+                        srcs.push_back(std::move(p));
+                }
+                UINT pe = RegisterClipboardFormatW(L"Preferred DropEffect");
+                HANDLE he = pe ? GetClipboardData(pe) : nullptr;
+                if (he) {
+                    auto* effect = static_cast<DWORD*>(GlobalLock(he));
+                    if (effect) {
+                        if (*effect & DROPEFFECT_MOVE) move = true;
+                        GlobalUnlock(he);
+                    }
+                }
+                GlobalUnlock(h);
+            }
+        }
+        CloseClipboard();
+    } else if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+        // 兼容回退：剪贴板是文本且恰好是一个存在的路径 -> 复制该文件
+        if (!OpenClipboard(hwnd_)) return;
+        HANDLE h = GetClipboardData(CF_UNICODETEXT);
+        std::wstring src = h ? static_cast<const wchar_t*>(GlobalLock(h)) : L"";
+        if (h) GlobalUnlock(h);
+        CloseClipboard();
+        size_t b = src.find_first_not_of(L" \t\r\n\"");
+        size_t e = src.find_last_not_of(L" \t\r\n\"");
+        if (b != std::wstring::npos) src = src.substr(b, e - b + 1);
+        if (!src.empty() &&
+            GetFileAttributesW(src.c_str()) != INVALID_FILE_ATTRIBUTES)
+            srcs.push_back(src);
+    }
+
+    if (srcs.empty()) return;
+    if (shell::ExecuteFileOpMulti(hwnd_,
+                                  move ? shell::FileOp::Move : shell::FileOp::Copy,
+                                  srcs, CurTab().dir, true))
         RefreshList();
 }
 
@@ -1697,6 +1798,20 @@ static LRESULT CALLBACK PaneTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC orig)
 {
     switch (m) {
+    case WM_LBUTTONDBLCLK: {
+        // 分页栏空白区双击 = 新建分页。tab 控件类若带 CS_DBLCLKS，双击的
+        // 第二次点击会以本消息到达（而不是 WM_LBUTTONDOWN），所以两处都接。
+        TCHITTESTINFO ht{};
+        ht.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        int idx = (int)SendMessageW(h, TCM_HITTEST, 0, reinterpret_cast<LPARAM>(&ht));
+        int pi = PaneOfTab(h);
+        if (idx < 0 && pi >= 0) {
+            lastBlankClickTime_ = 0;    // 收尾，避免再触发一次时间差检测
+            AddRightTab(true, (size_t)pi);
+            return 0;
+        }
+        break;
+    }
     case WM_LBUTTONDOWN: {
         TCHITTESTINFO ht{};
         ht.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
@@ -1803,6 +1918,20 @@ void MainWindow::UpdateNewTabButtons()
 {
     for (size_t i = 0; i < panes_.size(); ++i) {
         Pane& p = panes_[i];
+
+        // 右上角“▾”外部工具按钮：贴本窗格 tab 条的最右端
+        int toolsLeft = -1;
+        if (p.btnTools != nullptr && p.tab != nullptr) {
+            RECT tc{};
+            if (GetClientRect(p.tab, &tc) && tc.right > 30) {
+                POINT tr{ tc.right - 26, 1 };
+                MapWindowPoints(p.tab, hwnd_, &tr, 1);
+                SetWindowPos(p.btnTools, HWND_TOP, tr.x, tr.y, 24, 20,
+                             SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                toolsLeft = tr.x;
+            }
+        }
+
         if (p.btnNewTab == nullptr || p.tab == nullptr) continue;
         int cnt = (int)SendMessageW(p.tab, TCM_GETITEMCOUNT, 0, 0);
         if (cnt <= 0) { ShowWindow(p.btnNewTab, SW_HIDE); continue; }
@@ -1817,9 +1946,165 @@ void MainWindow::UpdateNewTabButtons()
         int x = br.x + 6;                       // 紧贴最后一个 tab 头右侧
         int y = tl.y + ((br.y - tl.y) - 22) / 2; // 与该 tab 头垂直居中
         p.lastTabRight = x;
+        // tab 太多快顶到“▾”按钮时收起“+”（分页栏放不下就别叠上去）
+        if (toolsLeft >= 0 && x + 26 > toolsLeft - 2) {
+            ShowWindow(p.btnNewTab, SW_HIDE);
+            continue;
+        }
         SetWindowPos(p.btnNewTab, HWND_TOP, x, y, 26, 22,
                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
+}
+
+// ---------------------------------------------------------------------------
+// 窗格右上角“▾”外部工具菜单
+// ---------------------------------------------------------------------------
+static std::wstring ToolsFilePath()
+{
+    wchar_t buf[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    std::wstring dir(buf);
+    size_t s = dir.find_last_of(L'\\');
+    if (s != std::wstring::npos) dir.resize(s);
+    return dir + L"\\tools.txt";
+}
+
+struct PaneTool { std::wstring name, cmdline; };
+
+// 解析工具列表文本：每行 名称|命令行，# 开头为注释
+static std::vector<PaneTool> ParsePaneTools(const std::wstring& text)
+{
+    std::vector<PaneTool> out;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t e = text.find(L'\n', pos);
+        std::wstring line = text.substr(pos,
+            (e == std::wstring::npos ? text.size() : e) - pos);
+        if (e == std::wstring::npos) pos = text.size() + 1;
+        else pos = e + 1;
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        if (line.empty() || line[0] == L'#') continue;
+        size_t bar = line.find(L'|');
+        if (bar == std::wstring::npos || bar == 0 || bar + 1 >= line.size()) continue;
+        out.push_back({ line.substr(0, bar), line.substr(bar + 1) });
+    }
+    return out;
+}
+
+// 读外部工具列表；文件不存在时先写入默认配置（CMD / PowerShell / VSCode）
+static std::vector<PaneTool> LoadPaneTools()
+{
+    static const wchar_t* kDefaults =
+        L"# 外部工具配置：每行一条，格式：名称|命令行（# 开头的行是注释）\n"
+        L"# %DIR% 会替换为按钮所在窗格的当前目录；命令的工作目录也是该目录。\n"
+        L"CMD|cmd.exe\n"
+        L"PowerShell|powershell.exe\n"
+        L"VSCode|cmd /c code \"%DIR%\"\n";
+
+    std::wstring text;
+    HANDLE h = CreateFileW(ToolsFilePath().c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        std::string utf8;
+        char buf[4096];
+        DWORD got = 0;
+        for (;;) {
+            if (!ReadFile(h, buf, sizeof(buf), &got, nullptr) || got == 0) break;
+            utf8.append(buf, got);
+        }
+        CloseHandle(h);
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8.data(),
+                                       (int)utf8.size(), nullptr, 0);
+        if (wlen > 0) {
+            text.resize(wlen);
+            MultiByteToWideChar(CP_UTF8, 0, utf8.data(), (int)utf8.size(),
+                                text.data(), wlen);
+        }
+    } else {
+        // 首次使用：落盘默认配置，方便用户直接改
+        text = kDefaults;
+        int n = WideCharToMultiByte(CP_UTF8, 0, kDefaults, -1,
+                                    nullptr, 0, nullptr, nullptr);
+        if (n > 1) {
+            std::string def(n - 1, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, kDefaults, -1,
+                                def.data(), n, nullptr, nullptr);
+            HANDLE w = CreateFileW(ToolsFilePath().c_str(), GENERIC_WRITE, 0,
+                                   nullptr, CREATE_ALWAYS, 0, nullptr);
+            if (w != INVALID_HANDLE_VALUE) {
+                DWORD written = 0;
+                WriteFile(w, def.data(), (DWORD)def.size(), &written, nullptr);
+                CloseHandle(w);
+            }
+        }
+    }
+
+    std::vector<PaneTool> tools = ParsePaneTools(text);
+    if (tools.empty()) tools = ParsePaneTools(kDefaults); // 文件被清空时兜底
+    return tools;
+}
+
+// 点击“▾”弹出的下拉菜单：外部工具 + 配置入口
+void MainWindow::ShowPaneToolsMenu(size_t paneIdx)
+{
+    if (paneIdx >= panes_.size() || panes_[paneIdx].btnTools == nullptr) return;
+    auto tools = LoadPaneTools();
+
+    HMENU menu = CreatePopupMenu();
+    for (size_t i = 0; i < tools.size(); ++i)
+        AppendMenuW(menu, MF_STRING, i + 1, tools[i].name.c_str());
+    if (!tools.empty()) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 1000, L"配置外部工具...");
+
+    RECT br{};
+    GetWindowRect(panes_[paneIdx].btnTools, &br);
+    int cmd = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                               br.left, br.bottom, hwnd_, nullptr);
+    DestroyMenu(menu);
+
+    if (cmd >= 1 && cmd <= (int)tools.size())
+        RunPaneTool(paneIdx, tools[cmd - 1].name, tools[cmd - 1].cmdline);
+    else if (cmd == 1000)
+        ShellExecuteW(hwnd_, L"open", L"notepad.exe",
+                      ToolsFilePath().c_str(), nullptr, SW_SHOWNORMAL);
+}
+
+// 启动外部工具：工作目录 = 该窗格当前分页的目录；%DIR% 替换为该目录
+void MainWindow::RunPaneTool(size_t paneIdx, const std::wstring& name,
+                             const std::wstring& cmdline)
+{
+    if (paneIdx >= panes_.size()) return;
+    std::wstring dir = PaneActiveTab(paneIdx).dir;
+    DWORD attr = GetFileAttributesW(dir.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        MessageBoxW(hwnd_, L"当前目录不存在，无法打开外部工具。",
+                    name.c_str(), MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    std::wstring line = cmdline;
+    for (size_t pos = 0; (pos = line.find(L"%DIR%", pos)) != std::wstring::npos; ) {
+        line.replace(pos, 5, dir);
+        pos += dir.size();
+    }
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_SHOWNORMAL;
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> buf(line.begin(), line.end());
+    buf.push_back(L'\0');
+    if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE,
+                        CREATE_NEW_CONSOLE, nullptr, dir.c_str(), &si, &pi)) {
+        std::wstring msg = L"无法启动工具：\n" + line +
+                           L"\n（错误码 " + std::to_wstring(GetLastError()) + L"）";
+        MessageBoxW(hwnd_, msg.c_str(), name.c_str(), MB_OK | MB_ICONERROR);
+        return;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
 }
 
 // ---------------------------------------------------------------------------
@@ -1860,7 +2145,9 @@ void MainWindow::Layout()
     GetWindowRect(status_, &rs);
     int statusH = rs.bottom - rs.top;
 
-    int pagerY = H - statusH - 28;
+    // 分页栏关闭时整条隐藏，28px 高度还给文件列表
+    int pagerH = paginationEnabled_ ? 28 : 0;
+    int pagerY = H - statusH - pagerH;
     int listH = pagerY - y;
 
     // 左侧 Tab 容器：先放 tab，再把内容页放到 tab 显示区内
@@ -1956,14 +2243,21 @@ void MainWindow::Layout()
     splitTop_ = y;
     splitBot_ = pagerY;
 
-    // 分页栏
-    int px = 4;
-    place(pagerFirst_, px, pagerY + 2, 40, 24); px += 44;
-    place(pagerPrev_,  px, pagerY + 2, 40, 24); px += 44;
-    place(pagerLabel_, px, pagerY + 4, 160, 20); px += 164;
-    place(pagerNext_,  px, pagerY + 2, 40, 24); px += 44;
-    place(pagerLast_,  px, pagerY + 2, 40, 24); px += 48;
-    place(pagerSize_,  px, pagerY + 2, 100, 24);
+    // 分页栏：关闭分页开关时整条隐藏
+    {
+        HWND pagerCtls[] = { pagerFirst_, pagerPrev_, pagerLabel_, pagerNext_, pagerLast_, pagerSize_ };
+        for (HWND h : pagerCtls)
+            if (h) ShowWindow(h, paginationEnabled_ ? SW_SHOWNA : SW_HIDE);
+    }
+    if (paginationEnabled_) {
+        int px = 4;
+        place(pagerFirst_, px, pagerY + 2, 40, 24); px += 44;
+        place(pagerPrev_,  px, pagerY + 2, 40, 24); px += 44;
+        place(pagerLabel_, px, pagerY + 4, 160, 20); px += 164;
+        place(pagerNext_,  px, pagerY + 2, 40, 24); px += 44;
+        place(pagerLast_,  px, pagerY + 2, 40, 24); px += 48;
+        place(pagerSize_,  px, pagerY + 2, 100, 24);
+    }
 
     // 状态栏自动布局
     SendMessageW(status_, WM_SIZE, 0, MAKELPARAM(W, H));
@@ -1982,6 +2276,16 @@ LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN ||
          msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN))
         SelectPane((size_t)pi);
+    // 文件视图的常规键盘操作（资源管理器习惯）：Ctrl+C 复制 / Ctrl+X 剪切 /
+    // Ctrl+V 粘贴 / Delete 删除到回收站 / Shift+Delete 直接删除。
+    if (pi >= 0 && msg == WM_KEYDOWN) {
+        bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (ctrl && wp == 'C')      { OnClipboard(false); return 0; }
+        if (ctrl && wp == 'X')      { OnClipboard(true);  return 0; }
+        if (ctrl && wp == 'V')      { OnPaste();          return 0; }
+        if (wp == VK_DELETE)        { OnDelete(!shift);   return 0; }
+    }
     if (pi >= 0 && msg == WM_CONTEXTMENU) {
         // 右键菜单：在列表空白/条目上弹出 Explorer 风格菜单
         if ((size_t)pi != activePane_) SelectPane((size_t)pi); // 先激活该窗格
@@ -2000,7 +2304,6 @@ LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         if (addFavorite) OnAddFavorite();
         return 0;
     }
-    if (msg == WM_CHAR && wp == VK_DELETE) { /* Del 经 LVN_KEYDOWN 处理 */ }
     if (pi >= 0 && msg == WM_KEYDOWN && wp == VK_ESCAPE) {
         // 列表聚焦时 ESC 同样等同于点关闭按钮：收进托盘
         HideToTray();
@@ -2223,8 +2526,8 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             }
             else if (nm->code == LVN_KEYDOWN) {
                 auto* kd = reinterpret_cast<NMLVKEYDOWN*>(nm);
-                if (kd->wVKey == VK_DELETE) OnDelete();
-                else if (kd->wVKey == VK_F2) OnRename();
+                if (kd->wVKey == VK_F2) OnRename();
+                // Delete/Shift+Delete 在 ListViewProc 的 WM_KEYDOWN 里处理
             }
         }
         else if (nm->code == TCN_SELCHANGE && PaneOfTab(nm->hwndFrom) >= 0) {
@@ -2310,6 +2613,13 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                     else
                         AddRightTab(true, (size_t)paneIdx); // 普通点击：在该窗格加一个分页
                 }
+                return 0;
+            }
+            // 每个窗格一个“▾”外部工具按钮
+            if (id >= IDC_TOOLS_BASE && id < IDC_TOOLS_BASE + 8) {
+                int tag = id - IDC_TOOLS_BASE;
+                for (size_t i = 0; i < panes_.size(); ++i)
+                    if (panes_[i].tag == tag) { ShowPaneToolsMenu(i); break; }
                 return 0;
             }
             break;

@@ -66,7 +66,9 @@ size_t EnumeratePage(const std::wstring& dir,
     }
 
     if (ok) {
-        out.reserve(count);
+        // reserve 上限 26 万条（约 25MB）：count 可能是“未分页”的大哨兵值（如 1e9），
+        // 直接按它预分配会申请几十 GB 而抛 bad_alloc；超出部分让 push_back 自己增长
+        out.reserve(std::min<size_t>(count, 260000));
         while (taken < count) {
             if (accept()) {
                 FileEntry e;

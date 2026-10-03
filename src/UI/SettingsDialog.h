@@ -16,11 +16,11 @@ inline int PageSizeToIndex(int size)
 
 // 设置界面的数据：进对话框时带初值，出来时回写结果
 struct SettingsData {
-    bool gridLines = true;   // 文件列表网格线
-    int  paneCount = 1;      // 窗格数量 1~4
-    int  triLayout = 1;      // 三窗格排列：0=品字形(1上2下) 1=倒品字形(2上1下)
-    int  pageSize  = 100;    // 每页项数
-    bool autoStart = false;  // 开机自启动
+    bool gridLines  = true;   // 文件列表网格线
+    bool pagination = true;   // 分页开关：关闭后一页显示全部条目（每页项数用主界面分页栏改）
+    int  paneCount  = 1;      // 窗格数量 1~4
+    int  triLayout  = 1;      // 三窗格排列：0=品字形(1上2下) 1=倒品字形(2上1下)
+    bool autoStart  = false;  // 开机自启动
 };
 
 namespace settings {

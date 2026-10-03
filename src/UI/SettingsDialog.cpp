@@ -14,7 +14,7 @@ enum {
     IDC_OPT_GRID = 1040, IDC_OPT_PANES1 = 1041, IDC_OPT_PANES2 = 1042,
     IDC_OPT_PANES3 = 1043, IDC_OPT_PANES4 = 1044,
     IDC_OPT_TRI_TOP = 1045, IDC_OPT_TRI_DOWN = 1046,
-    IDC_OPT_PAGESIZE = 1047, IDC_OPT_STARTUP = 1048,
+    IDC_OPT_PAGING = 1047, IDC_OPT_STARTUP = 1048,
     IDC_OPT_APPLY = 1049,   // “应用”按钮（即时生效，对话框不关闭）
 };
 
@@ -22,13 +22,12 @@ constexpr wchar_t kDlgClass[] = L"PagedExplorerSettingsBox";
 constexpr wchar_t kRunKey[]    = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValue[]  = L"PagedExplorer";
 
-// 对话框尺寸
-constexpr int kDlgW = 404, kDlgH = 286;
+// 对话框尺寸（高度要盖住非客户区：标题栏 + 边框约占 30px）
+constexpr int kDlgW = 404, kDlgH = 330;
 
 // 模态期间共享的状态（同一时刻只有一个设置对话框）
 struct State {
     SettingsData data{};   // 进对话框时的初值 / 按确定后的结果
-    int  pageIndex = 1;    // 每页项数在 combo 里的下标
     bool applied = false;  // 用户是否按了“确定”
     HFONT font = nullptr;  // 主窗口的界面字体
     std::function<void(const SettingsData&)> apply; // “确定/应用”时即时套用
@@ -64,18 +63,14 @@ void ApplyFont(HWND h)
     if (g.font) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), TRUE);
 }
 
-// 把当前控件状态读回 g.data / g.pageIndex
+// 把当前控件状态读回 g.data
 void ReadControls(HWND h)
 {
-    g.data.gridLines = (Button_GetCheck(GetDlgItem(h, IDC_OPT_GRID)) == BST_CHECKED);
-    g.data.paneCount = RadioChecked(h, IDC_OPT_PANES1, 4) + 1;
-    g.data.triLayout = RadioChecked(h, IDC_OPT_TRI_TOP, 2);
-    g.pageIndex      = (int)SendMessageW(GetDlgItem(h, IDC_OPT_PAGESIZE),
-                                         CB_GETCURSEL, 0, 0);
-    if (g.pageIndex < 0 || g.pageIndex >= kPageSizeCount)
-        g.pageIndex = PageSizeToIndex(g.data.pageSize);
-    g.data.pageSize  = kPageSizes[g.pageIndex];
-    g.data.autoStart = (Button_GetCheck(GetDlgItem(h, IDC_OPT_STARTUP)) == BST_CHECKED);
+    g.data.gridLines  = (Button_GetCheck(GetDlgItem(h, IDC_OPT_GRID)) == BST_CHECKED);
+    g.data.pagination = (Button_GetCheck(GetDlgItem(h, IDC_OPT_PAGING)) == BST_CHECKED);
+    g.data.paneCount  = RadioChecked(h, IDC_OPT_PANES1, 4) + 1;
+    g.data.triLayout  = RadioChecked(h, IDC_OPT_TRI_TOP, 2);
+    g.data.autoStart  = (Button_GetCheck(GetDlgItem(h, IDC_OPT_STARTUP)) == BST_CHECKED);
 }
 
 LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
@@ -180,7 +175,6 @@ bool Show(HWND owner, HFONT font, SettingsData& data,
            std::function<void(const SettingsData&)> onApply)
 {
     g.data = data;
-    g.pageIndex = PageSizeToIndex(data.pageSize);
     g.applied = false;
     g.font = font;
     g.apply = std::move(onApply);
@@ -218,10 +212,10 @@ bool Show(HWND owner, HFONT font, SettingsData& data,
         ApplyFont(h);
         return h;
     };
-    auto rad = [&](const wchar_t* t, int id, int x, int y, bool groupStart) {
+    auto rad = [&](const wchar_t* t, int id, int x, int y, bool groupStart, int w = 130) {
         DWORD st = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON;
         if (groupStart) st |= WS_GROUP;
-        HWND h = CreateWindowExW(0, WC_BUTTONW, t, st, x, y, 130, 22, dlg,
+        HWND h = CreateWindowExW(0, WC_BUTTONW, t, st, x, y, w, 22, dlg,
                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), hInst, nullptr);
         ApplyFont(h);
         return h;
@@ -232,46 +226,44 @@ bool Show(HWND owner, HFONT font, SettingsData& data,
     HWND cGrid = chk(L"显示网格线（关闭后列表不再画横竖线）", IDC_OPT_GRID, 34, 34);
     Button_SetCheck(cGrid, g.data.gridLines ? BST_CHECKED : BST_UNCHECKED);
 
-    lab(L"文件列表每页项数：", 34, 62, 150);
-    HWND cPage = CreateWindowExW(0, WC_COMBOBOXW, L"",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | CBS_DROPDOWNLIST,
-        190, 60, 120, 200, dlg,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_OPT_PAGESIZE)), hInst, nullptr);
-    ApplyFont(cPage);
-    for (int i = 0; i < kPageSizeCount; ++i) {
-        wchar_t buf[32]; swprintf_s(buf, L"%d / 页", kPageSizes[i]);
-        SendMessageW(cPage, CB_ADDSTRING, 0, (LPARAM)buf);
-    }
-    SendMessageW(cPage, CB_SETCURSEL, g.pageIndex, 0);
+    HWND cPaging = chk(L"启用分页（关闭后一次显示全部条目）", IDC_OPT_PAGING, 34, 58);
+    Button_SetCheck(cPaging, g.data.pagination ? BST_CHECKED : BST_UNCHECKED);
 
     // ---- 窗格布局 ----
-    lab(L"窗格布局", 20, 96, 200);
+    lab(L"窗格布局", 20, 92, 200);
     lab(L"窗格数量：", 34, 120, 80);
+    // 单选钮宽度必须收紧（文本只有一位数字，36px 足够）：以前固定 130px 而间距只有
+    // 42px，控件矩形互相叠压，z 序在上面的会吃掉下面的大部分点击区域
     for (int i = 0; i < 4; ++i) {
         wchar_t t[8]; swprintf_s(t, L"%d", i + 1);
-        rad(t, IDC_OPT_PANES1 + i, 118 + i * 42, 118, i == 0);
+        rad(t, IDC_OPT_PANES1 + i, 118 + i * 40, 118, i == 0, 36);
         SetCheck(dlg, IDC_OPT_PANES1 + i, g.data.paneCount == i + 1);
     }
-    lab(L"三窗格排列：", 34, 148, 90);
-    rad(L"品字形（1 上 2 下）", IDC_OPT_TRI_TOP, 130, 146, true);
-    rad(L"倒品字形（2 上 1 下）", IDC_OPT_TRI_DOWN, 268, 146, false);
+    lab(L"三窗格排列：", 34, 150, 90);
+    // 两个选项文字较长（约 150px），横排放不下会互相裁剪，改为竖排
+    rad(L"品字形（1 上 2 下）", IDC_OPT_TRI_TOP, 128, 148, true, 190);
+    rad(L"倒品字形（2 上 1 下）", IDC_OPT_TRI_DOWN, 128, 172, false, 190);
     SetCheck(dlg, IDC_OPT_TRI_TOP, g.data.triLayout == 0);
     SetCheck(dlg, IDC_OPT_TRI_DOWN, g.data.triLayout != 0);
 
     // ---- 启动 ----
-    lab(L"启动", 20, 182, 200);
-    HWND cStart = chk(L"Windows 启动时运行本应用", IDC_OPT_STARTUP, 34, 204);
+    lab(L"启动", 20, 206, 200);
+    HWND cStart = chk(L"Windows 启动时运行本应用", IDC_OPT_STARTUP, 34, 228);
     Button_SetCheck(cStart, g.data.autoStart ? BST_CHECKED : BST_UNCHECKED);
 
+    // 按钮贴客户区底部：以前用 kDlgH-40 定位，没扣掉标题栏/边框高度，
+    // 三个按钮下半截被客户区底边裁掉
+    RECT rcDlg{}; GetClientRect(dlg, &rcDlg);
+    int btnY = rcDlg.bottom - 36;
     HWND ok = CreateWindowExW(0, WC_BUTTONW, L"确定",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_DEFPUSHBUTTON,
-        214, kDlgH - 40, 84, 26, dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), hInst, nullptr);
+        214, btnY, 84, 26, dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), hInst, nullptr);
     CreateWindowExW(0, WC_BUTTONW, L"取消",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        306, kDlgH - 40, 84, 26, dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), hInst, nullptr);
+        306, btnY, 84, 26, dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), hInst, nullptr);
     CreateWindowExW(0, WC_BUTTONW, L"应用",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        122, kDlgH - 40, 84, 26, dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_OPT_APPLY)), hInst, nullptr);
+        122, btnY, 84, 26, dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_OPT_APPLY)), hInst, nullptr);
     ApplyFont(ok);
     SendMessageW(dlg, DM_SETDEFID, IDOK, 0);
     UpdateTriEnabled(dlg);

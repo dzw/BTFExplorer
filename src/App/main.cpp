@@ -3,6 +3,7 @@
 #include <objbase.h>
 #include <shellapi.h>
 #include <cstdio>
+#include <exception>
 #include <vector>
 #include "../UI/MainWindow.h"
 #include "../Util/AppLog.h"
@@ -41,6 +42,12 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
 {
+    // 未捕获 C++ 异常（如 std::bad_alloc）会走 terminate -> abort（WER 里表现为
+    // ucrtbase c0000409）；在这里记一条日志，方便事后从 applog 定位
+    std::set_terminate([]() {
+        WriteAppLog(L"TERMINATE: uncaught exception (terminate handler hit)");
+    });
+
     std::vector<wchar_t> exePath(32768);
     DWORD exeLength = GetModuleFileNameW(nullptr, exePath.data(),
                                         static_cast<DWORD>(exePath.size()));

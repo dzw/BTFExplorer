@@ -8,4 +8,4 @@ build.bat
 /cmake-build/
 /.idea/
 /.codebuddy/*.png
-.codebuddy/run_*.ps1
+.codebuddy/*.ps1

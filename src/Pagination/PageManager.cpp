@@ -45,7 +45,9 @@ bool PageManager::TryGetPage(size_t pageIndex, std::vector<FileEntry>& out) cons
 
 void PageManager::PrefetchAround(size_t currentPage)
 {
+    size_t pages = PageCount();
     for (size_t p : { currentPage == 0 ? 0 : currentPage - 1, currentPage + 1 }) {
+        if (pages > 0 && p >= pages) continue; // 越界页不预取（未分页时只有 1 页）
         std::lock_guard<std::mutex> lk(mtx_);
         if (!cache_.count(p) && !pending_.count(p)) {
             pending_[p] = true;

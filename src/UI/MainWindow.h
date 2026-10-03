@@ -17,6 +17,7 @@ enum {
     IDC_PAGE_SIZE = 1014, IDC_PAGER_LABEL = 1015,
     IDC_TAB = 1016, IDC_FAVLIST = 1017, IDC_RIGHTTAB = 1018, IDC_NEWTAB = 1019,
     IDC_NEWTAB_BASE = 1200,    // 每个窗格一个“+”按钮，命令 ID = IDC_NEWTAB_BASE + 窗格 tag
+    IDC_TOOLS_BASE = 1210,     // 每个窗格一个“▾”外部工具按钮，命令 ID = IDC_TOOLS_BASE + tag
     IDC_LAYOUT1 = 1020, IDC_LAYOUT2 = 1021, IDC_LAYOUT3 = 1022, IDC_LAYOUT4 = 1023,
     IDC_TRI_PINTOP = 1024, IDC_TRI_PINDOWN = 1025,
     IDC_MENU_FILTERS = 1026,
@@ -51,6 +52,7 @@ struct Pane {
     size_t active = 0;                       // 本窗格当前显示的分页
     int lastTabRight = 0;                    // 最后一个 tab 头右缘（“+”按钮定位用）
     HWND btnNewTab = nullptr;                // 本窗格的“+”新增分页按钮
+    HWND btnTools = nullptr;                 // 本窗格右上角的“▾”外部工具按钮
 };
 
 // 资源管理器主窗口：树 + 虚拟 ListView + 地址栏 + 分页栏 + 状态栏
@@ -98,6 +100,7 @@ private:
     void SyncPagerSizeCombo();       // 每页项数变化/恢复后，同步分页栏下拉框
     int  EnsureIcon(FileEntry& e);       // 系统图像列表索引（懒取并缓存）
     bool SelectedPath(std::wstring& out) const;
+    std::vector<std::wstring> SelectedPaths() const; // 选中项完整路径（支持多选）
     std::wstring CurrentPagePath(int item) const; // item -> full path
 
     // 收藏
@@ -110,10 +113,10 @@ private:
     void OnRemoveFavorite();
 
     // 键盘/命令
-    void OnDelete();
+    void OnDelete(bool toRecycleBin = true); // 删除选中项；false=不进回收站（Shift+Delete）
     void OnRename();
-    void OnClipboard(bool cut, bool copyOnly = false);
-    void OnPaste();
+    void OnClipboard(bool cut);      // 复制/剪切选中项（CF_HDROP + Preferred DropEffect）
+    void OnPaste();                  // 粘贴剪贴板中的文件到当前目录
     void HideToTray();
     void ShowFromTray();
     void EnsureTrayIcon();      // 图标常驻：确保通知区里有图标（幂等）
@@ -194,6 +197,8 @@ private:
     void MoveTabToPane(size_t tabIndex, size_t paneIdx); // 分页拖拽移动
     void UpdateRightTabLabels();
     void UpdateNewTabButtons(); // 每个窗格的“+”按钮贴在其最后一个分页头右侧
+    void ShowPaneToolsMenu(size_t paneIdx); // 窗格右上角“▾”：外部工具下拉菜单（可配置）
+    void RunPaneTool(size_t paneIdx, const std::wstring& name, const std::wstring& cmdline);
     size_t PaneTabPos(size_t paneIdx, size_t tabIndex) const; // 分页在本窗格中的序号
     void TabContextMenu(HWND h, int idx, POINT screenPt);     // 分页标题右键菜单
     void CloseOtherTabs(size_t keepTabIndex);                 // 关闭同一窗格的其它分页
@@ -201,6 +206,11 @@ private:
     void ToggleTabLock(size_t tabIndex);                      // 锁定 / 解锁该分页
 
     size_t pageSize_ = 100;
+    // 关闭分页开关时用“一页装下所有”的档位（ PageManager 对它按普通页处理，
+    // 分页栏整条隐藏，状态栏显示“未分页”）
+    static constexpr size_t kUnlimitedPageSize = 1000000000;
+    bool paginationEnabled_ = true;   // 分页开关（设置界面可关）
+    size_t EffectivePageSize() const { return paginationEnabled_ ? pageSize_ : kUnlimitedPageSize; }
     int sortCol_ = 0;      // 排序列（全局记住）
     bool sortAsc_ = true;
     bool showGridLines_ = true;  // 文件列表是否画网格线（设置界面可关）
