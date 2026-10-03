@@ -20,8 +20,17 @@ void PageManager::OpenDirectory(const std::wstring& dir, size_t pageSize)
     worker_ = std::thread(&PageManager::WorkerLoop, this);
 }
 
-bool PageManager::RequestPage(size_t pageIndex)
+void PageManager::Invalidate()
 {
+    std::lock_guard<std::mutex> lk(mtx_);
+    cache_.clear();
+    pending_.clear();
+    totalCount_ = 0;
+    totalCountAtomic_.store(0);
+    // 工作线程保持待命；调用方随后 RequestPage 会重新排队加载
+}
+
+bool PageManager::RequestPage(size_t pageIndex){
     std::lock_guard<std::mutex> lk(mtx_);
     if (cache_.count(pageIndex)) return true;
     if (pending_.count(pageIndex)) return false;

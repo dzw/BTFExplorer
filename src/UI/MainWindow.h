@@ -89,6 +89,7 @@ private:
     // 列表（作用于激活窗格的当前分页）
     HWND  CurList() const;            // 激活窗格的 ListView
     void RefreshList();               // 重新请求当前页
+    void RefreshListFromDisk();       // 文件增删改后：清分页缓存再刷新（防旧缓存）
     void OnPageLoaded();              // 后台加载完成（已 PostMessage 转到 UI 线程）
     void UpdateStatusBar();
     void UpdatePaginationBar();
@@ -160,6 +161,8 @@ private:
     int  savedPaneCount_ = 1;           // favorites.txt 的 panes= 恢复值
     bool startupLayoutApplied_ = false; // 启动恢复只做一次
     size_t pendingCloseTab_ = SIZE_MAX; // 中键点击待关闭的分页（延后到下一次消息循环）
+    size_t pendingAddTabPane_ = SIZE_MAX; // 双击空白待新建分页的窗格（延后处理，避免在
+                                          // tab 控件自己的窗口过程里 TCM_INSERTITEM/重排）
     size_t pendingMoveTab_ = SIZE_MAX;  // 拖拽待移动的分页
     int    pendingMovePane_ = -1;       // 拖拽目标窗格
     size_t menuTab_ = SIZE_MAX;         // 右键菜单作用的分页

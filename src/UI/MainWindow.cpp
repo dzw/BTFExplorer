@@ -17,6 +17,7 @@ static constexpr int WM_APP_PAGELOADED = WM_APP + 1;
 static constexpr UINT WM_APP_WIN_E = WM_APP + 2;   // Win+E 被拦截后激活本窗口
 static constexpr int WM_APP_CLOSE_TAB = WM_APP + 3; // 中键点击分页 -> 延后到主窗口关闭
 static constexpr int WM_APP_MOVE_TAB  = WM_APP + 4; // 拖拽分页 -> 延后到主窗口移动
+static constexpr int WM_APP_ADD_TAB   = WM_APP + 6; // 双击空白新建分页 -> 延后到主窗口添加（+5 是托盘回调）
 
 static UINT GetTaskbarBroadcastMessage()
 {
@@ -247,7 +248,7 @@ void MainWindow::CreateSidePanel()
     // 树和收藏列表都是 tab_ 的子窗口，显示由 SwitchSideTab 控制
     directoryTree_.Create(tab_, IDC_TREE, uiFont_);
     directoryTree_.PopulateDrives();
-    btnTreeSync_ = CreateWindowExW(0, WC_BUTTONW, L"定位",
+    btnTreeSync_ = CreateWindowExW(0, WC_BUTTONW, L"定",//定位
         WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
         0, 0, 0, 0, tab_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TREE_SYNC)), hInst, nullptr);
     if (uiFont_) SendMessageW(btnTreeSync_, WM_SETFONT, (WPARAM)uiFont_, TRUE);
@@ -1205,6 +1206,14 @@ void MainWindow::RefreshList()
     UpdatePaginationBar();
 }
 
+void MainWindow::RefreshListFromDisk()
+{
+    // 删除/粘贴/改名后页面数据已过期：清掉分页缓存再刷新，
+    // 否则 RequestPage 直接命中旧缓存，列表显示的还是操作前的内容
+    CurTab().pages->Invalidate();
+    RefreshList();
+}
+
 void MainWindow::OnPageLoaded()
 {
     // 后台加载完成后：如果当前分页还没内容就填充
@@ -1546,7 +1555,7 @@ void MainWindow::OnDelete(bool toRecycleBin)
     auto paths = SelectedPaths();
     if (paths.empty()) return;
     if (shell::ExecuteFileOpMulti(hwnd_, shell::FileOp::Delete, paths, L"", toRecycleBin))
-        RefreshList();
+        RefreshListFromDisk();
 }
 
 // 重命名对话框窗口过程：IDOK/IDCANCEL -> 记录结果并销毁
@@ -1644,7 +1653,7 @@ void MainWindow::OnRename()
     if (!g_renameConfirmed || g_renameText.empty() || g_renameText == oldName) return;
 
     if (shell::ExecuteFileOp(hwnd_, shell::FileOp::Rename, path, g_renameText))
-        RefreshList();
+        RefreshListFromDisk();
 }
 
 // 把文件路径列表放进剪贴板（CF_HDROP + Preferred DropEffect），与资源管理器
@@ -1752,7 +1761,7 @@ void MainWindow::OnPaste()
     if (shell::ExecuteFileOpMulti(hwnd_,
                                   move ? shell::FileOp::Move : shell::FileOp::Copy,
                                   srcs, CurTab().dir, true))
-        RefreshList();
+        RefreshListFromDisk();
 }
 
 // 地址栏子类化：回车时向主窗口发 EN_RETURN 通知
@@ -1799,15 +1808,18 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
 {
     switch (m) {
     case WM_LBUTTONDBLCLK: {
-        // 分页栏空白区双击 = 新建分页。tab 控件类若带 CS_DBLCLKS，双击的
-        // 第二次点击会以本消息到达（而不是 WM_LBUTTONDOWN），所以两处都接。
+        // 分页栏空白区双击 = 新建分页。tab 控件类带 CS_DBLCLKS，双击的第二次
+        // 点击以本消息到达。不在这里直接 AddRightTab：那会在 tab 控件自己的
+        // 窗口过程里 TCM_INSERTITEM + Layout(对它 SetWindowPos)，重入 comctl32
+        // 内部状态会把它点崩（COMCTL32 c000041d），丢给主窗口消息循环处理。
         TCHITTESTINFO ht{};
         ht.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         int idx = (int)SendMessageW(h, TCM_HITTEST, 0, reinterpret_cast<LPARAM>(&ht));
         int pi = PaneOfTab(h);
         if (idx < 0 && pi >= 0) {
             lastBlankClickTime_ = 0;    // 收尾，避免再触发一次时间差检测
-            AddRightTab(true, (size_t)pi);
+            if (!PostMessageW(hwnd_, WM_APP_ADD_TAB, static_cast<WPARAM>(pi), 0))
+                WriteAppLog(L"ADD_TAB post failed after blank-area double-click");
             return 0;
         }
         break;
@@ -1824,13 +1836,15 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
             tabDragIndex_ = idx;
             SetCapture(h);
         } else if (pi >= 0) {
-            // 分页栏空白区域：双击新建分页（不依赖 CS_DBLCLKS，自己测时间差）
+            // 分页栏空白区域：双击新建分页（不依赖 CS_DBLCLKS，自己测时间差）。
+            // 同样延后到主窗口处理，原因同 WM_LBUTTONDBLCLK 分支。
             DWORD now = GetMessageTime();
             if (now - lastBlankClickTime_ <= (DWORD)GetDoubleClickTime() &&
                 abs(ht.pt.x - lastBlankClickPt_.x) <= GetSystemMetrics(SM_CXDOUBLECLK) &&
                 abs(ht.pt.y - lastBlankClickPt_.y) <= GetSystemMetrics(SM_CYDOUBLECLK)) {
                 lastBlankClickTime_ = 0;
-                AddRightTab(true, (size_t)pi);
+                if (!PostMessageW(hwnd_, WM_APP_ADD_TAB, static_cast<WPARAM>(pi), 0))
+                    WriteAppLog(L"ADD_TAB post failed after blank-area double-click");
                 return 0;
             }
             lastBlankClickTime_ = now;
@@ -2160,7 +2174,7 @@ void MainWindow::Layout()
     int treeTop = tabH + 6;
     int innerH = listH - treeTop - 6;
     int sideContentH = listH - tabH - 12;
-    place(btnTreeSync_, sideW - 42, treeTop + 2, 36, 20);
+    place(btnTreeSync_, sideW - 42 - 2, treeTop + 2, 36, 20);
     place(directoryTree_.Handle(), 4, treeTop, sideW - 8, innerH);
     SetWindowPos(btnTreeSync_, HWND_TOP, sideW - 42, treeTop + 2, 36, 20,
                  SWP_NOACTIVATE);
@@ -2300,7 +2314,7 @@ LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         bool addFavorite = false;
         if (shell::ShowContextMenu(hwnd_, path, CurTab().dir, pt,
                                   L"添加当前目录到收藏", addFavorite))
-            RefreshList();
+            RefreshListFromDisk();   // 右键菜单可能增删改了文件（删除/粘贴/重命名）
         if (addFavorite) OnAddFavorite();
         return 0;
     }
@@ -2529,6 +2543,26 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                 if (kd->wVKey == VK_F2) OnRename();
                 // Delete/Shift+Delete 在 ListViewProc 的 WM_KEYDOWN 里处理
             }
+            else if (nm->code == LVN_ODFINDITEM) {
+                // 虚拟列表的类型前置搜索：键入字符时控件要求我们给出匹配项下标，
+                // 不处理的话输入 g 无法定位到 github 这类条目
+                auto* fi = reinterpret_cast<NMLVFINDITEM*>(nm);
+                TabState& t = PaneActiveTab((size_t)pi);
+                int n = (int)t.pageItems.size();
+                const wchar_t* prefix = fi->lvfi.psz;
+                if (n == 0 || !prefix || !*prefix) return -1;
+                int start = fi->iStart;
+                if (start < 0 || start >= n) start = 0;
+                size_t plen = wcslen(prefix);
+                for (int k = 0; k < n; ++k) {           // 从 iStart 起环形查找
+                    int i = (start + k) % n;
+                    const std::wstring& name = t.pageItems[i].name;
+                    if (name.size() >= plen &&
+                        _wcsnicmp(name.c_str(), prefix, plen) == 0)
+                        return i;                        // 返回匹配下标（不是 0！）
+                }
+                return -1;
+            }
         }
         else if (nm->code == TCN_SELCHANGE && PaneOfTab(nm->hwndFrom) >= 0) {
             // 某个窗格的 tab 头点击：切换该窗格的当前分页
@@ -2636,7 +2670,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         case IDC_LAYOUT4: SetPaneCount(4); return 0;
         case IDC_TRI_PINTOP:  SetTriLayout(0); return 0; // 品字形：1 上 2 下
         case IDC_TRI_PINDOWN: SetTriLayout(1); return 0; // 倒品字形：2 上 1 下
-        case IDC_REFRESH: RefreshList(); return 0;
+        case IDC_REFRESH: RefreshListFromDisk(); return 0;   // 刷新=真正重新枚举目录
         case IDC_MENU_FILTERS:
             shell::OpenContextMenuFilterSettings(hwnd_);
             return 0;
@@ -2682,6 +2716,11 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             MoveTabToPane(pendingMoveTab_, (size_t)pendingMovePane_);
         pendingMoveTab_ = SIZE_MAX;
         pendingMovePane_ = -1;
+        return 0;
+
+    case WM_APP_ADD_TAB:        // 双击分页栏空白（延后到这里真正新建，见 PaneTabHandler）
+        if (static_cast<size_t>(wp) < panes_.size())
+            AddRightTab(true, static_cast<size_t>(wp));
         return 0;
 
     case WM_APP_PAGELOADED:

@@ -21,6 +21,10 @@ public:
     // 打开新目录（重置缓存并后台加载第 0 页）
     void OpenDirectory(const std::wstring& dir, size_t pageSize);
 
+    // 清空缓存强制重新枚举：本程序/外部对当前目录做增删改后调用，
+    // 否则 RefreshList 命中旧缓存，列表显示的还是操作前的内容
+    void Invalidate();
+
     // 请求加载某一页。返回 true = 已在缓存（可立即取）；false = 已提交后台加载
     bool RequestPage(size_t pageIndex);
 
