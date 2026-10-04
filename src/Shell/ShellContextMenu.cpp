@@ -251,6 +251,96 @@ static bool GroupOpenActions(HMENU menu)
     return true;
 }
 
+static std::wstring MenuItemText(HMENU menu, UINT position)
+{
+    std::vector<wchar_t> text(1024, L'\0');
+    MENUITEMINFOW item{};
+    item.cbSize = sizeof(item);
+    item.fMask = MIIM_STRING;
+    item.dwTypeData = text.data();
+    item.cch = static_cast<UINT>(text.size());
+    if (!GetMenuItemInfoW(menu, position, TRUE, &item))
+        return {};
+    return std::wstring(item.dwTypeData, item.cch);
+}
+
+static bool IsNewFolderCommand(HMENU menu, UINT command, bool inNewMenu = false)
+{
+    for (int i = 0; i < GetMenuItemCount(menu); ++i) {
+        MENUITEMINFOW item{};
+        item.cbSize = sizeof(item);
+        item.fMask = MIIM_ID | MIIM_SUBMENU;
+        if (!GetMenuItemInfoW(menu, static_cast<UINT>(i), TRUE, &item))
+            continue;
+
+        std::wstring text = MenuItemText(menu, static_cast<UINT>(i));
+        std::wstring normalized = text;
+        for (wchar_t& ch : normalized) {
+            if (ch == L'&') ch = L' ';
+            else ch = static_cast<wchar_t>(std::towlower(ch));
+        }
+        bool isNewMenu = inNewMenu ||
+            normalized.find(L"新建") != std::wstring::npos ||
+            normalized.find(L"new") != std::wstring::npos;
+        if (item.hSubMenu) {
+            if (IsNewFolderCommand(item.hSubMenu, command, isNewMenu))
+                return true;
+        } else if (item.wID == command && isNewMenu &&
+                   (normalized.find(L"文件夹") != std::wstring::npos ||
+                    normalized.find(L"folder") != std::wstring::npos)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ListDirectories(const std::wstring& directory,
+                            std::vector<std::wstring>& names)
+{
+    names.clear();
+    if (directory.empty()) return false;
+    std::wstring pattern = directory;
+    if (pattern.back() != L'\\' && pattern.back() != L'/')
+        pattern.push_back(L'\\');
+    pattern.push_back(L'*');
+
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileW(pattern.c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE)
+        return false;
+    do {
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            wcscmp(data.cFileName, L".") != 0 && wcscmp(data.cFileName, L"..") != 0)
+            names.emplace_back(data.cFileName);
+    } while (FindNextFileW(find, &data));
+    FindClose(find);
+    return true;
+}
+
+static std::wstring FindCreatedDirectory(const std::wstring& directory,
+                                        const std::vector<std::wstring>& previous)
+{
+    std::vector<std::wstring> current;
+    if (!ListDirectories(directory, current))
+        return {};
+    for (const std::wstring& name : current) {
+        bool existed = false;
+        for (const std::wstring& oldName : previous) {
+            if (_wcsicmp(name.c_str(), oldName.c_str()) == 0) {
+                existed = true;
+                break;
+            }
+        }
+        if (!existed) {
+            std::wstring path = directory;
+            if (path.back() != L'\\' && path.back() != L'/')
+                path.push_back(L'\\');
+            return path + name;
+        }
+    }
+    return {};
+}
+
 struct ContextMenuHandler {
     IContextMenu2* menu2 = nullptr;
     IContextMenu3* menu3 = nullptr;
@@ -278,9 +368,10 @@ static LRESULT CALLBACK ContextMenuSubclassProc(HWND hwnd, UINT msg, WPARAM wp,
 
 bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& menuDir,
                      POINT ptScreen, const std::wstring& customItem,
-                     bool& customItemSelected)
+                     bool& customItemSelected, std::wstring* createdFolderPath)
 {
     customItemSelected = false;
+    if (createdFolderPath) createdFolderPath->clear();
     UniquePIDL pidl;
     ComPtr<IShellFolder> parent;
     PCUITEMID_CHILD child = nullptr;
@@ -319,6 +410,8 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
     HMENU menu = CreatePopupMenu();
     if (!menu) return false;
     bool invoked = false;
+    std::vector<std::wstring> previousDirectories;
+    bool haveDirectorySnapshot = false;
     if (SUCCEEDED(cm->QueryContextMenu(menu, 0, CMD_FIRST, CMD_LAST, CMF_NORMAL))) {
         std::vector<std::wstring> hiddenNames;
         LoadHiddenNames(hwnd, hiddenNames);
@@ -364,6 +457,9 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
                 if (PathRemoveFileSpecW(parentPath.data()))
                     invokeDir.assign(parentPath.data());
             }
+            bool newFolderCommand = IsNewFolderCommand(menu, cmd);
+            if (newFolderCommand && createdFolderPath)
+                haveDirectorySnapshot = ListDirectories(invokeDir, previousDirectories);
             char dirA[MAX_PATH * 2] = {};
             if (!invokeDir.empty())
                 WideCharToMultiByte(CP_ACP, 0, invokeDir.c_str(), -1,
@@ -378,6 +474,8 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
             info.nShow = SW_SHOWNORMAL;
             info.ptInvoke = ptScreen;
             invoked = SUCCEEDED(cm->InvokeCommand(reinterpret_cast<CMINVOKECOMMANDINFO*>(&info)));
+            if (invoked && newFolderCommand && createdFolderPath && haveDirectorySnapshot)
+                *createdFolderPath = FindCreatedDirectory(invokeDir, previousDirectories);
             if (!invoked)
                 MessageBoxW(hwnd, L"执行所选系统右键菜单命令失败。",
                             L"右键菜单", MB_OK | MB_ICONERROR);
