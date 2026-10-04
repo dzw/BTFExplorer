@@ -1,5 +1,6 @@
 #include "ShellContextMenu.h"
 #include "ShellUtil.h"
+#include "../Util/AppLog.h"
 #include <shlobj.h>
 #include <shellapi.h>
 #include <shlwapi.h>
@@ -14,6 +15,7 @@ namespace shell {
 static constexpr UINT CMD_FIRST = 1;
 static constexpr UINT CMD_LAST  = 0x7FFF;
 static constexpr UINT CMD_CUSTOM = CMD_LAST + 1;
+static constexpr UINT CMD_RENAME = CMD_LAST + 2;
 
 static const std::vector<std::wstring>& DefaultHiddenNames()
 {
@@ -264,6 +266,36 @@ static std::wstring MenuItemText(HMENU menu, UINT position)
     return std::wstring(item.dwTypeData, item.cch);
 }
 
+static bool IsRenameLabel(const std::wstring& text)
+{
+    std::wstring normalized = text;
+    for (wchar_t& ch : normalized) {
+        if (ch == L'&') ch = L' ';
+        else ch = static_cast<wchar_t>(std::towlower(ch));
+    }
+    return normalized.find(L"重命名") != std::wstring::npos ||
+           normalized.find(L"rename") != std::wstring::npos;
+}
+
+static void RemoveRenameItems(HMENU menu)
+{
+    for (int i = GetMenuItemCount(menu) - 1; i >= 0; --i) {
+        MENUITEMINFOW item{};
+        item.cbSize = sizeof(item);
+        item.fMask = MIIM_SUBMENU;
+        if (!GetMenuItemInfoW(menu, static_cast<UINT>(i), TRUE, &item))
+            continue;
+
+        if (IsRenameLabel(MenuItemText(menu, static_cast<UINT>(i)))) {
+            DeleteMenu(menu, static_cast<UINT>(i), MF_BYPOSITION);
+        } else if (item.hSubMenu) {
+            RemoveRenameItems(item.hSubMenu);
+            if (GetMenuItemCount(item.hSubMenu) == 0)
+                DeleteMenu(menu, static_cast<UINT>(i), MF_BYPOSITION);
+        }
+    }
+}
+
 static bool IsNewFolderCommand(HMENU menu, UINT command, bool inNewMenu = false)
 {
     for (int i = 0; i < GetMenuItemCount(menu); ++i) {
@@ -294,50 +326,34 @@ static bool IsNewFolderCommand(HMENU menu, UINT command, bool inNewMenu = false)
     return false;
 }
 
-static bool ListDirectories(const std::wstring& directory,
-                            std::vector<std::wstring>& names)
+static std::wstring CreateFolderForRename(HWND owner, const std::wstring& directory)
 {
-    names.clear();
-    if (directory.empty()) return false;
-    std::wstring pattern = directory;
-    if (pattern.back() != L'\\' && pattern.back() != L'/')
-        pattern.push_back(L'\\');
-    pattern.push_back(L'*');
-
-    WIN32_FIND_DATAW data{};
-    HANDLE find = FindFirstFileW(pattern.c_str(), &data);
-    if (find == INVALID_HANDLE_VALUE)
-        return false;
-    do {
-        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-            wcscmp(data.cFileName, L".") != 0 && wcscmp(data.cFileName, L"..") != 0)
-            names.emplace_back(data.cFileName);
-    } while (FindNextFileW(find, &data));
-    FindClose(find);
-    return true;
-}
-
-static std::wstring FindCreatedDirectory(const std::wstring& directory,
-                                        const std::vector<std::wstring>& previous)
-{
-    std::vector<std::wstring> current;
-    if (!ListDirectories(directory, current))
-        return {};
-    for (const std::wstring& name : current) {
-        bool existed = false;
-        for (const std::wstring& oldName : previous) {
-            if (_wcsicmp(name.c_str(), oldName.c_str()) == 0) {
-                existed = true;
-                break;
-            }
+    if (directory.empty()) return {};
+    for (unsigned int suffix = 1; suffix <= 10000; ++suffix) {
+        std::wstring name = L"新建文件夹";
+        if (suffix > 1)
+            name += L" (" + std::to_wstring(suffix) + L")";
+        std::wstring path = directory;
+        if (path.back() != L'\\' && path.back() != L'/')
+            path.push_back(L'\\');
+        path += name;
+        if (CreateDirectoryW(path.c_str(), nullptr)) {
+            WriteAppLog((L"NEW_FOLDER created: " + path).c_str());
+            return path;
         }
-        if (!existed) {
-            std::wstring path = directory;
-            if (path.back() != L'\\' && path.back() != L'/')
-                path.push_back(L'\\');
-            return path + name;
+        DWORD error = GetLastError();
+        if (error != ERROR_ALREADY_EXISTS && error != ERROR_FILE_EXISTS) {
+            WriteAppLog((L"NEW_FOLDER create failed: path=" + path +
+                         L", win32Error=" + std::to_wstring(error)).c_str());
+            std::wstring message = L"无法创建文件夹：\n" + path +
+                L"\n错误码：" + std::to_wstring(error);
+            MessageBoxW(owner, message.c_str(), L"新建文件夹", MB_OK | MB_ICONERROR);
+            return {};
         }
     }
+    MessageBoxW(owner, L"无法找到可用的新文件夹名称。",
+                L"新建文件夹", MB_OK | MB_ICONERROR);
+    WriteAppLog((L"NEW_FOLDER failed: no available name in " + directory).c_str());
     return {};
 }
 
@@ -368,10 +384,15 @@ static LRESULT CALLBACK ContextMenuSubclassProc(HWND hwnd, UINT msg, WPARAM wp,
 
 bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& menuDir,
                      POINT ptScreen, const std::wstring& customItem,
-                     bool& customItemSelected, std::wstring* createdFolderPath)
+                     bool& customItemSelected, std::wstring* createdFolderPath,
+                     bool* renameSelected)
 {
     customItemSelected = false;
     if (createdFolderPath) createdFolderPath->clear();
+    if (renameSelected) *renameSelected = false;
+    WriteAppLog((L"CONTEXT_MENU opening: path=" +
+                 (path.empty() ? std::wstring(L"(background)") : path) +
+                 L", directory=" + menuDir).c_str());
     UniquePIDL pidl;
     ComPtr<IShellFolder> parent;
     PCUITEMID_CHILD child = nullptr;
@@ -410,13 +431,19 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
     HMENU menu = CreatePopupMenu();
     if (!menu) return false;
     bool invoked = false;
-    std::vector<std::wstring> previousDirectories;
-    bool haveDirectorySnapshot = false;
     if (SUCCEEDED(cm->QueryContextMenu(menu, 0, CMD_FIRST, CMD_LAST, CMF_NORMAL))) {
         std::vector<std::wstring> hiddenNames;
         LoadHiddenNames(hwnd, hiddenNames);
         FilterProviderItems(menu, hiddenNames);
         GroupOpenActions(menu);
+        if (!path.empty() && renameSelected) {
+            RemoveRenameItems(menu);
+            BOOL appended = AppendMenuW(menu, MF_STRING, CMD_RENAME, L"重命名(&M)");
+            WriteAppLog(appended
+                ? L"CONTEXT_MENU custom rename item appended"
+                : (L"CONTEXT_MENU failed to append rename item: error=" +
+                   std::to_wstring(GetLastError())).c_str());
+        }
         if (!customItem.empty()) {
             if (GetMenuItemCount(menu) > 0)
                 AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -442,10 +469,15 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
         }
         UINT cmd = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                     ptScreen.x, ptScreen.y, hwnd, nullptr);
+        WriteAppLog((L"CONTEXT_MENU returned command=" +
+                     std::to_wstring(cmd)).c_str());
         if (subclassed && (cm2 || cm3))
             RemoveWindowSubclass(hwnd, ContextMenuSubclassProc, subclassId);
         if (cmd == CMD_CUSTOM) {
             customItemSelected = true;
+        } else if (cmd == CMD_RENAME) {
+            if (renameSelected) *renameSelected = true;
+            WriteAppLog((L"CONTEXT_MENU rename command selected: " + path).c_str());
         } else if (cmd >= CMD_FIRST && cmd <= CMD_LAST) {
             // “新建”等文件夹背景菜单处理器靠 lpDirectoryW 知道在哪里创建文件，
             // 不设置会静默失败（粘贴/删除有数据对象提供目标，唯独新建依赖它）
@@ -458,8 +490,19 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
                     invokeDir.assign(parentPath.data());
             }
             bool newFolderCommand = IsNewFolderCommand(menu, cmd);
-            if (newFolderCommand && createdFolderPath)
-                haveDirectorySnapshot = ListDirectories(invokeDir, previousDirectories);
+            WriteAppLog((L"CONTEXT_MENU shell command selected: id=" +
+                         std::to_wstring(cmd) + L", newFolder=" +
+                         (newFolderCommand ? L"true" : L"false") +
+                         L", directory=" + invokeDir).c_str());
+            if (newFolderCommand && createdFolderPath) {
+                *createdFolderPath = CreateFolderForRename(hwnd, invokeDir);
+                invoked = !createdFolderPath->empty();
+                WriteAppLog((L"NEW_FOLDER request result: path=" +
+                             (createdFolderPath->empty() ? std::wstring(L"(none)") :
+                                                           *createdFolderPath)).c_str());
+                DestroyMenu(menu);
+                return invoked;
+            }
             char dirA[MAX_PATH * 2] = {};
             if (!invokeDir.empty())
                 WideCharToMultiByte(CP_ACP, 0, invokeDir.c_str(), -1,
@@ -474,8 +517,6 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
             info.nShow = SW_SHOWNORMAL;
             info.ptInvoke = ptScreen;
             invoked = SUCCEEDED(cm->InvokeCommand(reinterpret_cast<CMINVOKECOMMANDINFO*>(&info)));
-            if (invoked && newFolderCommand && createdFolderPath && haveDirectorySnapshot)
-                *createdFolderPath = FindCreatedDirectory(invokeDir, previousDirectories);
             if (!invoked)
                 MessageBoxW(hwnd, L"执行所选系统右键菜单命令失败。",
                             L"右键菜单", MB_OK | MB_ICONERROR);

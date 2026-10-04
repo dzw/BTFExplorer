@@ -10,7 +10,8 @@ namespace shell {
 bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& menuDir,
                      POINT ptScreen, const std::wstring& customItem,
                      bool& customItemSelected,
-                     std::wstring* createdFolderPath = nullptr);
+                     std::wstring* createdFolderPath = nullptr,
+                     bool* renameSelected = nullptr);
 
 // Opens the editable UTF-8 filter list in Notepad, creating it with defaults if needed.
 bool OpenContextMenuFilterSettings(HWND owner);

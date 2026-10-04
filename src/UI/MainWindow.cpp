@@ -1771,14 +1771,23 @@ static LRESULT CALLBACK RenameDlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 void MainWindow::OnRename()
 {
     std::wstring path;
-    if (!SelectedPath(path)) return;
+    if (!SelectedPath(path)) {
+        WriteAppLog(L"RENAME request ignored: no selected item in active pane");
+        return;
+    }
+    WriteAppLog((L"RENAME requested from active pane: " + path).c_str());
     RenamePath(path);
 }
 
 void MainWindow::RenamePath(const std::wstring& path)
 {
-    if (path.empty()) return;
+    if (path.empty()) {
+        WriteAppLog(L"RENAME aborted: empty source path");
+        return;
+    }
     std::wstring oldName = path.substr(path.find_last_of(L'\\') + 1);
+    WriteAppLog((L"RENAME dialog opening: path=" + path +
+                 L", currentName=" + oldName).c_str());
 
     const wchar_t* DLG_CLASS = L"PagedExplorerRenameBox";
     HINSTANCE hInst = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd_, GWLP_HINSTANCE));
@@ -1791,6 +1800,15 @@ void MainWindow::RenamePath(const std::wstring& path)
         wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
         wc.lpszClassName = DLG_CLASS;
         cls = RegisterClassW(&wc);
+        if (!cls && GetLastError() == ERROR_CLASS_ALREADY_EXISTS)
+            cls = 1;
+    }
+    if (!cls) {
+        WriteAppLog((L"RENAME dialog class registration failed: error=" +
+                     std::to_wstring(GetLastError())).c_str());
+        MessageBoxW(hwnd_, L"无法创建重命名对话框。", L"重命名",
+                    MB_OK | MB_ICONERROR);
+        return;
     }
 
     g_renameConfirmed = false;
@@ -1798,6 +1816,13 @@ void MainWindow::RenamePath(const std::wstring& path)
 
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, DLG_CLASS, L"重命名",
         WS_POPUP | WS_CAPTION | WS_SYSMENU, 0, 0, 420, 112, hwnd_, nullptr, hInst, nullptr);
+    if (!dlg) {
+        WriteAppLog((L"RENAME dialog creation failed: error=" +
+                     std::to_wstring(GetLastError())).c_str());
+        MessageBoxW(hwnd_, L"无法打开重命名对话框。", L"重命名",
+                    MB_OK | MB_ICONERROR);
+        return;
+    }
     // 居中到主窗口
     RECT rm; GetWindowRect(hwnd_, &rm);
     SetWindowPos(dlg, nullptr,
@@ -1841,10 +1866,28 @@ void MainWindow::RenamePath(const std::wstring& path)
     EnableWindow(hwnd_, TRUE);
     SetFocus(CurList());
 
-    if (!g_renameConfirmed || g_renameText.empty() || g_renameText == oldName) return;
+    if (!g_renameConfirmed) {
+        WriteAppLog((L"RENAME dialog cancelled: path=" + path).c_str());
+        return;
+    }
+    if (g_renameText.empty() || g_renameText == oldName) {
+        WriteAppLog((L"RENAME no-op: path=" + path +
+                     L", enteredName=" + g_renameText).c_str());
+        return;
+    }
 
-    if (shell::ExecuteFileOp(hwnd_, shell::FileOp::Rename, path, g_renameText))
+    WriteAppLog((L"RENAME operation starting: source=" + path +
+                 L", destinationName=" + g_renameText).c_str());
+    if (shell::ExecuteFileOp(hwnd_, shell::FileOp::Rename, path, g_renameText)) {
+        WriteAppLog((L"RENAME operation succeeded: source=" + path +
+                     L", destinationName=" + g_renameText).c_str());
         RefreshListFromDisk();
+    } else {
+        WriteAppLog((L"RENAME operation failed: source=" + path +
+                     L", destinationName=" + g_renameText).c_str());
+        MessageBoxW(hwnd_, L"重命名失败。请确认文件仍存在且目标名称可用。",
+                    L"重命名", MB_OK | MB_ICONERROR);
+    }
 }
 
 // 把文件路径列表放进剪贴板（CF_HDROP + Preferred DropEffect），与资源管理器
@@ -2620,6 +2663,16 @@ LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     int pi = PaneOfList(h);
+    if (pi >= 0 && msg == WM_KEYDOWN && wp == VK_F2) {
+        int selected = ListView_GetNextItem(h, -1, LVNI_SELECTED);
+        std::wstring path = PaneItemPath(static_cast<size_t>(pi), selected);
+        if (!path.empty()) {
+            if (static_cast<size_t>(pi) != activePane_)
+                SelectPane(static_cast<size_t>(pi));
+            RenamePath(path);
+        }
+        return 0;
+    }
     // 只有真正的用户输入（点击/按键）才激活窗格并同步目录树；
     // 鼠标移动、悬停重绘、tooltip 等带来的消息一律不切换。
     if (pi >= 0 && (size_t)pi != activePane_ &&
@@ -2631,10 +2684,12 @@ LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     if (pi >= 0 && msg == WM_KEYDOWN) {
         bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (wp == VK_F2)
+            WriteAppLog((L"RENAME key message received by list: pane=" +
+                         std::to_wstring(pi)).c_str());
         if (ctrl && wp == 'C')      { OnClipboard(false); return 0; }
         if (ctrl && wp == 'X')      { OnClipboard(true);  return 0; }
         if (ctrl && wp == 'V')      { OnPaste();          return 0; }
-        if (wp == VK_F2)            { OnRename();         return 0; }
         if (wp == VK_DELETE)        { OnDelete(!shift);   return 0; }
     }
     if (pi >= 0 && msg == WM_CONTEXTMENU) {
@@ -2665,11 +2720,26 @@ LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         }
         bool addFavorite = false;
         std::wstring createdFolderPath;
+        bool renameSelected = false;
         if (shell::ShowContextMenu(hwnd_, path, PaneActiveTab((size_t)pi).dir, pt,
-                                  L"添加当前目录到收藏", addFavorite, &createdFolderPath)) {
+                                  L"添加当前目录到收藏", addFavorite, &createdFolderPath,
+                                  &renameSelected)) {
+            WriteAppLog((L"CONTEXT_MENU command completed: pane=" +
+                         std::to_wstring(pi) + L", selectedPath=" +
+                         (path.empty() ? L"(background)" : path) +
+                         L", createdFolder=" +
+                         (createdFolderPath.empty() ? L"(none)" : createdFolderPath)).c_str());
             if (!createdFolderPath.empty())
                 RenamePath(createdFolderPath);
             RefreshListFromDisk();   // 右键菜单可能增删改了文件（删除/粘贴/重命名）
+        } else {
+            WriteAppLog((L"CONTEXT_MENU command not invoked: pane=" +
+                         std::to_wstring(pi) + L", selectedPath=" +
+                         (path.empty() ? L"(background)" : path)).c_str());
+        }
+        if (renameSelected && !path.empty()) {
+            WriteAppLog((L"CONTEXT_MENU rename selected: " + path).c_str());
+            RenamePath(path);
         }
         if (addFavorite) OnAddFavorite();
         return 0;
@@ -2896,7 +2966,11 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             }
             else if (nm->code == LVN_KEYDOWN) {
                 auto* kd = reinterpret_cast<NMLVKEYDOWN*>(nm);
-                if (kd->wVKey == VK_F2) OnRename();
+                if (kd->wVKey == VK_F2) {
+                    WriteAppLog((L"RENAME LVN_KEYDOWN received: pane=" +
+                                 std::to_wstring(pi)).c_str());
+                    OnRename();
+                }
                 // Delete/Shift+Delete 在 ListViewProc 的 WM_KEYDOWN 里处理
             }
             else if (nm->code == LVN_ODFINDITEM) {

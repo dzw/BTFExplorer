@@ -3,30 +3,55 @@
 #include <shlobj.h>
 #include <shellapi.h>
 #include <shlwapi.h>
+#include "../Util/AppLog.h"
 
 namespace shell {
+
+static const wchar_t* FileOpName(FileOp op)
+{
+    switch (op) {
+    case FileOp::Delete: return L"delete";
+    case FileOp::Copy: return L"copy";
+    case FileOp::Move: return L"move";
+    case FileOp::Rename: return L"rename";
+    }
+    return L"unknown";
+}
 
 bool ExecuteFileOp(HWND hwnd, FileOp op,
                    const std::wstring& srcPath,
                    const std::wstring& destName)
 {
+    WriteAppLog((L"FILEOP start: op=" + std::wstring(FileOpName(op)) +
+                 L", source=" + srcPath + L", destination=" + destName).c_str());
     ComPtr<IFileOperation> fo;
-    if (FAILED(CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL,
-                                IID_PPV_ARGS(&fo))))
+    HRESULT hr = CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL,
+                                  IID_PPV_ARGS(&fo));
+    if (FAILED(hr)) {
+        WriteAppLog((L"FILEOP CoCreateInstance failed: hr=" +
+                     std::to_wstring(static_cast<unsigned long>(hr))).c_str());
         return false;
+    }
 
     DWORD flags = FOF_ALLOWUNDO | FOF_NOCONFIRMMKDIR;
     if (op != FileOp::Delete) flags |= FOF_NO_CONNECTED_ELEMENTS;
-    if (FAILED(fo->SetOperationFlags(flags)))
+    hr = fo->SetOperationFlags(flags);
+    if (FAILED(hr)) {
+        WriteAppLog((L"FILEOP SetOperationFlags failed: hr=" +
+                     std::to_wstring(static_cast<unsigned long>(hr))).c_str());
         return false;
+    }
 
     UniquePIDL pidl = PIDLFromPath(srcPath);
     ComPtr<IShellItem> item;
-    if (FAILED(SHCreateItemFromParsingName(srcPath.c_str(), nullptr,
-                                           IID_PPV_ARGS(&item))))
+    hr = SHCreateItemFromParsingName(srcPath.c_str(), nullptr, IID_PPV_ARGS(&item));
+    if (FAILED(hr)) {
+        WriteAppLog((L"FILEOP source parsing failed: hr=" +
+                     std::to_wstring(static_cast<unsigned long>(hr)) +
+                     L", source=" + srcPath).c_str());
         return false;
+    }
 
-    HRESULT hr = E_FAIL;
     switch (op) {
     case FileOp::Delete:
         hr = fo->DeleteItem(item.Get(), nullptr);
@@ -38,17 +63,36 @@ bool ExecuteFileOp(HWND hwnd, FileOp op,
     case FileOp::Move: {
         // destName 在这里表示目标目录
         ComPtr<IShellItem> dest;
-        if (FAILED(SHCreateItemFromParsingName(destName.c_str(), nullptr,
-                                               IID_PPV_ARGS(&dest))))
+        hr = SHCreateItemFromParsingName(destName.c_str(), nullptr, IID_PPV_ARGS(&dest));
+        if (FAILED(hr)) {
+            WriteAppLog((L"FILEOP destination parsing failed: hr=" +
+                         std::to_wstring(static_cast<unsigned long>(hr)) +
+                         L", destination=" + destName).c_str());
             return false;
+        }
         hr = (op == FileOp::Copy) ? fo->CopyItem(item.Get(), dest.Get(), nullptr, nullptr)
                                   : fo->MoveItem(item.Get(), dest.Get(), nullptr, nullptr);
         break;
     }
     }
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        WriteAppLog((L"FILEOP queue operation failed: hr=" +
+                     std::to_wstring(static_cast<unsigned long>(hr))).c_str());
+        return false;
+    }
     hr = fo->PerformOperations();
-    return SUCCEEDED(hr);
+    if (FAILED(hr)) {
+        WriteAppLog((L"FILEOP PerformOperations failed: hr=" +
+                     std::to_wstring(static_cast<unsigned long>(hr))).c_str());
+        return false;
+    }
+    BOOL aborted = FALSE;
+    HRESULT abortResult = fo->GetAnyOperationsAborted(&aborted);
+    WriteAppLog((L"FILEOP complete: op=" + std::wstring(FileOpName(op)) +
+                 L", aborted=" + (SUCCEEDED(abortResult) && aborted ? L"true" : L"false") +
+                 L", abortQueryHr=" +
+                 std::to_wstring(static_cast<unsigned long>(abortResult))).c_str());
+    return true;
 }
 
 bool ExecuteFileOpMulti(HWND hwnd, FileOp op,
