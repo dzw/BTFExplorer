@@ -1,3 +1,4 @@
+pskill PagedExplorer
 @echo off
 setlocal
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"

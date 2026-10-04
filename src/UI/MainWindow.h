@@ -155,9 +155,14 @@ private:
     size_t activePane_ = 0;             // 激活窗格（树/收藏/命令作用目标）
     size_t activeTab_ = 0;              // 激活窗格内的当前分页（tabs_ 下标）
     bool paneSplitDragging_ = false;    // 正在拖窗格间分隔条
+    bool rowSplitDragging_ = false;     // 正在拖窗格行之间的水平分隔条
     int  paneSplitIndex_ = -1;          // 拖动的分隔条（splitPairs_ 下标）
     std::vector<RECT> paneRects_;                // 各窗格客户区矩形（命中测试/拖拽用）
     std::vector<std::pair<int,int>> splitPairs_; // 同排并排窗格对（边界可拖）
+    int rowSplitPermille_ = 500;        // 上下两排高度比例（千分比）
+    int rowSplitY_ = -1;                // 两排间分隔条的当前 y 坐标
+    int rowSplitTop_ = 0;               // 两排布局可用区域顶部
+    int rowSplitBottom_ = 0;            // 两排布局可用区域底部
     int layoutCount_ = 1;               // 窗格数 1~4（Alt+1~4 切换，= panes_.size()）
     int triLayout_ = 1;                 // 3 窗格形态：0=品字形(1上2下) 1=倒品字形(2上1下)，默认倒品
     int  savedPaneCount_ = 1;           // favorites.txt 的 panes= 恢复值

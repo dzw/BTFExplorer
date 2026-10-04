@@ -1846,6 +1846,55 @@ static LRESULT CALLBACK PaneTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 
 LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC orig)
 {
+    // Hit zones overlap pane tabs; forward those mouse events because the parent won't receive them.
+    auto isSplitterHit = [&](POINT pt) {
+        ClientToScreen(h, &pt);
+        ScreenToClient(hwnd_, &pt);
+        if (pt.y < splitTop_ || pt.y > splitBot_) return false;
+        if (rowSplitY_ >= 0 &&
+            pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitHit &&
+            !paneRects_.empty()) {
+            int left = paneRects_.front().left;
+            int right = paneRects_.front().right;
+            for (const RECT& r : paneRects_) {
+                if (r.left < left) left = r.left;
+                if (r.right > right) right = r.right;
+            }
+            if (pt.x >= left && pt.x <= right) return true;
+        }
+        for (const auto& pr : splitPairs_) {
+            int edge = paneRects_[pr.first].right;
+            if (pt.x >= edge && pt.x <= edge + kSplitHit &&
+                pt.y >= paneRects_[pr.first].top && pt.y <= paneRects_[pr.first].bottom)
+                return true;
+        }
+        return pt.x >= sideWidth_ && pt.x <= sideWidth_ + kSplitHit;
+    };
+
+    if (m == WM_LBUTTONDOWN) {
+        POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        if (isSplitterHit(pt)) {
+            ClientToScreen(h, &pt);
+            ScreenToClient(hwnd_, &pt);
+            SendMessageW(hwnd_, WM_LBUTTONDOWN, wp, MAKELPARAM(pt.x, pt.y));
+            return 0;
+        }
+    } else if (m == WM_SETCURSOR) {
+        POINT pt{};
+        GetCursorPos(&pt);
+        ScreenToClient(h, &pt);
+        if (isSplitterHit(pt)) {
+            SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
+            ClientToScreen(h, &pt);
+            ScreenToClient(hwnd_, &pt);
+            if (rowSplitY_ >= 0 &&
+                pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitHit) {
+                SetCursor(LoadCursor(nullptr, IDC_SIZENS));
+            }
+            return TRUE;
+        }
+    }
+
     switch (m) {
     case WM_PAINT: {
         // 当前焦点窗格：分页栏整行底色涂淡粉绿。先让控件按主题画完，
@@ -2262,6 +2311,9 @@ void MainWindow::Layout()
     const int S = kSplitGap; // 分隔条厚度（视觉留白）
     paneRects_.clear();
     splitPairs_.clear();
+    rowSplitY_ = -1;
+    rowSplitTop_ = y;
+    rowSplitBottom_ = y + gh;
 
     size_t n = panes_.size();
     std::vector<RECT> rects(n);
@@ -2282,7 +2334,11 @@ void MainWindow::Layout()
         rects[1] = { gx + w + S, y, gx + gw, y + gh };
         splitPairs_.push_back({ 0, 1 });
     } else if (n == 3) {
-        int halfH = (gh - S) / 2;
+        int availableH = gh - S;
+        int halfH = (int)((long long)availableH * rowSplitPermille_ / 1000);
+        if (halfH < 120) halfH = 120;
+        if (availableH - halfH < 120) halfH = availableH - 120;
+        rowSplitY_ = y + halfH;
         if (triLayout_ == 1) { // 倒品字形：2 上 1 下（默认）
             int w = rowW(0, 1);
             rects[0] = { gx, y, gx + w, y + halfH };
@@ -2297,7 +2353,11 @@ void MainWindow::Layout()
             splitPairs_.push_back({ 1, 2 }); // 竖分隔条在下方两窗格之间
         }
     } else if (n >= 4) { // 4：田字形（n==0 时哪个分支都不走：窗格尚未创建）
-        int halfH = (gh - S) / 2;
+        int availableH = gh - S;
+        int halfH = (int)((long long)availableH * rowSplitPermille_ / 1000);
+        if (halfH < 120) halfH = 120;
+        if (availableH - halfH < 120) halfH = availableH - 120;
+        rowSplitY_ = y + halfH;
         int wTop = rowW(0, 1);
         int wBot = rowW(2, 3);
         rects[0] = { gx, y, gx + wTop, y + halfH };
@@ -2356,6 +2416,35 @@ void MainWindow::Layout()
 
 LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (msg == WM_LBUTTONDOWN || msg == WM_SETCURSOR) {
+        POINT pt{};
+        if (msg == WM_LBUTTONDOWN) {
+            pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            ClientToScreen(h, &pt);
+        } else {
+            GetCursorPos(&pt);
+        }
+        ScreenToClient(hwnd_, &pt);
+
+        if (rowSplitY_ >= 0 && !paneRects_.empty() &&
+            pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitHit) {
+            int left = paneRects_.front().left;
+            int right = paneRects_.front().right;
+            for (const RECT& r : paneRects_) {
+                if (r.left < left) left = r.left;
+                if (r.right > right) right = r.right;
+            }
+            if (pt.x >= left && pt.x <= right) {
+                if (msg == WM_LBUTTONDOWN) {
+                    SendMessageW(hwnd_, WM_LBUTTONDOWN, wp, MAKELPARAM(pt.x, pt.y));
+                } else {
+                    SetCursor(LoadCursor(nullptr, IDC_SIZENS));
+                }
+                return msg == WM_SETCURSOR ? TRUE : 0;
+            }
+        }
+    }
+
     int pi = PaneOfList(h);
     // 只有真正的用户输入（点击/按键）才激活窗格并同步目录树；
     // 鼠标移动、悬停重绘、tooltip 等带来的消息一律不切换。
@@ -2872,6 +2961,21 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
     case WM_LBUTTONDOWN: {
         int x = static_cast<int>(GET_X_LPARAM(lp));
         int yy = static_cast<int>(GET_Y_LPARAM(lp));
+        if (rowSplitY_ >= 0 && !paneRects_.empty() &&
+            yy >= rowSplitY_ - kSplitHit && yy <= rowSplitY_ + kSplitHit) {
+            int left = paneRects_.front().left;
+            int right = paneRects_.front().right;
+            for (const RECT& r : paneRects_) {
+                if (r.left < left) left = r.left;
+                if (r.right > right) right = r.right;
+            }
+            if (x >= left && x <= right) {
+                rowSplitDragging_ = true;
+                SetCapture(hwnd_);
+                SetCursor(LoadCursor(nullptr, IDC_SIZENS));
+                return 0;
+            }
+        }
         // 窗格间分隔条命中：splitPairs_ 各对的右缘 .. +12（限该排高度内）
         if (yy >= splitTop_ && yy <= splitBot_) {
             for (size_t k = 0; k < splitPairs_.size(); ++k) {
@@ -2896,6 +3000,20 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         break;
     }
     case WM_MOUSEMOVE:
+        if (rowSplitDragging_) {
+            int availableH = rowSplitBottom_ - rowSplitTop_ - kSplitGap;
+            if (availableH >= 240) {
+                int topH = static_cast<int>(GET_Y_LPARAM(lp)) - rowSplitTop_;
+                if (topH < 120) topH = 120;
+                if (topH > availableH - 120) topH = availableH - 120;
+                int ratio = (int)((long long)topH * 1000 / availableH);
+                if (ratio != rowSplitPermille_) {
+                    rowSplitPermille_ = ratio;
+                    Layout();
+                }
+            }
+            return 0;
+        }
         if (paneSplitDragging_) {
             // 拖 splitPairs_[k] 分隔条：调整左右两窗格的 width
             int x = static_cast<int>(GET_X_LPARAM(lp));
@@ -2906,15 +3024,14 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                 int leftEdge = paneRects_[a].left;
                 int want = x - leftEdge;
                 int minW = 160;
-                int maxW = paneRects_[b].right - minW - kSplitGap;
+                int availableW = paneRects_[b].right - leftEdge - kSplitGap;
+                int maxW = availableW - minW;
                 if (want < minW) want = minW;
                 if (want > maxW) want = maxW;
-                int delta = want - panes_[a].width;
-                // 宽度没变（例如鼠标停在最小/最大限制处）就不做全量重排
-                if (delta != 0) {
-                    panes_[a].width += delta;
-                    panes_[b].width -= delta;
-                    if (panes_[b].width < 160) panes_[b].width = 160;
+                // Store the actual pixel split as weights so the rendered divider tracks the pointer.
+                if (want != paneRects_[a].right - leftEdge) {
+                    panes_[a].width = want;
+                    panes_[b].width = availableW - want;
                     Layout();
                 }
             }
@@ -2930,6 +3047,11 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
     case WM_LBUTTONUP:
+        if (rowSplitDragging_) {
+            rowSplitDragging_ = false;
+            ReleaseCapture();
+            return 0;
+        }
         if (paneSplitDragging_) {
             paneSplitDragging_ = false;
             paneSplitIndex_ = -1;
@@ -2944,6 +3066,19 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         break;
     case WM_SETCURSOR: {
         POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd_, &pt);
+        if (rowSplitY_ >= 0 && !paneRects_.empty() &&
+            pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitHit) {
+            int left = paneRects_.front().left;
+            int right = paneRects_.front().right;
+            for (const RECT& r : paneRects_) {
+                if (r.left < left) left = r.left;
+                if (r.right > right) right = r.right;
+            }
+            if (pt.x >= left && pt.x <= right) {
+                SetCursor(LoadCursor(nullptr, IDC_SIZENS));
+                return TRUE;
+            }
+        }
         // 窗格间分隔条光标
         if (pt.y >= splitTop_ && pt.y <= splitBot_) {
             for (size_t k = 0; k < splitPairs_.size(); ++k) {
