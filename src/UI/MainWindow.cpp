@@ -40,6 +40,10 @@ static constexpr UINT EN_ADDR_RETURN = 0x1000;
 static constexpr int kSplitGap = 3;
 static constexpr int kSplitHit = 6;
 
+// 缓慢双击进重命名：第一次单击选中后，第二次单击落在同一项、且间隔已超过
+// 系统双击时间（说明没被识别成双击打开）但仍在该时间窗内 -> 视为“慢双击”重命名。
+static constexpr DWORD kSlowRenameWindow = 1500; // ms
+
 static LRESULT CALLBACK AddressProc(HWND h, UINT m, WPARAM wp, LPARAM lp); // 前向声明
 static LRESULT CALLBACK PaneTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp); // 分页拖拽 tab 子类化
 static LRESULT CALLBACK SideTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp);
@@ -2662,6 +2666,42 @@ LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         }
     }
 
+    // 慢双击（Explorer 习惯）：先单击选中、停顿一下再单击同一项 -> 进入重命名。
+    // 快速双击会被系统判定为双击、走 NM_DBLCLK 打开/进入；这里只拦截“慢”的那一次点击。
+    if (msg == WM_LBUTTONDOWN) {
+        LVHITTESTINFO ht{};
+        ht.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        int idx = ListView_HitTest(h, &ht);
+        DWORD now = GetMessageTime();
+        DWORD delta = (DWORD)(now - lastRenameClickTime_);
+        bool modifier = (GetKeyState(VK_CONTROL) & 0x8000) || (GetKeyState(VK_SHIFT) & 0x8000);
+        if (modifier) {
+            // Ctrl/Shift 是选择修饰键，不参与慢双击，并清掉记录避免误触发
+            lastRenameList_ = nullptr;
+            lastRenameClickItem_ = -1;
+            lastRenameClickTime_ = 0;
+        } else if (idx >= 0 && h == lastRenameList_ && idx == lastRenameClickItem_ &&
+                   ListView_GetItemState(h, idx, LVIS_SELECTED) &&
+                   delta >= (DWORD)GetDoubleClickTime() && delta <= kSlowRenameWindow) {
+            lastRenameList_ = nullptr;    // 复位，避免连点连续触发
+            lastRenameClickItem_ = -1;
+            lastRenameClickTime_ = 0;
+            int rpi = PaneOfList(h);
+            if (rpi >= 0) {
+                std::wstring path = PaneItemPath((size_t)rpi, idx);
+                if (!path.empty()) {
+                    if ((size_t)rpi != activePane_) SelectPane((size_t)rpi);
+                    RenamePath(path);
+                }
+            }
+            return 0;   // 吃掉这次点击（项已选中，无需再改选择）
+        } else {
+            lastRenameList_ = h;
+            lastRenameClickItem_ = idx;   // 空白处 idx<0 也记录，会覆盖上一项
+            lastRenameClickTime_ = now;
+        }
+    }
+
     int pi = PaneOfList(h);
     if (pi >= 0 && msg == WM_KEYDOWN && wp == VK_F2) {
         int selected = ListView_GetNextItem(h, -1, LVNI_SELECTED);
@@ -3067,9 +3107,19 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         case IDC_UP: {
+            // 上一级：逐级去掉最后一段。一级文件夹的上一级就是盘根（F:\tts_out -> F:\），
+            // 原先的 find_last_of + (p>2) 判断会把这种“父目录就是盘根”的情况误拦，
+            // 所以这里显式区分：父目录只剩盘符时补上反斜杠。
             const std::wstring& dir = CurTab().dir;
-            size_t p = dir.find_last_of(L'\\');
-            if (p != std::wstring::npos && p > 2) Navigate(dir.substr(0, p));
+            size_t end = dir.size();
+            while (end > 0 && (dir[end - 1] == L'\\' || dir[end - 1] == L'/')) --end; // 去尾分隔符
+            if (end <= 2) return 0;                    // 已在盘根（如 F:\）或无效路径，不动
+            size_t p = dir.find_last_of(L"\\/", end - 1);
+            std::wstring parent = (p == std::wstring::npos)
+                ? dir.substr(0, 2) + L'\\'             // "F:sub" 盘相对路径 -> 盘根
+                : dir.substr(0, p);
+            if (parent.size() == 2) parent += L'\\';   // "F:" -> "F:\"
+            if (!parent.empty() && parent != dir) Navigate(parent);
             return 0;
         }
         default:

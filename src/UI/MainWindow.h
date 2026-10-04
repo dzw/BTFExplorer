@@ -181,6 +181,9 @@ private:
     int  tabDragIndex_ = -1;            // 拖拽源窗格内的 tab 序号
     DWORD lastBlankClickTime_ = 0;      // 分页栏空白区单击时间（双击检测用）
     POINT lastBlankClickPt_ = {0, 0};   // 分页栏空白区单击位置（双击检测用）
+    HWND lastRenameList_ = nullptr;     // 慢双击重命名：上次单击所在列表
+    int  lastRenameClickItem_ = -1;     // 慢双击重命名：上次单击的行下标
+    DWORD lastRenameClickTime_ = 0;     // 慢双击重命名：上次单击时刻
 
     TabState& CurTab() { return tabs_[activeTab_]; }
     const TabState& CurTab() const { return tabs_[activeTab_]; }

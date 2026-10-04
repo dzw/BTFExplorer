@@ -156,12 +156,48 @@ static bool FilterProviderItems(HMENU menu, const std::vector<std::wstring>& hid
 
 static bool IsOpenAction(const std::wstring& text)
 {
-    std::wstring normalized = text;
-    for (wchar_t& ch : normalized)
-        ch = static_cast<wchar_t>(std::towlower(ch));
+    // 归一化：小写化，并去掉加速键符号 '&'（有的项写作 “Open Git &GUI here”，
+    // 带 & 会导致 “open git gui here” 子串匹配失败）。
+    std::wstring normalized;
+    normalized.reserve(text.size());
+    for (wchar_t ch : text) {
+        if (ch == L'&') continue;
+        normalized.push_back(static_cast<wchar_t>(std::towlower(ch)));
+    }
 
     if (normalized.find(L"everything") != std::wstring::npos)
         return false;
+
+    // 下列项一律留在顶层，不并入 Open 分组（默认会被通用规则归组，这里显式排除）：
+    //   Notepad++ / Sublime / VSCode —— 文本、代码编辑器，通常带 “Open with …” 前缀
+    //   Terminal                     —— “Open in Terminal”，命中通用规则 “open in ”
+    //   “通过 Code打开”              —— VSCode 的中文项，命中规则 (code + 打开)
+    if (normalized.find(L"notepad++") != std::wstring::npos ||
+        normalized.find(L"notepad+") != std::wstring::npos ||
+        normalized.find(L"sublime") != std::wstring::npos ||
+        normalized.find(L"terminal") != std::wstring::npos ||
+        normalized.find(L"vscode") != std::wstring::npos ||
+        normalized.find(L"vs code") != std::wstring::npos ||
+        normalized.find(L"visual studio code") != std::wstring::npos ||
+        (normalized.find(L"code") != std::wstring::npos &&
+         normalized.find(L"打开") != std::wstring::npos))
+        return false;
+
+    // 反汇编器 IDA 并入 Open 分组（默认它不带 “open” 前缀，只会留在顶层）。
+    if (normalized.find(L"ida pro") != std::wstring::npos ||
+        normalized.find(L"ida32") != std::wstring::npos ||
+        normalized.find(L"ida64") != std::wstring::npos)
+        return true;
+
+    // VLC / ChatGPT / Windows Media Player 的相关项也并入 Open 分组（用户要求）：
+    //   “Add to VLC media player's Playlist”“Play with VLC media player”
+    //   “Open project in ChatGPT”
+    //   “添加到 Windows Media Player 列表”“使用 Windows Media Player 播放”
+    if (normalized.find(L"vlc media player") != std::wstring::npos ||
+        normalized.find(L"chatgpt") != std::wstring::npos ||
+        normalized.find(L"windows media player") != std::wstring::npos)
+        return true;
+
     return normalized.find(L"open in ") != std::wstring::npos ||
            normalized.find(L"open with ") != std::wstring::npos ||
            normalized.find(L"open git gui here") != std::wstring::npos ||
