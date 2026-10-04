@@ -152,6 +152,105 @@ static bool FilterProviderItems(HMENU menu, const std::vector<std::wstring>& hid
     return removed;
 }
 
+static bool IsOpenAction(const std::wstring& text)
+{
+    std::wstring normalized = text;
+    for (wchar_t& ch : normalized)
+        ch = static_cast<wchar_t>(std::towlower(ch));
+
+    if (normalized.find(L"everything") != std::wstring::npos)
+        return false;
+    return normalized.find(L"open in ") != std::wstring::npos ||
+           normalized.find(L"open with ") != std::wstring::npos ||
+           normalized.find(L"open git gui here") != std::wstring::npos ||
+           normalized.find(L"open git bash here") != std::wstring::npos ||
+           (normalized.find(L"visual studio") != std::wstring::npos &&
+            normalized.find(L"打开") != std::wstring::npos) ||
+           (normalized.find(L"code") != std::wstring::npos &&
+            normalized.find(L"打开") != std::wstring::npos) ||
+           (normalized.find(L"workbuddy") != std::wstring::npos &&
+            normalized.find(L"打开") != std::wstring::npos);
+}
+
+static bool GroupOpenActions(HMENU menu)
+{
+    struct Entry {
+        MENUITEMINFOW info{};
+        std::wstring text;
+        UINT position = 0;
+    };
+    std::vector<Entry> moved;
+    HMENU submenu = CreatePopupMenu();
+    if (!submenu) return false;
+    auto insertEntry = [](HMENU target, UINT position, const Entry& entry) {
+        MENUITEMINFOW info = entry.info;
+        info.dwTypeData = const_cast<LPWSTR>(entry.text.c_str());
+        info.cch = static_cast<UINT>(entry.text.size());
+        return InsertMenuItemW(target, position, TRUE, &info) != FALSE;
+    };
+    auto rollback = [&]() {
+        for (const Entry& entry : moved) {
+            RemoveMenu(submenu, 0, MF_BYPOSITION);
+            insertEntry(menu, entry.position, entry);
+        }
+    };
+
+    for (int i = 0; i < GetMenuItemCount(menu);) {
+        std::vector<wchar_t> text(1024, L'\0');
+        MENUITEMINFOW item{};
+        item.cbSize = sizeof(item);
+        item.fMask = MIIM_FTYPE | MIIM_ID | MIIM_STATE | MIIM_SUBMENU |
+                     MIIM_DATA | MIIM_BITMAP | MIIM_STRING;
+        item.dwTypeData = text.data();
+        item.cch = static_cast<UINT>(text.size());
+        if (!GetMenuItemInfoW(menu, static_cast<UINT>(i), TRUE, &item)) {
+            ++i;
+            continue;
+        }
+        std::wstring label(item.dwTypeData, item.cch);
+        if (!IsOpenAction(label)) {
+            ++i;
+            continue;
+        }
+
+        Entry entry;
+        entry.info = item;
+        entry.text = std::move(label);
+        entry.info.dwTypeData = entry.text.data();
+        entry.info.cch = static_cast<UINT>(entry.text.size());
+        entry.position = static_cast<UINT>(i);
+        if (!RemoveMenu(menu, static_cast<UINT>(i), MF_BYPOSITION)) {
+            DestroyMenu(submenu);
+            return false;
+        }
+        if (!insertEntry(submenu, static_cast<UINT>(GetMenuItemCount(submenu)), entry)) {
+            insertEntry(menu, static_cast<UINT>(i), entry);
+            rollback();
+            DestroyMenu(submenu);
+            return false;
+        }
+        moved.push_back(std::move(entry));
+    }
+
+    if (moved.empty()) {
+        DestroyMenu(submenu);
+        return false;
+    }
+
+    MENUITEMINFOW openItem{};
+    openItem.cbSize = sizeof(openItem);
+    openItem.fMask = MIIM_FTYPE | MIIM_STRING | MIIM_SUBMENU;
+    openItem.fType = MFT_STRING;
+    openItem.dwTypeData = const_cast<LPWSTR>(L"Open");
+    openItem.hSubMenu = submenu;
+    if (!InsertMenuItemW(menu, moved.front().position, TRUE, &openItem)) {
+        rollback();
+        DestroyMenu(submenu);
+        return false;
+    }
+    return true;
+}
+
 struct ContextMenuHandler {
     IContextMenu2* menu2 = nullptr;
     IContextMenu3* menu3 = nullptr;
@@ -224,6 +323,7 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
         std::vector<std::wstring> hiddenNames;
         LoadHiddenNames(hwnd, hiddenNames);
         FilterProviderItems(menu, hiddenNames);
+        GroupOpenActions(menu);
         if (!customItem.empty()) {
             if (GetMenuItemCount(menu) > 0)
                 AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);

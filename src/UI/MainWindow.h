@@ -68,12 +68,14 @@ private:
     MainWindow() = default;
 
     friend LRESULT CALLBACK PaneTabProc(HWND, UINT, WPARAM, LPARAM);
+    friend class FileDropTarget;
 
     static LRESULT CALLBACK WndProcStatic(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK ListViewProcStatic(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
     LRESULT WndProc(UINT, WPARAM, LPARAM);
     LRESULT ListViewProc(HWND h, UINT, WPARAM, LPARAM);
     LRESULT PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC orig); // 分页拖拽
+    DWORD HandleFileDrop(HWND list, const std::vector<std::wstring>& paths, DWORD effect);
 
     // UI 构建
     void BuildChildren();

@@ -6,6 +6,7 @@
 #include "../Util/AppLog.h"
 #include <windowsx.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <cstdio>
 #include <algorithm>
 #include <vector>
@@ -45,6 +46,147 @@ static LRESULT CALLBACK SideTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp);
 
 // ListView 列
 enum { COL_NAME = 0, COL_TYPE, COL_SIZE, COL_MTIME };
+
+class FileDropTarget final : public IDropTarget {
+public:
+    FileDropTarget(MainWindow* owner, HWND list) : owner_(owner), list_(list) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override
+    {
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        if (riid == IID_IUnknown || riid == IID_IDropTarget) {
+            *object = static_cast<IDropTarget*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        ULONG refs = --refs_;
+        if (refs == 0) delete this;
+        return refs;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data, DWORD keys, POINTL,
+                                        DWORD* effect) override
+    {
+        if (!effect) return E_POINTER;
+        allowed_ = *effect;
+        preferred_ = PreferredEffect(data);
+        hasFiles_ = HasFileDrop(data);
+        *effect = hasFiles_ ? ChooseEffect(keys) : DROPEFFECT_NONE;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD keys, POINTL, DWORD* effect) override
+    {
+        if (!effect) return E_POINTER;
+        *effect = hasFiles_ ? ChooseEffect(keys) : DROPEFFECT_NONE;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragLeave() override
+    {
+        hasFiles_ = false;
+        allowed_ = DROPEFFECT_NONE;
+        preferred_ = DROPEFFECT_NONE;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD keys, POINTL,
+                                   DWORD* effect) override
+    {
+        if (!effect) return E_POINTER;
+        DWORD chosen = ChooseEffect(keys);
+        if (!hasFiles_ || chosen == DROPEFFECT_NONE) {
+            *effect = DROPEFFECT_NONE;
+            return S_OK;
+        }
+
+        FORMATETC format{ CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+        STGMEDIUM medium{};
+        HRESULT hr = data ? data->GetData(&format, &medium) : E_INVALIDARG;
+        if (FAILED(hr)) {
+            *effect = DROPEFFECT_NONE;
+            return hr;
+        }
+
+        HDROP drop = static_cast<HDROP>(medium.hGlobal);
+        UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        std::vector<std::wstring> paths;
+        paths.reserve(count);
+        for (UINT i = 0; i < count; ++i) {
+            UINT length = DragQueryFileW(drop, i, nullptr, 0);
+            std::wstring path(length + 1, L'\0');
+            UINT copied = DragQueryFileW(drop, i, path.data(), length + 1);
+            if (copied > 0) {
+                path.resize(copied);
+                paths.push_back(std::move(path));
+            }
+        }
+        ReleaseStgMedium(&medium);
+
+        DWORD completed = owner_->HandleFileDrop(list_, paths, chosen);
+        *effect = completed;
+        DragLeave();
+        return S_OK;
+    }
+
+private:
+    static bool HasFileDrop(IDataObject* data)
+    {
+        FORMATETC format{ CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+        return data && SUCCEEDED(data->QueryGetData(&format));
+    }
+
+    static DWORD PreferredEffect(IDataObject* data)
+    {
+        static const CLIPFORMAT formatId =
+            static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"Preferred DropEffect"));
+        if (!data || !formatId) return DROPEFFECT_NONE;
+        FORMATETC format{ formatId, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+        STGMEDIUM medium{};
+        if (FAILED(data->GetData(&format, &medium))) return DROPEFFECT_NONE;
+
+        DWORD effect = DROPEFFECT_NONE;
+        if (medium.hGlobal && GlobalSize(medium.hGlobal) >= sizeof(effect)) {
+            const void* value = GlobalLock(medium.hGlobal);
+            if (value) {
+                effect = *static_cast<const DWORD*>(value);
+                GlobalUnlock(medium.hGlobal);
+            }
+        }
+        ReleaseStgMedium(&medium);
+        return effect;
+    }
+
+    DWORD ChooseEffect(DWORD keys) const
+    {
+        DWORD available = allowed_;
+        DWORD preferred = preferred_ & available;
+        DWORD requested = (keys & MK_CONTROL) ? DROPEFFECT_COPY :
+                          (keys & MK_SHIFT) ? DROPEFFECT_MOVE :
+                          (preferred & DROPEFFECT_MOVE) ? DROPEFFECT_MOVE :
+                          (preferred & DROPEFFECT_COPY) ? DROPEFFECT_COPY :
+                          (preferred & DROPEFFECT_LINK) ? DROPEFFECT_LINK :
+                          (available & DROPEFFECT_MOVE) ? DROPEFFECT_MOVE :
+                          (available & DROPEFFECT_COPY) ? DROPEFFECT_COPY :
+                          (available & DROPEFFECT_LINK) ? DROPEFFECT_LINK :
+                          DROPEFFECT_NONE;
+        return (requested & allowed_) ? requested : DROPEFFECT_NONE;
+    }
+
+    MainWindow* owner_;
+    HWND list_;
+    ULONG refs_ = 1;
+    DWORD allowed_ = DROPEFFECT_NONE;
+    DWORD preferred_ = DROPEFFECT_NONE;
+    bool hasFiles_ = false;
+};
 
 // ---------------------------------------------------------------------------
 // 创建
@@ -358,6 +500,12 @@ void MainWindow::CreatePane(Pane& p)
     p.listOld = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(p.list, GWLP_WNDPROC,
         reinterpret_cast<LONG_PTR>(&MainWindow::ListViewProcStatic)));
     SetWindowLongPtrW(p.list, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+    auto* dropTarget = new FileDropTarget(this, p.list);
+    HRESULT dropResult = RegisterDragDrop(p.list, dropTarget);
+    dropTarget->Release();
+    if (FAILED(dropResult))
+        WriteAppLog((L"RegisterDragDrop failed (" +
+                     std::to_wstring(static_cast<unsigned long>(dropResult)) + L")").c_str());
 
     // 本窗格自己的“+”按钮（每个窗格一个，贴在最后一个分页头右侧）
     p.btnNewTab = CreateWindowExW(0, WC_BUTTONW, L"+",
@@ -392,6 +540,7 @@ void MainWindow::RemovePane(size_t idx)
         tabDragPane_ = -1;
         tabDragIndex_ = -1;
     }
+    if (panes_[idx].list) RevokeDragDrop(panes_[idx].list);
     DestroyWindow(panes_[idx].tab);
     if (panes_[idx].btnNewTab) DestroyWindow(panes_[idx].btnNewTab);
     if (panes_[idx].btnTools) DestroyWindow(panes_[idx].btnTools);
@@ -1800,6 +1949,25 @@ void MainWindow::OnPaste()
         RefreshListFromDisk();
 }
 
+DWORD MainWindow::HandleFileDrop(HWND list, const std::vector<std::wstring>& paths,
+                                 DWORD effect)
+{
+    int paneIndex = PaneOfList(list);
+    if (paneIndex < 0 || paths.empty() ||
+        (effect != DROPEFFECT_COPY && effect != DROPEFFECT_MOVE))
+        return DROPEFFECT_NONE;
+
+    SelectPane(static_cast<size_t>(paneIndex));
+    shell::FileOp operation = effect == DROPEFFECT_MOVE
+        ? shell::FileOp::Move : shell::FileOp::Copy;
+    if (!shell::ExecuteFileOpMulti(hwnd_, operation, paths, CurTab().dir, true)) {
+        WriteAppLog(L"File drop operation failed");
+        return DROPEFFECT_NONE;
+    }
+    RefreshListFromDisk();
+    return effect;
+}
+
 // 地址栏子类化：回车时向主窗口发 EN_RETURN 通知
 static LRESULT CALLBACK AddressProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 {
@@ -3102,6 +3270,8 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         WriteAppLog(L"WM_DESTROY received; application window is exiting");
         trayIcon_.Remove();
+        for (const Pane& pane : panes_)
+            if (pane.list) RevokeDragDrop(pane.list);
         for (auto& t : tabs_) t.pages->Shutdown();
         SaveSession();   // 记住这次打开的所有窗格/分页/历史，下次启动恢复
         PostQuitMessage(0);
