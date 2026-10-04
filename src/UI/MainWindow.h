@@ -120,6 +120,7 @@ private:
     // 键盘/命令
     void OnDelete(bool toRecycleBin = true); // 删除选中项；false=不进回收站（Shift+Delete）
     void OnRename();
+    void RenamePath(const std::wstring& path);
     void OnClipboard(bool cut);      // 复制/剪切选中项（CF_HDROP + Preferred DropEffect）
     void OnPaste();                  // 粘贴剪贴板中的文件到当前目录
     void HideToTray();

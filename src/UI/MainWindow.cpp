@@ -1772,6 +1772,12 @@ void MainWindow::OnRename()
 {
     std::wstring path;
     if (!SelectedPath(path)) return;
+    RenamePath(path);
+}
+
+void MainWindow::RenamePath(const std::wstring& path)
+{
+    if (path.empty()) return;
     std::wstring oldName = path.substr(path.find_last_of(L'\\') + 1);
 
     const wchar_t* DLG_CLASS = L"PagedExplorerRenameBox";
@@ -2628,6 +2634,7 @@ LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         if (ctrl && wp == 'C')      { OnClipboard(false); return 0; }
         if (ctrl && wp == 'X')      { OnClipboard(true);  return 0; }
         if (ctrl && wp == 'V')      { OnPaste();          return 0; }
+        if (wp == VK_F2)            { OnRename();         return 0; }
         if (wp == VK_DELETE)        { OnDelete(!shift);   return 0; }
     }
     if (pi >= 0 && msg == WM_CONTEXTMENU) {
@@ -2657,9 +2664,13 @@ LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             }
         }
         bool addFavorite = false;
+        std::wstring createdFolderPath;
         if (shell::ShowContextMenu(hwnd_, path, PaneActiveTab((size_t)pi).dir, pt,
-                                  L"添加当前目录到收藏", addFavorite))
+                                  L"添加当前目录到收藏", addFavorite, &createdFolderPath)) {
+            if (!createdFolderPath.empty())
+                RenamePath(createdFolderPath);
             RefreshListFromDisk();   // 右键菜单可能增删改了文件（删除/粘贴/重命名）
+        }
         if (addFavorite) OnAddFavorite();
         return 0;
     }
