@@ -1940,8 +1940,6 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
                     size_t tabIndex = SIZE_MAX;
                     if (tabDragIndex_ >= 0 && (size_t)tabDragIndex_ < panes_[tabDragPane_].tabs.size())
                         tabIndex = panes_[tabDragPane_].tabs[tabDragIndex_];
-                    if (tabIndex != SIZE_MAX && tabs_[tabIndex].locked)
-                        tabIndex = SIZE_MAX;    // 锁定的分页不允许被拖走
                     tabDragActive_ = false; // 拖拽状态先收尾
                     if (GetCapture() == h) ReleaseCapture();
                     if (tabIndex != SIZE_MAX) {
@@ -2378,16 +2376,31 @@ LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     if (pi >= 0 && msg == WM_CONTEXTMENU) {
         // 右键菜单：在列表空白/条目上弹出 Explorer 风格菜单
         if ((size_t)pi != activePane_) SelectPane((size_t)pi); // 先激活该窗格
-        int sel = ListView_GetNextItem(h, -1, LVNI_SELECTED);
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        if (pt.x == -1 && pt.y == -1) { // 键盘触发
+        bool keyboardContext = pt.x == -1 && pt.y == -1;
+        if (keyboardContext) { // 键盘触发
             pt = { 200, 200 };
             ClientToScreen(hwnd_, &pt);
         }
         std::wstring path;
-        if (sel >= 0) path = PaneItemPath((size_t)pi, sel);
+        if (keyboardContext) {
+            int sel = ListView_GetNextItem(h, -1, LVNI_SELECTED);
+            if (sel >= 0) path = PaneItemPath((size_t)pi, sel);
+        } else {
+            POINT clientPt = pt;
+            ScreenToClient(h, &clientPt);
+            LVHITTESTINFO hit{};
+            hit.pt = clientPt;
+            int item = ListView_HitTest(h, &hit);
+            if (item >= 0) {
+                path = PaneItemPath((size_t)pi, item);
+            } else {
+                // 空白处使用文件夹背景菜单，而不是沿用之前残留的选中项。
+                ListView_SetItemState(h, -1, 0, LVIS_SELECTED);
+            }
+        }
         bool addFavorite = false;
-        if (shell::ShowContextMenu(hwnd_, path, CurTab().dir, pt,
+        if (shell::ShowContextMenu(hwnd_, path, PaneActiveTab((size_t)pi).dir, pt,
                                   L"添加当前目录到收藏", addFavorite))
             RefreshListFromDisk();   // 右键菜单可能增删改了文件（删除/粘贴/重命名）
         if (addFavorite) OnAddFavorite();
@@ -2780,7 +2793,12 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             if (HIWORD(wp) == EN_KILLFOCUS || HIWORD(wp) == EN_ADDR_RETURN) {
                 wchar_t buf[MAX_PATH * 2] = {};
                 GetWindowTextW(address_, buf, MAX_PATH * 2);
-                if (buf[0] && buf != CurTab().dir) Navigate(buf);
+                if (buf[0] && buf != CurTab().dir) {
+                    // 锁定只挡关闭与地址变化：激活的是锁定分页时，改走侧栏同款逻辑，
+                    // 在同一窗格里新开一个分页打开新地址，不动锁定分页本身
+                    if (CurTab().locked) NavigateFromSidebar(buf);
+                    else Navigate(buf);
+                }
                 if (HIWORD(wp) == EN_ADDR_RETURN) SetFocus(CurList());
             }
             return 0;

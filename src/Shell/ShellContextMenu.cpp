@@ -2,6 +2,7 @@
 #include "ShellUtil.h"
 #include <shlobj.h>
 #include <shellapi.h>
+#include <shlwapi.h>
 #include <cerrno>
 #include <cstdio>
 #include <cwctype>
@@ -151,6 +152,31 @@ static bool FilterProviderItems(HMENU menu, const std::vector<std::wstring>& hid
     return removed;
 }
 
+struct ContextMenuHandler {
+    IContextMenu2* menu2 = nullptr;
+    IContextMenu3* menu3 = nullptr;
+};
+
+static LRESULT CALLBACK ContextMenuSubclassProc(HWND hwnd, UINT msg, WPARAM wp,
+                                                 LPARAM lp, UINT_PTR,
+                                                 DWORD_PTR refData)
+{
+    auto* handler = reinterpret_cast<ContextMenuHandler*>(refData);
+    if (handler &&
+        (msg == WM_INITMENUPOPUP || msg == WM_DRAWITEM ||
+         msg == WM_MEASUREITEM || msg == WM_MENUCHAR)) {
+        LRESULT result = 0;
+        if (handler->menu3 && msg == WM_MENUCHAR &&
+            SUCCEEDED(handler->menu3->HandleMenuMsg2(msg, wp, lp, &result)))
+            return result;
+        IContextMenu2* menu2 = handler->menu3
+            ? static_cast<IContextMenu2*>(handler->menu3) : handler->menu2;
+        if (menu2 && SUCCEEDED(menu2->HandleMenuMsg(msg, wp, lp)))
+            return 0;
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
 bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& menuDir,
                      POINT ptScreen, const std::wstring& customItem,
                      bool& customItemSelected)
@@ -203,19 +229,58 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
                 AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(menu, MF_STRING, CMD_CUSTOM, customItem.c_str());
         }
+        ComPtr<IContextMenu3> cm3;
+        ComPtr<IContextMenu2> cm2;
+        bool hasMenu3 = SUCCEEDED(cm->QueryInterface(
+            IID_IContextMenu3, reinterpret_cast<void**>(cm3.operator&())));
+        if (!hasMenu3)
+            cm->QueryInterface(IID_IContextMenu2,
+                               reinterpret_cast<void**>(cm2.operator&()));
+        ContextMenuHandler handler{ cm2.Get(), cm3.Get() };
+        UINT_PTR subclassId = reinterpret_cast<UINT_PTR>(&ContextMenuSubclassProc);
+        bool subclassed = (!cm2 && !cm3) ||
+            SetWindowSubclass(hwnd, ContextMenuSubclassProc, subclassId,
+                              reinterpret_cast<DWORD_PTR>(&handler)) != FALSE;
+        if (!subclassed) {
+            MessageBoxW(hwnd, L"无法初始化系统右键菜单，无法显示动态菜单项。",
+                        L"右键菜单", MB_OK | MB_ICONERROR);
+            DestroyMenu(menu);
+            return false;
+        }
         UINT cmd = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                     ptScreen.x, ptScreen.y, hwnd, nullptr);
+        if (subclassed && (cm2 || cm3))
+            RemoveWindowSubclass(hwnd, ContextMenuSubclassProc, subclassId);
         if (cmd == CMD_CUSTOM) {
             customItemSelected = true;
         } else if (cmd >= CMD_FIRST && cmd <= CMD_LAST) {
+            // “新建”等文件夹背景菜单处理器靠 lpDirectoryW 知道在哪里创建文件，
+            // 不设置会静默失败（粘贴/删除有数据对象提供目标，唯独新建依赖它）
+            // 背景菜单（path 为空）用当前目录；选中条目则用其所在目录
+            std::wstring invokeDir = path.empty() ? menuDir : path;
+            if (!path.empty() && !invokeDir.empty()) {
+                std::vector<wchar_t> parentPath(invokeDir.begin(), invokeDir.end());
+                parentPath.push_back(L'\0');
+                if (PathRemoveFileSpecW(parentPath.data()))
+                    invokeDir.assign(parentPath.data());
+            }
+            char dirA[MAX_PATH * 2] = {};
+            if (!invokeDir.empty())
+                WideCharToMultiByte(CP_ACP, 0, invokeDir.c_str(), -1,
+                                    dirA, sizeof(dirA), nullptr, nullptr);
             CMINVOKECOMMANDINFOEX info = { sizeof(info) };
             info.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
             info.hwnd = hwnd;
             info.lpVerb  = reinterpret_cast<LPCSTR>(MAKEINTRESOURCEA(cmd - CMD_FIRST));
             info.lpVerbW = reinterpret_cast<LPCWSTR>(MAKEINTRESOURCEW(cmd - CMD_FIRST));
+            info.lpDirectory  = dirA[0] ? dirA : nullptr;
+            info.lpDirectoryW = invokeDir.empty() ? nullptr : invokeDir.c_str();
             info.nShow = SW_SHOWNORMAL;
             info.ptInvoke = ptScreen;
             invoked = SUCCEEDED(cm->InvokeCommand(reinterpret_cast<CMINVOKECOMMANDINFO*>(&info)));
+            if (!invoked)
+                MessageBoxW(hwnd, L"执行所选系统右键菜单命令失败。",
+                            L"右键菜单", MB_OK | MB_ICONERROR);
         }
     }
     DestroyMenu(menu);
