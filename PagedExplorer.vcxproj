@@ -35,6 +35,7 @@
     <ClCompile Include="src\Shell\ShellUtil.cpp" />
     <ClCompile Include="src\Pagination\PageManager.cpp" />
     <ClCompile Include="src\Util\AppLog.cpp" />
+    <ClCompile Include="src\Util\DirWatcher.cpp" />
     <ClCompile Include="src\UI\DirectoryTree.cpp" />
     <ClCompile Include="src\UI\MainWindow.cpp" />
     <ClCompile Include="src\UI\SettingsDialog.cpp" />
@@ -49,6 +50,7 @@
     <ClInclude Include="src\UI\SettingsDialog.h" />
     <ClInclude Include="src\UI\TrayIcon.h" />
     <ClInclude Include="src\Util\AppLog.h" />
+    <ClInclude Include="src\Util\DirWatcher.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

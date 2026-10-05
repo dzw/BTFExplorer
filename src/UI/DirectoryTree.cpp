@@ -180,6 +180,10 @@ bool DirectoryTree::HandleNotification(const NMHDR* notification,
             ExpandNode(treeNotification->itemNew.hItem);
         return true;
     }
+    if (notification->code == TVN_ITEMEXPANDEDW) {
+        if (expandedChanged) expandedChanged();   // 监视集随展开状态更新
+        return true;
+    }
     if (notification->code == TVN_SELCHANGEDW) {
         const auto* treeNotification =
             reinterpret_cast<const NMTREEVIEWW*>(notification);
@@ -285,4 +289,85 @@ void DirectoryTree::SyncToPath(const std::wstring& rawPath, bool showErrors)
     TreeView_SelectItem(hwnd_, node);
     syncingSelection_ = false;
     TreeView_EnsureVisible(hwnd_, node);
+}
+
+// 深度优先查找路径对应的节点（路径不区分大小写）
+HTREEITEM DirectoryTree::FindNodeByPath(HTREEITEM from, const std::wstring& path)
+{
+    for (HTREEITEM it = TreeView_GetChild(hwnd_, from); it;
+         it = TreeView_GetNextSibling(hwnd_, it)) {
+        TVITEMW item{};
+        item.hItem = it;
+        item.mask = TVIF_PARAM;
+        if (TreeView_GetItem(hwnd_, &item) && item.lParam) {
+            const auto* p = reinterpret_cast<const std::wstring*>(item.lParam);
+            if (_wcsicmp(p->c_str(), path.c_str()) == 0) return it;
+        }
+        HTREEITEM sub = FindNodeByPath(it, path);
+        if (sub) return sub;
+    }
+    return nullptr;
+}
+
+void DirectoryTree::CollectExpandedRecursive(HTREEITEM parent,
+                                             std::vector<std::wstring>& out)
+{
+    for (HTREEITEM it = TreeView_GetChild(hwnd_, parent); it;
+         it = TreeView_GetNextSibling(hwnd_, it)) {
+        TVITEMW item{};
+        item.hItem = it;
+        item.mask = TVIF_PARAM | TVIF_STATE;
+        item.stateMask = TVIS_EXPANDED;
+        if (!TreeView_GetItem(hwnd_, &item) || !item.lParam) continue;
+        const auto* p = reinterpret_cast<const std::wstring*>(item.lParam);
+        if (item.state & TVIS_EXPANDED) {
+            out.push_back(*p);
+            CollectExpandedRecursive(it, out);
+        }
+    }
+}
+
+void DirectoryTree::CollectExpandedPaths(std::vector<std::wstring>& out)
+{
+    if (!hwnd_) return;
+    CollectExpandedRecursive(TreeView_GetRoot(hwnd_), out);
+}
+
+// 外部变化后刷新节点：已展开则重新枚举子目录（保持展开与选中），
+// 未展开则只丢弃已填充的子项，下次展开时 ExpandNode 会重新枚举
+void DirectoryTree::RefreshNode(const std::wstring& dir)
+{
+    if (!hwnd_) return;
+    HTREEITEM sel = TreeView_GetSelection(hwnd_);
+    std::wstring selPath;
+    if (sel) {
+        TVITEMW item{};
+        item.hItem = sel;
+        item.mask = TVIF_PARAM;
+        if (TreeView_GetItem(hwnd_, &item) && item.lParam)
+            selPath = *reinterpret_cast<const std::wstring*>(item.lParam);
+    }
+
+    syncingSelection_ = true;   // 刷新期间的选择变化不当作用户导航
+    HTREEITEM node = FindNodeByPath(TreeView_GetRoot(hwnd_), dir);
+    if (node) {
+        TVITEMW item{};
+        item.hItem = node;
+        item.mask = TVIF_STATE;
+        item.stateMask = TVIS_EXPANDED;
+        TreeView_GetItem(hwnd_, &item);
+        bool expanded = (item.state & TVIS_EXPANDED) != 0;
+        for (HTREEITEM child = TreeView_GetChild(hwnd_, node); child; ) {
+            HTREEITEM next = TreeView_GetNextSibling(hwnd_, child);
+            TreeView_DeleteItem(hwnd_, child);
+            child = next;
+        }
+        if (expanded) InsertChildFolders(hwnd_, node, dir);
+    }
+    // 恢复选中：原选中项若随子树被删且路径仍存在则重选，否则选回刷新节点
+    HTREEITEM restore = selPath.empty() ? nullptr : FindNodeByPath(TreeView_GetRoot(hwnd_), selPath);
+    if (!restore) restore = node ? node : sel;
+    if (restore && TreeView_GetSelection(hwnd_) != restore)
+        TreeView_SelectItem(hwnd_, restore);
+    syncingSelection_ = false;
 }

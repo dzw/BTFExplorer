@@ -23,7 +23,8 @@ static constexpr int WM_APP_TREE_NEWTAB = WM_APP + 7;
 static constexpr int WM_APP_SELECT_PANE = WM_APP + 8;  // 延后激活窗格（重入 comctl32 会崩）
 static constexpr int WM_APP_SELECT_TAB  = WM_APP + 9;  // 延后激活分页（同上）
 static constexpr int WM_APP_PAGE_REFRESH = WM_APP + 10;
-static constexpr int WM_APP_TAB_CONTEXT = WM_APP + 11; // 延后弹出分页头右键菜单 // 延后翻页（同上） // 目录树中键 -> 延后到主窗口新开分页
+static constexpr int WM_APP_TAB_CONTEXT = WM_APP + 11;
+static constexpr int WM_APP_DIR_CHANGED  = WM_APP + 12; // 外部目录变化（DirWatcher 投递） // 延后弹出分页头右键菜单 // 延后翻页（同上） // 目录树中键 -> 延后到主窗口新开分页
 
 // 当前焦点窗格顶部分页栏的整行底色（淡粉绿）：涂在分页头之间的空隙上，
 // 分页头本身保持系统外观（见 PaneTabHandler 的 WM_PAINT）
@@ -234,6 +235,7 @@ MainWindow* MainWindow::Create(HINSTANCE hInst)
     if (!self->hwnd_) { delete self; return nullptr; }
 
     self->BuildChildren();
+    self->watcher_.Start(self->hwnd_, WM_APP_DIR_CHANGED); // 外部目录变化监视
     self->EnsureTrayIcon();     // 图标常驻：启动就挂上，窗口显示与否通知区都有
     self->RestoreSession();     // 恢复上次会话（窗格/分页/历史），无会话则默认 1 窗格
     self->SyncPagerSizeCombo(); // 会话里恢复的“每页项数”要反映到分页栏下拉框
@@ -411,6 +413,8 @@ void MainWindow::CreateSidePanel()
         PostMessageW(hwnd_, WM_APP_TREE_NEWTAB,
                      reinterpret_cast<WPARAM>(new std::wstring(path)), 0);
     });
+    // 树节点展开/收起后：把新展开的目录纳入外部变化监视
+    directoryTree_.expandedChanged = [this]() { UpdateWatcher(); };
     btnTreeSync_ = CreateWindowExW(0, WC_BUTTONW, L"定",//定位
         WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
         0, 0, 0, 0, tab_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TREE_SYNC)), hInst, nullptr);
@@ -1025,6 +1029,7 @@ bool MainWindow::RestoreSession()
     SelectRightTab(act);
     UpdateRightTabLabels();
     Layout();
+    UpdateWatcher();
     return true;
 }
 
@@ -1138,6 +1143,7 @@ void MainWindow::MoveTabToPane(size_t tabIndex, size_t paneIdx)
         RemovePane(oldPane);
     SelectRightTab(tabIndex);
     Layout();
+    UpdateWatcher();
 }
 
 void MainWindow::UpdateRightTabLabels()
@@ -1330,6 +1336,7 @@ void MainWindow::CloseRightTab(size_t index)
     SelectRightTab((index < tabs_.size()) ? index : tabs_.size() - 1);
     UpdateRightTabLabels();
     Layout();
+    UpdateWatcher();
 }
 
 
@@ -1409,6 +1416,7 @@ void MainWindow::Navigate(const std::wstring& rawPath, bool addHistory)
     UpdateStatusBar();
     UpdatePaginationBar();
     UpdateRightTabLabels();
+    UpdateWatcher();
 }
 
 // 目录树 / 收藏 的跳转入口。
@@ -1432,17 +1440,24 @@ void MainWindow::OpenDirInNewTab(const std::wstring& path)
 
 void MainWindow::RefreshList()
 {
-    TabState& t = CurTab();
+    RefreshPaneList(activePane_);
+}
+
+// 重载指定窗格当前分页：外部目录变化、翻页、排序都走这里
+void MainWindow::RefreshPaneList(size_t paneIdx)
+{
+    if (paneIdx >= panes_.size()) return;
+    TabState& t = PaneActiveTab(paneIdx);
+    HWND list = panes_[paneIdx].list;
     t.pageItems.clear();
-    ListView_SetItemCountEx(CurList(), 0, 0);
+    ListView_SetItemCountEx(list, 0, 0);
     t.pages->RequestPage(t.curPage); // 可能命中缓存，也可能后台加载
     if (t.pages->TryGetPage(t.curPage, t.pageItems)) {
-        ApplyCurrentSort(); // 套用已保存的排序
-        ListView_SetItemCountEx(CurList(), t.pageItems.size(), LVSICF_NOINVALIDATEALL);
-        ListView_RedrawItems(CurList(), 0, static_cast<int>(t.pageItems.size()) - 1);
+        ApplyCurrentSort(paneIdx); // 套用已保存的排序
+        ListView_SetItemCountEx(list, t.pageItems.size(), LVSICF_NOINVALIDATEALL);
+        ListView_RedrawItems(list, 0, static_cast<int>(t.pageItems.size()) - 1);
     }
-    UpdateStatusBar();
-    UpdatePaginationBar();
+    if (paneIdx == activePane_) { UpdateStatusBar(); UpdatePaginationBar(); }
 }
 
 void MainWindow::RefreshListFromDisk()
@@ -1455,16 +1470,62 @@ void MainWindow::RefreshListFromDisk()
 
 void MainWindow::OnPageLoaded()
 {
-    // 后台加载完成后：如果当前分页还没内容就填充
-    TabState& t = CurTab();
-    if (t.pageItems.empty() && t.pages->TryGetPage(t.curPage, t.pageItems)) {
-        ApplyCurrentSort(); // 套用已保存的排序
-        ListView_SetItemCountEx(CurList(), t.pageItems.size(), LVSICF_NOINVALIDATEALL);
-        ListView_RedrawItems(CurList(), 0, static_cast<int>(t.pageItems.size()) - 1);
+    // 后台加载完成后：任何窗格的当前分页若还没内容就填充
+    // （外部变化刷新/恢复会话会让多个窗格先后完成加载）
+    for (size_t i = 0; i < panes_.size(); ++i) {
+        TabState& t = PaneActiveTab(i);
+        if (t.pageItems.empty() && t.pages->TryGetPage(t.curPage, t.pageItems)) {
+            ApplyCurrentSort(i); // 套用已保存的排序
+            ListView_SetItemCountEx(panes_[i].list, t.pageItems.size(), LVSICF_NOINVALIDATEALL);
+            ListView_RedrawItems(panes_[i].list, 0, static_cast<int>(t.pageItems.size()) - 1);
+        }
     }
-    t.pages->PrefetchAround(t.curPage);
+    CurTab().pages->PrefetchAround(CurTab().curPage);
     UpdateStatusBar();
     UpdatePaginationBar();
+}
+
+// 更新外部变化监视集：所有分页的当前目录 + 目录树所有已展开节点
+// （活动窗格的当前目录排最前；超过监视器上限时优先保住可见视图）
+void MainWindow::UpdateWatcher()
+{
+    std::vector<std::wstring> dirs;
+    if (activePane_ < panes_.size()) {
+        const std::wstring& d = PaneActiveTab(activePane_).dir;
+        if (!d.empty()) dirs.push_back(d);
+    }
+    for (size_t i = 0; i < panes_.size(); ++i) {
+        if (i == activePane_) continue;
+        const std::wstring& d = PaneActiveTab(i).dir;
+        if (!d.empty()) dirs.push_back(d);
+    }
+    for (const auto& t : tabs_)
+        if (!t.dir.empty()) dirs.push_back(t.dir);
+    directoryTree_.CollectExpandedPaths(dirs);
+
+    std::vector<std::wstring> uniq;
+    for (const auto& d : dirs) {
+        bool dup = false;
+        for (const auto& u : uniq)
+            if (_wcsicmp(u.c_str(), d.c_str()) == 0) { dup = true; break; }
+        if (!dup) uniq.push_back(d);
+    }
+    watcher_.SetDirectories(std::move(uniq));
+}
+
+// 外部目录变化：失效对应分页缓存、立即重载可见窗格列表、刷新树节点
+void MainWindow::OnExternalDirChanged(const std::wstring& dir)
+{
+    WriteAppLog((L"EXTERNAL_REFRESH dir=" + dir).c_str());
+    for (auto& t : tabs_)
+        if (_wcsicmp(t.dir.c_str(), dir.c_str()) == 0)
+            t.pages->Invalidate();          // 后台分页下次激活时重新枚举
+    for (size_t i = 0; i < panes_.size(); ++i) {
+        TabState& t = PaneActiveTab(i);
+        if (_wcsicmp(t.dir.c_str(), dir.c_str()) == 0)
+            RefreshPaneList(i);             // 可见窗格立即重载（后台线程枚举）
+    }
+    directoryTree_.RefreshNode(dir);        // 树节点重新枚举子目录
 }
 
 void MainWindow::UpdateStatusBar()
@@ -1503,18 +1564,18 @@ void MainWindow::OnColumnClick(int col)
     if (col == sortCol_) sortAsc_ = !sortAsc_;
     else { sortCol_ = col; sortAsc_ = true; }
     SaveFavorites(); // 记住排序设置
-    ApplyCurrentSort();
+    ApplyCurrentSort(activePane_);
 }
 
 // 按 sortCol_/sortAsc_ 排序当前页并重绘（页面加载后也调用，保持排序生效）
-void MainWindow::ApplyCurrentSort()
+void MainWindow::ApplyCurrentSort(size_t paneIdx)
 {
     auto strLess = [](const std::wstring& a, const std::wstring& b) {
         return _wcsicmp(a.c_str(), b.c_str()) < 0;
     };
     int col = sortCol_;
     bool asc = sortAsc_;
-    TabState& t = CurTab();
+    TabState& t = PaneActiveTab(paneIdx);
     std::sort(t.pageItems.begin(), t.pageItems.end(), [&](const FileEntry& a, const FileEntry& b) {
         if (a.isFolder != b.isFolder) return a.isFolder > b.isFolder; // 文件夹始终在前
         switch (col) {
@@ -1526,8 +1587,8 @@ void MainWindow::ApplyCurrentSort()
         }
         return false;
     });
-    if (!CurTab().pageItems.empty())
-        ListView_RedrawItems(CurList(), 0, static_cast<int>(CurTab().pageItems.size()) - 1);
+    if (paneIdx < panes_.size() && !t.pageItems.empty())
+        ListView_RedrawItems(panes_[paneIdx].list, 0, static_cast<int>(t.pageItems.size()) - 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -3328,6 +3389,16 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    case WM_APP_DIR_CHANGED: {  // 外部目录变化：失效缓存并刷新对应视图
+        auto* dirp = reinterpret_cast<std::wstring*>(lp);
+        if (dirp) {
+            std::wstring dir = std::move(*dirp);
+            delete dirp;
+            OnExternalDirChanged(dir);
+        }
+        return 0;
+    }
+
     case WM_APP_PAGE_REFRESH: { // 延后翻页：按钮的 WM_COMMAND 链结束后才动 ListView
         switch (wp) {
         case IDC_FIRST: CurTab().curPage = 0; break;
@@ -3519,6 +3590,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         WriteAppLog(L"WM_DESTROY received; application window is exiting");
+        watcher_.Stop();
         trayIcon_.Remove();
         for (const Pane& pane : panes_)
             if (pane.list) RevokeDragDrop(pane.list);

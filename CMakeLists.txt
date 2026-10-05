@@ -14,6 +14,7 @@ add_executable(PagedExplorer WIN32
     src/Shell/ShellUtil.cpp
     src/Pagination/PageManager.cpp
     src/Util/AppLog.cpp
+    src/Util/DirWatcher.cpp
     src/UI/DirectoryTree.cpp
     src/UI/MainWindow.cpp
     src/UI/SettingsDialog.cpp

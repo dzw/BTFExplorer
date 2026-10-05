@@ -6,6 +6,7 @@
 #include <vector>
 #include "../Pagination/PageManager.h"
 #include "../FileModel/FileEntry.h"
+#include "../Util/DirWatcher.h"
 #include "DirectoryTree.h"
 #include "TrayIcon.h"
 
@@ -91,7 +92,10 @@ private:
 
     // 列表（作用于激活窗格的当前分页）
     HWND  CurList() const;            // 激活窗格的 ListView
-    void RefreshList();               // 重新请求当前页
+    void RefreshList();               // 重新请求当前页（活动窗格）
+    void RefreshPaneList(size_t paneIdx); // 重新请求指定窗格当前分页（外部变化刷新用）
+    void UpdateWatcher();             // 把当前应监视的目录集推给 DirWatcher
+    void OnExternalDirChanged(const std::wstring& dir);
     void RefreshListFromDisk();       // 文件增删改后：清分页缓存再刷新（防旧缓存）
     // 焦点窗格变化后重画新旧焦点窗格的分页栏行（焦点行淡粉绿）。
     // 其他窗格的分页栏外观与焦点无关，整块失效只会造成无谓重绘（其他窗格闪）
@@ -100,7 +104,7 @@ private:
     void UpdateStatusBar();
     void UpdatePaginationBar();
     void OnColumnClick(int col);
-    void ApplyCurrentSort();
+    void ApplyCurrentSort(size_t paneIdx); // 按 sortCol_/sortAsc_ 排序指定窗格的当前分页
     void InsertColumns(HWND list);   // 给指定列表建列
     DWORD ListExStyle() const;       // 文件列表的扩展样式（受“显示网格线”开关控制）
     void ApplyListStyles();          // 把当前开关状态套用到所有窗格列表
@@ -187,6 +191,7 @@ private:
     int  lastRenameClickItem_ = -1;     // 慢双击重命名：上次单击的行下标
     DWORD lastRenameClickTime_ = 0;     // 慢双击重命名：上次单击时刻
 
+    DirWatcher watcher_;                  // 外部目录变化监视（所有分页目录 + 已展开树节点）
     size_t pendingSelectPane_ = SIZE_MAX; // 延后激活的窗格（避免在 comctl 控件自身过程里重入）
     size_t pendingSelectTab_ = SIZE_MAX;  // 延后激活的分页下标（同上）
 
