@@ -19,7 +19,11 @@ static constexpr UINT WM_APP_WIN_E = WM_APP + 2;   // Win+E 被拦截后激活�
 static constexpr int WM_APP_CLOSE_TAB = WM_APP + 3; // 中键点击分页 -> 延后到主窗口关闭
 static constexpr int WM_APP_MOVE_TAB  = WM_APP + 4; // 拖拽分页 -> 延后到主窗口移动
 static constexpr int WM_APP_ADD_TAB   = WM_APP + 6; // 双击空白新建分页 -> 延后到主窗口添加（+5 是托盘回调）
-static constexpr int WM_APP_TREE_NEWTAB = WM_APP + 7; // 目录树中键 -> 延后到主窗口新开分页
+static constexpr int WM_APP_TREE_NEWTAB = WM_APP + 7;
+static constexpr int WM_APP_SELECT_PANE = WM_APP + 8;  // 延后激活窗格（重入 comctl32 会崩）
+static constexpr int WM_APP_SELECT_TAB  = WM_APP + 9;  // 延后激活分页（同上）
+static constexpr int WM_APP_PAGE_REFRESH = WM_APP + 10;
+static constexpr int WM_APP_TAB_CONTEXT = WM_APP + 11; // 延后弹出分页头右键菜单 // 延后翻页（同上） // 目录树中键 -> 延后到主窗口新开分页
 
 // 当前焦点窗格顶部分页栏的整行底色（淡粉绿）：涂在分页头之间的空隙上，
 // 分页头本身保持系统外观（见 PaneTabHandler 的 WM_PAINT）
@@ -1053,6 +1057,19 @@ void MainWindow::SelectPane(size_t index)
     InvalidateTabStrips(prevPane);
     RefreshList();
     SyncTreeToCurrentTab(false);
+}
+
+// 延后版激活入口：只记录目标并 PostMessage，控件消息链结束后才真正切换。
+void MainWindow::PostSelectPane(size_t pi)
+{
+    pendingSelectPane_ = pi;
+    PostMessageW(hwnd_, WM_APP_SELECT_PANE, 0, 0);
+}
+
+void MainWindow::PostSelectRightTab(size_t index)
+{
+    pendingSelectTab_ = index;
+    PostMessageW(hwnd_, WM_APP_SELECT_TAB, 0, 0);
 }
 
 // 焦点窗格变化后重画受影响窗格的分页栏（焦点窗格整行淡粉绿）。
@@ -2270,9 +2287,11 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
         ht.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         int idx = (int)SendMessageW(h, TCM_HITTEST, 0, reinterpret_cast<LPARAM>(&ht));
         if (idx >= 0) {
-            POINT pt = ht.pt;
-            ClientToScreen(h, &pt);
-            TabContextMenu(h, idx, pt);
+            // TabContextMenu 会在 tab 控件自己的窗口过程里开菜单循环并销毁/增删
+            // 控件（重入 comctl32 会崩，见 PostSelectPane 注释），延后弹出；
+            // 存客户区坐标，处理时再换算屏幕坐标并重新命中验证
+            POINT* heapPt = new POINT(ht.pt);
+            PostMessageW(hwnd_, WM_APP_TAB_CONTEXT, (WPARAM)(uintptr_t)h, (LPARAM)heapPt);
             return 0;
         }
         break;              // 标题空白处右键不管，交给默认过程
@@ -2751,7 +2770,7 @@ LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     if (pi >= 0 && (size_t)pi != activePane_ &&
         (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN ||
          msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN))
-        SelectPane((size_t)pi);
+        PostSelectPane((size_t)pi);   // 在列表自己的消息过程里，激活延后（防重入 comctl32）
     // 文件视图的常规键盘操作（资源管理器习惯）：Ctrl+C 复制 / Ctrl+X 剪切 /
     // Ctrl+V 粘贴 / Delete 删除到回收站 / Shift+Delete 直接删除。
     if (pi >= 0 && msg == WM_KEYDOWN) {
@@ -2767,7 +2786,7 @@ LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     }
     if (pi >= 0 && msg == WM_CONTEXTMENU) {
         // 右键菜单：在列表空白/条目上弹出 Explorer 风格菜单
-        if ((size_t)pi != activePane_) SelectPane((size_t)pi); // 先激活该窗格
+        if ((size_t)pi != activePane_) PostSelectPane((size_t)pi); // 激活延后（防重入）
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         bool keyboardContext = pt.x == -1 && pt.y == -1;
         if (keyboardContext) { // 键盘触发
@@ -2998,7 +3017,9 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             case NM_RETURN:
             case LVN_COLUMNCLICK:
             case LVN_KEYDOWN:
-                if ((size_t)pi != activePane_) SelectPane((size_t)pi);
+                // 这些通知是列表控件在自己消息过程里同步发来的，激活窗格会
+                // 重入该列表（RefreshList -> LVM_SETITEMCOUNT），延后执行
+                if ((size_t)pi != activePane_) PostSelectPane((size_t)pi);
                 break;
             }
             if (nm->code == LVN_GETDISPINFOW) {
@@ -3091,7 +3112,10 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             size_t inPane = (size_t)SendMessageW(panes_[tipi].tab, TCM_GETCURSEL, 0, 0);
             if (inPane < panes_[tipi].tabs.size()) {
                 panes_[tipi].active = inPane;
-                SelectRightTab(panes_[tipi].tabs[inPane]);
+                // TCN_SELCHANGE 是 tab 控件在自己的 WM_LBUTTONDOWN 过程里同步发来的，
+                // 这里不能同步重入它（SelectRightTab 会 TCM_SETCURSEL + 动它的子列表），
+                // 否则崩在 COMCTL32（见 PostSelectRightTab 注释）
+                PostSelectRightTab(panes_[tipi].tabs[inPane]);
             }
         }
         else if (nm->hwndFrom == tab_ && nm->code == TCN_SELCHANGE) {
@@ -3208,13 +3232,11 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         case IDC_SETTINGS:
             OpenSettings();
             return 0;
-        case IDC_FIRST: CurTab().curPage = 0; RefreshList(); return 0;
-        case IDC_PREV:  if (CurTab().curPage > 0) { --CurTab().curPage; RefreshList(); } return 0;
-        case IDC_NEXT:
-            if (CurTab().curPage + 1 < CurTab().pages->PageCount()) { ++CurTab().curPage; RefreshList(); }
-            return 0;
+        case IDC_FIRST: PostMessageW(hwnd_, WM_APP_PAGE_REFRESH, IDC_FIRST, 0); return 0;
+        case IDC_PREV:  PostMessageW(hwnd_, WM_APP_PAGE_REFRESH, IDC_PREV, 0); return 0;
+        case IDC_NEXT:  PostMessageW(hwnd_, WM_APP_PAGE_REFRESH, IDC_NEXT, 0); return 0;
         case IDC_LAST:
-            if (CurTab().pages->PageCount() > 0) { CurTab().curPage = CurTab().pages->PageCount() - 1; RefreshList(); }
+            PostMessageW(hwnd_, WM_APP_PAGE_REFRESH, IDC_LAST, 0);
             return 0;
         case IDC_PAGE_SIZE:
             if (HIWORD(wp) == CBN_SELCHANGE) {
@@ -3265,6 +3287,56 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             OpenDirInNewTab(*path);
             delete path;
         }
+        return 0;
+    }
+
+    case WM_APP_SELECT_PANE:    // 延后激活窗格（真正的切换在控件消息链之外执行）
+        if (pendingSelectPane_ < panes_.size()) {
+            size_t pi = pendingSelectPane_;
+            pendingSelectPane_ = SIZE_MAX;
+            SelectPane(pi);
+        } else pendingSelectPane_ = SIZE_MAX;
+        return 0;
+
+    case WM_APP_SELECT_TAB:     // 延后激活分页
+        if (pendingSelectTab_ < tabs_.size()) {
+            size_t ti = pendingSelectTab_;
+            pendingSelectTab_ = SIZE_MAX;
+            SelectRightTab(ti);
+        } else pendingSelectTab_ = SIZE_MAX;
+        return 0;
+
+    case WM_APP_TAB_CONTEXT: {  // 延后弹出分页头右键菜单（控件消息链之外执行）
+        POINT* heapPt = reinterpret_cast<POINT*>(lp);
+        if (heapPt) {
+            HWND tab = reinterpret_cast<HWND>(wp);
+            if (IsWindow(tab)) {
+                int pi = PaneOfTab(tab);
+                if (pi >= 0) {
+                    TCHITTESTINFO ht{};
+                    ht.pt = *heapPt;
+                    int idx = (int)SendMessageW(tab, TCM_HITTEST, 0, reinterpret_cast<LPARAM>(&ht));
+                    if (idx >= 0) {
+                        POINT pt = *heapPt;
+                        ClientToScreen(tab, &pt);
+                        TabContextMenu(tab, idx, pt);
+                    }
+                }
+            }
+            delete heapPt;
+        }
+        return 0;
+    }
+
+    case WM_APP_PAGE_REFRESH: { // 延后翻页：按钮的 WM_COMMAND 链结束后才动 ListView
+        switch (wp) {
+        case IDC_FIRST: CurTab().curPage = 0; break;
+        case IDC_PREV:  if (CurTab().curPage > 0) --CurTab().curPage; break;
+        case IDC_NEXT:  if (CurTab().curPage + 1 < CurTab().pages->PageCount()) ++CurTab().curPage; break;
+        case IDC_LAST:  if (CurTab().pages->PageCount() > 0) CurTab().curPage = CurTab().pages->PageCount() - 1; break;
+        default: return 0;
+        }
+        RefreshList();
         return 0;
     }
 

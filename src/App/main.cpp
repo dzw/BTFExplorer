@@ -2,18 +2,58 @@
 #include <commctrl.h>
 #include <objbase.h>
 #include <shellapi.h>
+#include <dbghelp.h>
 #include <cstdio>
 #include <exception>
 #include <vector>
 #include "../UI/MainWindow.h"
 #include "../Util/AppLog.h"
 
+#pragma comment(lib, "dbghelp.lib")
 #pragma comment(linker, "/manifestdependency:\"type='win32' \
 name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
 processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 // 与 MainWindow 中定义保持一致：Win+E 拦截后激活主窗口
 static constexpr UINT WM_APP_WIN_E = WM_APP + 2;
+
+// ---------------------------------------------------------------------------
+// 崩溃过滤器：未处理异常时写全量 minidump（%LOCALAPPDATA%\PagedExplorer\crash.dmp，
+// 覆盖上一次）并在 applog 记下异常码/出错地址，供离线用 PDB 还原完整调用链
+// ---------------------------------------------------------------------------
+static LONG WINAPI CrashDumpFilter(EXCEPTION_POINTERS* ep)
+{
+    static volatile LONG entered = 0;
+    if (InterlockedExchange(&entered, 1) != 0)   // 防二次异常递归，只处理第一次
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    wchar_t dir[MAX_PATH] = L".";
+    GetEnvironmentVariableW(L"LOCALAPPDATA", dir, MAX_PATH);
+    lstrcatW(dir, L"\\PagedExplorer");
+    CreateDirectoryW(dir, nullptr);
+    std::wstring dumpPath = std::wstring(dir) + L"\\crash.dmp";
+    HANDLE file = CreateFileW(dumpPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mei;
+        mei.ThreadId = GetCurrentThreadId();
+        mei.ExceptionPointers = ep;
+        mei.ClientPointers = FALSE;
+        HANDLE proc = GetCurrentProcess();
+        if (!MiniDumpWriteDump(proc, GetCurrentProcessId(), file,
+                               MiniDumpWithFullMemory, &mei, nullptr, nullptr))
+            MiniDumpWriteDump(proc, GetCurrentProcessId(), file,
+                              MiniDumpNormal, &mei, nullptr, nullptr);
+        CloseHandle(file);
+    }
+    wchar_t line[160];
+    wsprintfW(line, L"CRASH code=0x%08X rip=0x%p dump=%s",
+              ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0,
+              ep->ContextRecord ? (void*)ep->ContextRecord->Rip : nullptr,
+              dumpPath.c_str());
+    WriteAppLog(line);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 
 // ---------------------------------------------------------------------------
 // 全局低层键盘钩子：拦截 Win+E，替换为激活 PagedExplorer
@@ -42,6 +82,8 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
 {
+    SetUnhandledExceptionFilter(CrashDumpFilter);
+
     // 未捕获 C++ 异常（如 std::bad_alloc）会走 terminate -> abort（WER 里表现为
     // ucrtbase c0000409）；在这里记一条日志，方便事后从 applog 定位
     std::set_terminate([]() {

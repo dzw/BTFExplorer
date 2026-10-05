@@ -187,6 +187,9 @@ private:
     int  lastRenameClickItem_ = -1;     // 慢双击重命名：上次单击的行下标
     DWORD lastRenameClickTime_ = 0;     // 慢双击重命名：上次单击时刻
 
+    size_t pendingSelectPane_ = SIZE_MAX; // 延后激活的窗格（避免在 comctl 控件自身过程里重入）
+    size_t pendingSelectTab_ = SIZE_MAX;  // 延后激活的分页下标（同上）
+
     TabState& CurTab() { return tabs_[activeTab_]; }
     const TabState& CurTab() const { return tabs_[activeTab_]; }
     Pane& CurPane() { return panes_[activePane_]; }
@@ -209,6 +212,12 @@ private:
     bool RestoreSession();              // 启动时恢复上次会话（无则默认）；返回是否命中会话
     void SelectRightTab(size_t index);
     void SelectPane(size_t index);
+    // 在 comctl 控件自己的窗口过程里（点击分页头/列表、翻页按钮的消息链内）不能同步
+    // 重入该控件改状态（TCM_SETCURSEL / LVM_SETITEMCOUNT...），实测会崩在 COMCTL32
+    // （c0000005/41d，作者在“双击空白新建分页”路径已修过同款问题）。统一 PostMessage
+    // 延后到主窗口消息循环里执行。
+    void PostSelectPane(size_t pi);
+    void PostSelectRightTab(size_t index);
     bool PaneHasDir(size_t paneIdx, const std::wstring& dir) const; // 该窗格是否已有同一目录的分页
     void RemoveTab(size_t index, bool& paneEmptied); // 删除分页（paneEmptied=所属窗格变空了吗）
     void CloseRightTab(size_t index);
