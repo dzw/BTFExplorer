@@ -2995,8 +2995,18 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                         DWORD attr = GetFileAttributesW(p.c_str());
                         if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
                             Navigate(p);
-                        else
-                            ShellExecuteW(hwnd_, L"open", p.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                        else {
+                            // 工作目录 = 当前文件视图所在目录，BAT/可执行文件
+                            // 内的相对路径以该目录为基准。
+                            SHELLEXECUTEINFOW sei{};
+                            sei.cbSize = sizeof(sei);
+                            sei.hwnd = hwnd_;
+                            sei.lpVerb = L"open";
+                            sei.lpFile = p.c_str();
+                            sei.lpDirectory = PaneActiveTab((size_t)pi).dir.c_str();
+                            sei.nShow = SW_SHOWNORMAL;
+                            ShellExecuteExW(&sei);
+                        }
                     }
                 }
             }
