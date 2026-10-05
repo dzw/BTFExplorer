@@ -93,7 +93,9 @@ private:
     HWND  CurList() const;            // 激活窗格的 ListView
     void RefreshList();               // 重新请求当前页
     void RefreshListFromDisk();       // 文件增删改后：清分页缓存再刷新（防旧缓存）
-    void InvalidateTabStrips();       // 焦点窗格变化后重画各窗格分页栏（焦点行淡粉绿）
+    // 焦点窗格变化后重画新旧焦点窗格的分页栏行（焦点行淡粉绿）。
+    // 其他窗格的分页栏外观与焦点无关，整块失效只会造成无谓重绘（其他窗格闪）
+    void InvalidateTabStrips(size_t prevPane = SIZE_MAX);
     void OnPageLoaded();              // 后台加载完成（已 PostMessage 转到 UI 线程）
     void UpdateStatusBar();
     void UpdatePaginationBar();

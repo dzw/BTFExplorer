@@ -1028,6 +1028,7 @@ void MainWindow::SelectRightTab(size_t index)
 {
     if (index >= tabs_.size()) return;
     TabState& t = tabs_[index];
+    size_t prevPane = activePane_;   // 旧焦点窗格：重画分页栏时只需新旧两个
     activeTab_ = index;
     activePane_ = t.pane;
     Pane& p = panes_[activePane_];
@@ -1035,7 +1036,7 @@ void MainWindow::SelectRightTab(size_t index)
         if (p.tabs[k] == index) { p.active = k; break; }
     SendMessageW(p.tab, TCM_SETCURSEL, p.active, 0);
     SetWindowTextW(address_, t.dir.c_str());
-    InvalidateTabStrips();
+    InvalidateTabStrips(prevPane);
     RefreshList();
     SyncTreeToCurrentTab(false);
 }
@@ -1045,19 +1046,41 @@ void MainWindow::SelectPane(size_t index)
     if (index >= panes_.size()) return;
     Pane& p = panes_[index];
     if (p.tabs.empty()) return;
+    size_t prevPane = activePane_;   // 旧焦点窗格：重画分页栏时只需新旧两个
     activePane_ = index;
     activeTab_ = p.tabs[p.active];
     SetWindowTextW(address_, CurTab().dir.c_str());
-    InvalidateTabStrips();
+    InvalidateTabStrips(prevPane);
     RefreshList();
     SyncTreeToCurrentTab(false);
 }
 
-// 焦点窗格变化后重画各窗格分页栏（只有焦点窗格的整行是淡粉绿）
-void MainWindow::InvalidateTabStrips()
+// 焦点窗格变化后重画受影响窗格的分页栏（焦点窗格整行淡粉绿）。
+// 只失效“旧焦点 + 新焦点”两个窗格、且只失效分页栏那一行：
+//   - 其他窗格的分页栏外观与焦点无关，整块失效只会带来无谓重绘，
+//     表现为切换分页/窗格时其他窗格闪一下；
+//   - tab 控件客户区还包括列表四周的边距，整块失效会让整个窗格
+//     的框线跟着重绘（又是闪）。
+void MainWindow::InvalidateTabStrips(size_t prevPane)
 {
-    for (auto& p : panes_)
-        InvalidateRect(p.tab, nullptr, FALSE);
+    if (prevPane == activePane_) return;   // 同窗格内换分页头：分页栏外观不变
+    for (size_t i = 0; i < panes_.size(); ++i) {
+        if (i != activePane_ && i != prevPane) continue;
+        HWND tab = panes_[i].tab;
+        if (!tab) continue;
+        int cnt = (int)SendMessageW(tab, TCM_GETITEMCOUNT, 0, 0);
+        if (cnt <= 0) continue;
+        RECT ti{};
+        if (!SendMessageW(tab, TCM_GETITEMRECT, (WPARAM)(cnt - 1), reinterpret_cast<LPARAM>(&ti)) &&
+            !SendMessageW(tab, TCM_GETITEMRECT, 0, reinterpret_cast<LPARAM>(&ti)))
+            continue;
+        RECT rc{};
+        if (!GetClientRect(tab, &rc)) continue;
+        int rowH = ti.bottom + 3;          // 与 PaneTabHandler WM_PAINT 的行高算法一致
+        if (rowH > rc.bottom) rowH = rc.bottom;
+        RECT row = { 0, 0, rc.right, rowH };
+        InvalidateRect(tab, &row, FALSE);
+    }
 }
 
 void MainWindow::MoveTabToPane(size_t tabIndex, size_t paneIdx)
@@ -1111,6 +1134,16 @@ void MainWindow::UpdateRightTabLabels()
             else if (name.size() >= 2 && name[1] == L':') name = name.substr(0, 2);
             if (name.empty()) name = L"新建";
             if (tabs_[p.tabs[k]].locked) name = L"[锁] " + name;
+            // 文本没变就不重设：TCM_SETITEMW 会让分页头失效重绘，
+            // 一次导航会把所有窗格的所有分页头全刷一遍（闪）
+            wchar_t cur[512]{};
+            TCITEMW curItem{};
+            curItem.mask = TCIF_TEXT;
+            curItem.pszText = cur;
+            curItem.cchTextMax = 512;
+            if (SendMessageW(p.tab, TCM_GETITEMW, k, reinterpret_cast<LPARAM>(&curItem)) &&
+                wcscmp(cur, name.c_str()) == 0)
+                continue;
             TCITEMW ti{};
             ti.mask = TCIF_TEXT;
             ti.pszText = const_cast<LPWSTR>(name.c_str());
