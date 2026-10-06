@@ -49,4 +49,13 @@ std::wstring TypeNameForEntry(const std::wstring& path, bool isFolder);
 // 取系统图像列表 (SHGFI_SYSICONINDEX) 中的小图标索引，失败返回 -1
 int SysIconIndexForEntry(const std::wstring& path, bool isFolder);
 
+// 带进程内缓存的类型名查询：文件按扩展名只查一次 SHGetFileInfoW，文件夹查一次。
+// 枚举线程和 UI 线程都会调用（线程安全）。虚拟列表每帧每行都取类型列文本，
+// 不缓存的话滚动时每帧要打进 shell/注册表几十次，这是滚动卡顿的主因。
+std::wstring CachedTypeNameForEntry(const std::wstring& path, bool isFolder);
+
+// 带进程内缓存的图标索引查询：文件按扩展名缓存。图标逐文件而异的类型
+// （exe/lnk/ico 等）与文件夹不做扩展名缓存，仍逐路径查询。
+int CachedSysIconIndexForEntry(const std::wstring& path, bool isFolder);
+
 } // namespace shell

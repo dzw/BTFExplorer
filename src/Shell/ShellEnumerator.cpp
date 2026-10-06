@@ -77,7 +77,8 @@ size_t EnumeratePage(const std::wstring& dir,
                 e.isFolder = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
                 e.size = (static_cast<unsigned long long>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
                 e.writeTime = fd.ftLastWriteTime;
-                e.iconIndex = SysIconIndexForEntry(e.path, e.isFolder);
+                e.iconIndex = CachedSysIconIndexForEntry(e.path, e.isFolder);
+                e.typeName = CachedTypeNameForEntry(e.path, e.isFolder);
                 e.filled = true; // 枚举时这些字段本来就拿到了
                 out.push_back(std::move(e));
                 ++taken;

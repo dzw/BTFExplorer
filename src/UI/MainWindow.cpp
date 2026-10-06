@@ -1607,7 +1607,12 @@ void MainWindow::ApplyCurrentSort(size_t paneIdx)
         if (a.isFolder != b.isFolder) return a.isFolder > b.isFolder; // 文件夹始终在前
         switch (col) {
         case COL_NAME:  return asc ? strLess(a.name, b.name) : strLess(b.name, a.name);
-        case COL_TYPE:  return asc ? strLess(a.typeName, b.typeName) : strLess(b.typeName, a.typeName);
+        case COL_TYPE: {
+            int byType = strLess(a.typeName, b.typeName) ? -1
+                       : strLess(b.typeName, a.typeName) ? 1 : 0;
+            if (byType != 0) return asc ? byType < 0 : byType > 0;
+            return strLess(a.name, b.name); // 同类型按名称定序（对齐资源管理器，避免组内顺序不定）
+        }
         case COL_SIZE:  return asc ? a.size < b.size : a.size > b.size;
         case COL_MTIME: return asc ? FileTimeToUInt64(a.writeTime) < FileTimeToUInt64(b.writeTime)
                                    : FileTimeToUInt64(a.writeTime) > FileTimeToUInt64(b.writeTime);
@@ -1624,7 +1629,7 @@ void MainWindow::ApplyCurrentSort(size_t paneIdx)
 int MainWindow::EnsureIcon(FileEntry& e)
 {
     if (e.iconIndex < 0)
-        e.iconIndex = shell::SysIconIndexForEntry(e.path, e.isFolder);
+        e.iconIndex = shell::CachedSysIconIndexForEntry(e.path, e.isFolder);
     return e.iconIndex >= 0 ? e.iconIndex : I_IMAGENONE;
 }
 
@@ -3214,7 +3219,13 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                     std::wstring text;
                     switch (di->item.iSubItem) {
                     case COL_NAME: text = e.name; break;
-                    case COL_TYPE: text = e.isFolder ? L"文件夹" : shell::TypeNameForEntry(e.path, false); break;
+                    case COL_TYPE:
+                        // 类型列每帧每行都会来取：必须走缓存（枚举时已填 typeName），
+                        // 直接 SHGetFileInfoW 会让滚动时每次重绘都打进 shell/注册表
+                        if (!e.isFolder && e.typeName.empty())
+                            e.typeName = shell::CachedTypeNameForEntry(e.path, false);
+                        text = e.isFolder ? L"文件夹" : e.typeName;
+                        break;
                     case COL_SIZE: text = e.isFolder ? L"" : FormatSize(e.size); break;
                     case COL_MTIME: text = FormatTime(e.writeTime); break;
                     }
