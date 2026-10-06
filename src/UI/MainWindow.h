@@ -9,6 +9,8 @@
 #include "../Util/DirWatcher.h"
 #include "DirectoryTree.h"
 #include "TrayIcon.h"
+#include "FileList.h"
+#include "ShellFolderView.h"
 
 // 控件 ID（主窗口与 main.cpp 的加速键 / 单实例逻辑共享）
 enum {
@@ -19,6 +21,7 @@ enum {
     IDC_TAB = 1016, IDC_FAVLIST = 1017, IDC_RIGHTTAB = 1018, IDC_NEWTAB = 1019,
     IDC_NEWTAB_BASE = 1200,    // 每个窗格一个“+”按钮，命令 ID = IDC_NEWTAB_BASE + 窗格 tag
     IDC_TOOLS_BASE = 1210,     // 每个窗格一个“▾”外部工具按钮，命令 ID = IDC_TOOLS_BASE + tag
+    IDC_VIEWMODE_BASE = 1220,  // 每个窗格一个“Q”列表实现切换按钮，命令 ID = IDC_VIEWMODE_BASE + tag
     IDC_LAYOUT1 = 1020, IDC_LAYOUT2 = 1021, IDC_LAYOUT3 = 1022, IDC_LAYOUT4 = 1023,
     IDC_TRI_PINTOP = 1024, IDC_TRI_PINDOWN = 1025,
     IDC_MENU_FILTERS = 1026,
@@ -43,12 +46,18 @@ struct TabState {
     TabState() : pages(std::make_unique<PageManager>()) {}
 };
 
-// 右侧窗格：一个窗格 = 一个 Tab 容器 + 一个虚拟列表，可水平摆放多个
+// 右侧窗格：一个窗格 = 一个 Tab 容器 + 一个文件列表（两种实现可切换），
+// 可水平摆放多个
 static constexpr int IDC_LIST_BASE = 1100;   // 窗格列表的 ID = IDC_LIST_BASE + tag
 struct Pane {
     HWND tab = nullptr;                      // 该窗格的 Tab 容器
-    HWND list = nullptr;                     // 该窗格的虚拟 ListView
-    WNDPROC listOld = nullptr;               // 列表原窗口过程（每个窗格各自一份）
+    HWND list = nullptr;                     // 该窗格的自绘虚拟 ListView（默认实现）
+    // FileList 用堆持有：panes_ 是 vector，扩容搬移 Pane 时列表子类过程经
+    // GWLP_USERDATA 取 FileList*，地址必须稳定，不能跟着 vector 搬走
+    std::unique_ptr<FileList> fileList;
+    std::unique_ptr<ShellFolderView> shellView; // Q-Dir 式 shell 视图实现（懒创建）
+    int listMode = 0;                        // 文件列表实现：0=自绘虚拟列表 1=shell 视图
+    HWND btnViewMode = nullptr;              // 该窗格右上角“Q”列表实现切换按钮
     int tag = -1;                            // 窗格唯一编号（控件 ID 后缀，删除后编号可复用）
     int width = 340;                         // 窗格宽度（分隔条可拖）
     std::vector<size_t> tabs;                // 本窗格持有的 TabState 下标
@@ -58,8 +67,9 @@ struct Pane {
     HWND btnTools = nullptr;                 // 本窗格右上角的“▾”外部工具按钮
 };
 
-// 资源管理器主窗口：树 + 虚拟 ListView + 地址栏 + 分页栏 + 状态栏
-class MainWindow {
+// 资源管理器主窗口：树 + 虚拟 ListView + 地址栏 + 分页栏 + 状态栏。
+// 同时充当自绘文件列表的交互回调宿主（FileListDelegate）。
+class MainWindow : public FileListDelegate {
 public:
     static MainWindow* Create(HINSTANCE hInst);
     PageManager& Pages() { return *tabs_[activeTab_].pages; }
@@ -74,15 +84,12 @@ private:
     friend class FileDropTarget;
 
     static LRESULT CALLBACK WndProcStatic(HWND, UINT, WPARAM, LPARAM);
-    static LRESULT CALLBACK ListViewProcStatic(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
     LRESULT WndProc(UINT, WPARAM, LPARAM);
-    LRESULT ListViewProc(HWND h, UINT, WPARAM, LPARAM);
     LRESULT PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC orig); // 分页拖拽
     DWORD HandleFileDrop(HWND list, const std::vector<std::wstring>& paths, DWORD effect);
 
     // UI 构建
     void BuildChildren();
-    void BuildImageList(HWND list);  // 给指定列表挂上（共用的）系统图像列表
     void Layout();
     void CreateSidePanel();          // 左侧 Tab 容器：目录树 / 收藏
     void SwitchSideTab(int index);   // 切换 tab 显示
@@ -109,14 +116,28 @@ private:
     void UpdatePaginationBar();
     void OnColumnClick(int col);
     void ApplyCurrentSort(size_t paneIdx); // 按 sortCol_/sortAsc_ 排序指定窗格的当前分页
-    void InsertColumns(HWND list);   // 给指定列表建列
-    DWORD ListExStyle() const;       // 文件列表的扩展样式（受“显示网格线”开关控制）
-    void ApplyListStyles();          // 把当前开关状态套用到所有窗格列表
+    void ApplyListStyles();          // 把网格线开关状态套用到所有窗格列表
     void SyncPagerSizeCombo();       // 每页项数变化/恢复后，同步分页栏下拉框
-    int  EnsureIcon(FileEntry& e);       // 系统图像列表索引（懒取并缓存）
     bool SelectedPath(std::wstring& out) const;
     std::vector<std::wstring> SelectedPaths() const; // 选中项完整路径（支持多选）
     std::wstring CurrentPagePath(int item) const; // item -> full path
+
+    // 文件列表双实现（自绘虚拟列表 <-> shell 视图）
+    void ToggleListMode(size_t paneIdx);     // 窗格右上角“Q”按钮：切换实现
+    void ApplyPaneListMode(size_t paneIdx);  // 按 listMode 摆放两套实现的可见性
+    void SyncShellView(size_t paneIdx);      // shell 模式下把视图导航到当前分页目录
+
+    // FileListDelegate：自绘列表的交互回调（控件侧只管显示与命中，业务在这里）
+    bool HitRowSplit(HWND list, const POINT& clientPt) override;
+    void RowSplitClick(HWND list, WPARAM wp, const POINT& mainClientPt) override;
+    void ActivatePaneDeferred(HWND list) override;
+    void SlowRename(HWND list, int item) override;
+    void ListKeyCommand(HWND list, int cmd) override;
+    void ListContextMenu(HWND list, const POINT& screenPt, bool keyboard) override;
+    void ListColumnClicked(HWND list, int col) override;
+    void ListItemActivated(HWND list, int item) override;
+    bool GetItemText(HWND list, int item, int subItem, std::wstring& out) override;
+    int  GetItemIcon(HWND list, int item) override;
 
     // 收藏
     void LoadFavorites();
@@ -148,8 +169,6 @@ private:
     HWND pagerFirst_ = nullptr, pagerLast_ = nullptr, pagerLabel_ = nullptr, pagerSize_ = nullptr;
     HWND btnBack_ = nullptr, btnFwd_ = nullptr, btnUp_ = nullptr, btnRefresh_ = nullptr;
     HWND btnMenuFilters_ = nullptr, btnSettings_ = nullptr;
-    HIMAGELIST imgList_ = nullptr;   // 取不到系统图像列表时的自建兜底
-    HIMAGELIST sysImgs_ = nullptr;   // 系统图像列表（所有窗格共用）
     HFONT uiFont_ = nullptr;
 
     // 布局 / 交互
@@ -196,9 +215,6 @@ private:
     int  tabDragIndex_ = -1;            // 拖拽源窗格内的 tab 序号
     DWORD lastBlankClickTime_ = 0;      // 分页栏空白区单击时间（双击检测用）
     POINT lastBlankClickPt_ = {0, 0};   // 分页栏空白区单击位置（双击检测用）
-    HWND lastRenameList_ = nullptr;     // 慢双击重命名：上次单击所在列表
-    int  lastRenameClickItem_ = -1;     // 慢双击重命名：上次单击的行下标
-    DWORD lastRenameClickTime_ = 0;     // 慢双击重命名：上次单击时刻
 
     DirWatcher watcher_;                  // 外部目录变化监视（所有分页目录 + 已展开树节点）
     size_t pendingSelectPane_ = SIZE_MAX; // 延后激活的窗格（避免在 comctl 控件自身过程里重入）

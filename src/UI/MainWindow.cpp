@@ -48,16 +48,14 @@ static constexpr UINT EN_ADDR_RETURN = 0x1000;
 static constexpr int kSplitGap = 3;
 static constexpr int kSplitHit = 6;
 
-// 缓慢双击进重命名：第一次单击选中后，第二次单击落在同一项、且间隔已超过
-// 系统双击时间（说明没被识别成双击打开）但仍在该时间窗内 -> 视为“慢双击”重命名。
-static constexpr DWORD kSlowRenameWindow = 1500; // ms
-
 static LRESULT CALLBACK AddressProc(HWND h, UINT m, WPARAM wp, LPARAM lp); // 前向声明
 static LRESULT CALLBACK PaneTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp); // 分页拖拽 tab 子类化
 static LRESULT CALLBACK SideTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp);
 
-// ListView 列
+// ListView 列（列序契约见 FileList.h：0=名称 1=类型 2=大小 3=修改日期）
 enum { COL_NAME = 0, COL_TYPE, COL_SIZE, COL_MTIME };
+
+static constexpr int WM_APP_TOGGLE_VIEWMODE = WM_APP + 16; // 延后切换窗格列表实现
 
 class FileDropTarget final : public IDropTarget {
 public:
@@ -455,44 +453,16 @@ void MainWindow::SwitchSideTab(int index)
     Layout();
 }
 
-// 系统图像列表只取一次，所有窗格共用（列表带 LVS_SHAREIMAGELISTS）
-void MainWindow::BuildImageList(HWND list)
-{
-    if (!sysImgs_) {
-        SHFILEINFOW fi{};
-        sysImgs_ = reinterpret_cast<HIMAGELIST>(
-            SHGetFileInfoW(L"C:\\", 0, &fi, sizeof(fi), SHGFI_SYSICONINDEX | SHGFI_SMALLICON));
-    }
-    if (sysImgs_) {
-        ListView_SetImageList(list, sysImgs_, LVSIL_SMALL);
-        return;
-    }
-    if (!imgList_) {
-        int cx = GetSystemMetrics(SM_CXSMICON), cy = GetSystemMetrics(SM_CYSMICON);
-        imgList_ = ImageList_Create(cx, cy, ILC_COLOR32 | ILC_MASK, 32, 64);
-    }
-    if (imgList_) ListView_SetImageList(list, imgList_, LVSIL_SMALL);
-}
-
 void MainWindow::SyncTreeToCurrentTab(bool showErrors)
 {
     directoryTree_.SyncToPath(CurTab().dir, showErrors);
-}
-
-// 文件列表的扩展样式。网格线由设置界面的“显示网格线”开关控制，关掉时
-// 只保留整行选中 + 双缓冲（双缓冲是拖分隔条不闪的前提，不能去掉）。
-DWORD MainWindow::ListExStyle() const
-{
-    DWORD style = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER;
-    if (showGridLines_) style |= LVS_EX_GRIDLINES;
-    return style;
 }
 
 // 把当前开关状态套用到所有窗格列表（切换网格线时用）
 void MainWindow::ApplyListStyles()
 {
     for (auto& p : panes_)
-        if (p.list) ListView_SetExtendedListViewStyle(p.list, ListExStyle());
+        p.fileList->SetGridLines(showGridLines_);
 }
 
 // 每页项数变化或从会话恢复后，让分页栏的下拉框跟上（否则显示的还是旧档位）
@@ -515,17 +485,10 @@ void MainWindow::CreatePane(Pane& p)
     SetWindowLongPtrW(p.tab, GWLP_USERDATA, GetWindowLongPtrW(p.tab, GWLP_WNDPROC));
     SetWindowLongPtrW(p.tab, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&PaneTabProc));
 
-    p.list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_OWNERDATA | LVS_SHAREIMAGELISTS,
-        0, 0, 0, 0, p.tab, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_LIST_BASE + p.tag)), hInst, nullptr);
-    if (uiFont_) SendMessageW(p.list, WM_SETFONT, (WPARAM)uiFont_, TRUE);
-    ListView_SetExtendedListViewStyle(p.list, ListExStyle());
-    BuildImageList(p.list);
-    InsertColumns(p.list);
-
-    p.listOld = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(p.list, GWLP_WNDPROC,
-        reinterpret_cast<LONG_PTR>(&MainWindow::ListViewProcStatic)));
-    SetWindowLongPtrW(p.list, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+    // 自绘虚拟列表（默认文件列表实现，控件细节在 FileList 里维护）
+    p.fileList = std::make_unique<FileList>();
+    p.fileList->Create(p.tab, this, uiFont_, IDC_LIST_BASE + p.tag);
+    p.list = p.fileList->Handle();
     auto* dropTarget = new FileDropTarget(this, p.list);
     HRESULT dropResult = RegisterDragDrop(p.list, dropTarget);
     dropTarget->Release();
@@ -538,6 +501,12 @@ void MainWindow::CreatePane(Pane& p)
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
         0, 0, 26, 22, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_NEWTAB_BASE + p.tag)), hInst, nullptr);
     if (uiFont_) SendMessageW(p.btnNewTab, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+
+    // 本窗格右上角的“Q”：切换文件列表实现（自绘虚拟列表 <-> shell 视图）
+    p.btnViewMode = CreateWindowExW(0, WC_BUTTONW, L"Q",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        0, 0, 24, 20, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_VIEWMODE_BASE + p.tag)), hInst, nullptr);
+    if (uiFont_) SendMessageW(p.btnViewMode, WM_SETFONT, (WPARAM)uiFont_, TRUE);
 
     // 本窗格右上角的“▾”：外部工具下拉菜单（CMD / PowerShell / VSCode 等，见 tools.txt）
     p.btnTools = CreateWindowExW(0, WC_BUTTONW, L"▾",
@@ -569,8 +538,9 @@ void MainWindow::RemovePane(size_t idx)
     if (panes_[idx].list) RevokeDragDrop(panes_[idx].list);
     DestroyWindow(panes_[idx].tab);
     if (panes_[idx].btnNewTab) DestroyWindow(panes_[idx].btnNewTab);
+    if (panes_[idx].btnViewMode) DestroyWindow(panes_[idx].btnViewMode);
     if (panes_[idx].btnTools) DestroyWindow(panes_[idx].btnTools);
-    panes_.erase(panes_.begin() + idx);
+    panes_.erase(panes_.begin() + idx);   // shellView（unique_ptr）随 Pane 析构解绑
     for (auto& t : tabs_)
         if (t.pane > idx) --t.pane;
     if (panes_.empty()) activePane_ = 0;
@@ -745,6 +715,7 @@ void MainWindow::ResetAllPanes()
 // 退出时把当前所有窗格/分页/各自的历史写盘（UTF-8，与 favorites.txt 同目录）
 void MainWindow::SaveSession()
 {
+    if (restoreInProgress_) return;   // 恢复会话期间的落盘一律跳过（防递归/重复写）
     std::wstring path = SessionFilePath();
     FILE* f = nullptr;
     if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return;
@@ -808,6 +779,13 @@ void MainWindow::SaveSession()
         widths += std::to_wstring(panes_[i].width);
     }
     putLine(L"widths=" + widths);
+    // 每个窗格的文件列表实现（0=自绘虚拟列表 1=shell 视图）
+    std::wstring modes;
+    for (size_t i = 0; i < panes_.size(); ++i) {
+        if (i) modes += L",";
+        modes += std::to_wstring(panes_[i].listMode);
+    }
+    putLine(L"viewmodes=" + modes);
 
     for (size_t i = 0; i < tabs_.size(); ++i) {
         const TabState& t = tabs_[i];
@@ -845,6 +823,7 @@ bool MainWindow::RestoreSession()
     RECT savedWindowRect{};
     bool hasSavedWindowRect = false;
     std::vector<int> widths;
+    std::vector<int> viewModes;
     std::vector<TabRec> recs;
     TabRec cur; bool inTab = false, ok = false;
 
@@ -901,6 +880,17 @@ bool MainWindow::RestoreSession()
                     size_t c = v.find(L',', p);
                     std::wstring tok = (c == std::wstring::npos) ? v.substr(p) : v.substr(p, c - p);
                     if (!tok.empty()) widths.push_back(_wtoi(tok.c_str()));
+                    if (c == std::wstring::npos) break;
+                    p = c + 1;
+                }
+                continue;
+            }
+            if (w.rfind(L"viewmodes=", 0) == 0) {
+                std::wstring v = w.substr(10);
+                for (size_t p = 0; p <= v.size(); ) {
+                    size_t c = v.find(L',', p);
+                    std::wstring tok = (c == std::wstring::npos) ? v.substr(p) : v.substr(p, c - p);
+                    if (!tok.empty()) viewModes.push_back(_wtoi(tok.c_str()));
                     if (c == std::wstring::npos) break;
                     p = c + 1;
                 }
@@ -1013,6 +1003,7 @@ bool MainWindow::RestoreSession()
         panes_.emplace_back();
         CreatePane(panes_.back());
         if (i < (int)widths.size() && widths[i] > 0) panes_.back().width = widths[i];
+        if (i < (int)viewModes.size()) panes_.back().listMode = viewModes[i] ? 1 : 0;
     }
     for (const TabRec& r : recs) {
         size_t pi = (size_t)r.pane;
@@ -1061,6 +1052,14 @@ bool MainWindow::RestoreSession()
     SelectRightTab(act);
     UpdateRightTabLabels();
     Layout();
+    // 恢复各窗格的文件列表实现（shell 视图此刻才创建——需要窗格/分页就绪）。
+    // ToggleListMode 语义是“从自绘切到另一侧”，这里先把解析出的模式归零再切换。
+    for (size_t i = 0; i < panes_.size(); ++i) {
+        if (panes_[i].listMode == 1) {
+            panes_[i].listMode = 0;
+            ToggleListMode(i);
+        }
+    }
     UpdateWatcher();
     return true;
 }
@@ -1080,6 +1079,7 @@ void MainWindow::SelectRightTab(size_t index)
     InvalidateTabStrips(prevPane);
     RefreshList();
     SyncTreeToCurrentTab(false);
+    SyncShellView(t.pane);
 }
 
 void MainWindow::SelectPane(size_t index)
@@ -1094,6 +1094,7 @@ void MainWindow::SelectPane(size_t index)
     InvalidateTabStrips(prevPane);
     RefreshList();
     SyncTreeToCurrentTab(false);
+    SyncShellView(index);
 }
 
 // 延后版激活入口：只记录目标并 PostMessage，控件消息链结束后才真正切换。
@@ -1374,19 +1375,6 @@ void MainWindow::CloseRightTab(size_t index, bool force)
 }
 
 
-void MainWindow::InsertColumns(HWND list)
-{
-    auto add = [&](int idx, const wchar_t* text, int w) {
-        LVCOLUMNW c = { LVCF_TEXT | LVCF_WIDTH | LVCF_FMT, LVCFMT_LEFT, w, const_cast<LPWSTR>(text) };
-        c.iSubItem = idx;
-        ListView_InsertColumn(list, idx, &c);
-    };
-    add(COL_NAME, L"名称", 300);
-    add(COL_TYPE, L"类型", 140);
-    add(COL_SIZE, L"大小", 110);
-    add(COL_MTIME, L"修改日期", 160);
-}
-
 // ---------------------------------------------------------------------------
 // 导航
 // ---------------------------------------------------------------------------
@@ -1453,6 +1441,7 @@ void MainWindow::Navigate(const std::wstring& rawPath, bool addHistory)
     UpdatePaginationBar();
     UpdateRightTabLabels();
     UpdateWatcher();
+    SyncShellView(activePane_);   // 窗格处于 shell 视图模式时让视图跟着换目录
 }
 
 // 目录树 / 收藏 的跳转入口。
@@ -1594,6 +1583,8 @@ void MainWindow::OnExternalDirChanged(const std::wstring& dir)
 
 void MainWindow::UpdateStatusBar()
 {
+    // shell 视图模式：条目数由视图自己发状态文本（SetStatusTextSB），别覆盖
+    if (activePane_ < panes_.size() && panes_[activePane_].listMode == 1) return;
     wchar_t buf[160];
     unsigned long long total = CurTab().pages->TotalCount();
     if (total > 0 && !paginationEnabled_)
@@ -1609,6 +1600,15 @@ void MainWindow::UpdateStatusBar()
 void MainWindow::UpdatePaginationBar()
 {
     if (!paginationEnabled_) return;   // 分页栏整条已隐藏
+    if (activePane_ < panes_.size() && panes_[activePane_].listMode == 1) {
+        // shell 视图整目录显示，没有分页概念
+        SetWindowTextW(pagerLabel_, L"Shell 视图");
+        EnableWindow(pagerFirst_, FALSE);
+        EnableWindow(pagerPrev_, FALSE);
+        EnableWindow(pagerNext_, FALSE);
+        EnableWindow(pagerLast_, FALSE);
+        return;
+    }
     wchar_t buf[80];
     unsigned long long total = CurTab().pages->TotalCount();
     if (total > 0)
@@ -1661,32 +1661,256 @@ void MainWindow::ApplyCurrentSort(size_t paneIdx)
 }
 
 // ---------------------------------------------------------------------------
-// 虚拟 ListView：LVN_GETDISPINFO 时才取数据，几十个可见项，与总页数无关
+// 文件列表双实现：自绘虚拟列表（FileList） <-> shell 视图（ShellFolderView）
 // ---------------------------------------------------------------------------
-int MainWindow::EnsureIcon(FileEntry& e)
+// 窗格右上角“Q”按钮（延后到这里执行）：切换两种实现
+void MainWindow::ToggleListMode(size_t paneIdx)
 {
+    if (paneIdx >= panes_.size()) return;
+    Pane& p = panes_[paneIdx];
+    if (p.listMode == 0) {
+        // 切到 shell 视图：懒创建宿主 + 视图，导航到当前分页目录
+        if (!p.shellView) {
+            auto sv = std::make_unique<ShellFolderView>();
+            if (!sv->Create(p.tab)) {
+                WriteAppLog(L"ShellFolderView create failed");
+                return;
+            }
+            // 视图内双击目录 -> 浏览请求：必须延后（回调发生在视图自己的消息链内，
+            // 处理中的 Navigate 会销毁发起回调的这个视图）
+            sv->onBrowse = [this](const std::wstring& dir) {
+                PostMessageW(hwnd_, WM_APP_TREE_NAV, 0,
+                             reinterpret_cast<LPARAM>(new std::wstring(dir)));
+            };
+            sv->onStatusText = [this](const std::wstring& text) {
+                // 视图的“N 个对象”等状态文本：只在该窗格是活动窗格时显示
+                if (activePane_ < panes_.size() && panes_[activePane_].listMode == 1)
+                    SendMessageW(status_, SB_SETTEXTW, 0,
+                                 reinterpret_cast<LPARAM>(text.c_str()));
+            };
+            p.shellView = std::move(sv);
+        }
+        const std::wstring& dir = PaneActiveTab(paneIdx).dir;
+        if (!dir.empty() && !p.shellView->Navigate(dir)) {
+            WriteAppLog((L"ShellFolderView navigate failed: " + dir).c_str());
+            return;
+        }
+        p.listMode = 1;
+        ApplyPaneListMode(paneIdx);
+        if (paneIdx == activePane_ && p.shellView->HasView())
+            SetFocus(p.shellView->ViewWindow());
+    } else {
+        // 切回自绘虚拟列表
+        p.listMode = 0;
+        ApplyPaneListMode(paneIdx);
+        RefreshPaneList(paneIdx);   // 隐藏期间分页数据可能没跟上
+        if (paneIdx == activePane_) SetFocus(p.list);
+    }
+    if (paneIdx == activePane_) {
+        UpdateStatusBar();
+        UpdatePaginationBar();
+    }
+    SaveSession();   // 模式是会话状态，立即落盘
+}
+
+// 按 listMode 摆放两套实现的可见性（两者在布局里重叠摆放）
+void MainWindow::ApplyPaneListMode(size_t paneIdx)
+{
+    if (paneIdx >= panes_.size()) return;
+    Pane& p = panes_[paneIdx];
+    BOOL listVisible = (p.listMode == 0) ? SW_SHOW : SW_HIDE;
+    ShowWindow(p.list, listVisible);
+    if (p.shellView)
+        ShowWindow(p.shellView->Host(), listVisible == SW_SHOW ? SW_HIDE : SW_SHOW);
+    // 宿主可能是在上次 Layout 之后才创建的（尺寸还是 0），统一重摆一次：
+    // 宿主跟随列表位置/尺寸，shell 视图再填满宿主
+    Layout();
+    if (p.shellView) p.shellView->Layout();
+}
+
+// 窗格处于 shell 视图模式时，把视图导航到该窗格当前分页的目录
+void MainWindow::SyncShellView(size_t paneIdx)
+{
+    if (paneIdx >= panes_.size()) return;
+    Pane& p = panes_[paneIdx];
+    if (p.listMode != 1 || !p.shellView) return;
+    const std::wstring& dir = PaneActiveTab(paneIdx).dir;
+    if (!dir.empty() && p.shellView->Directory() != dir) {
+        if (!p.shellView->Navigate(dir))
+            WriteAppLog((L"ShellFolderView sync navigate failed: " + dir).c_str());
+    }
+}
+
+// --- FileListDelegate：自绘列表交互回调（控件代码在 FileList.cpp） ---
+
+bool MainWindow::HitRowSplit(HWND list, const POINT& clientPt)
+{
+    if (rowSplitY_ < 0 || paneRects_.empty()) return false;
+    if (clientPt.y < rowSplitY_ - kSplitHit || clientPt.y > rowSplitY_ + kSplitHit)
+        return false;
+    int left = paneRects_.front().left;
+    int right = paneRects_.front().right;
+    for (const RECT& r : paneRects_) {
+        if (r.left < left) left = r.left;
+        if (r.right > right) right = r.right;
+    }
+    return clientPt.x >= left && clientPt.x <= right;
+}
+
+void MainWindow::RowSplitClick(HWND list, WPARAM wp, const POINT& mainClientPt)
+{
+    SendMessageW(hwnd_, WM_LBUTTONDOWN, wp, MAKELPARAM(mainClientPt.x, mainClientPt.y));
+}
+
+void MainWindow::ActivatePaneDeferred(HWND list)
+{
+    int pi = PaneOfList(list);
+    if (pi >= 0 && (size_t)pi != activePane_) PostSelectPane((size_t)pi);
+}
+
+void MainWindow::SlowRename(HWND list, int item)
+{
+    int pi = PaneOfList(list);
+    if (pi < 0) return;
+    std::wstring path = PaneItemPath((size_t)pi, item);
+    if (path.empty()) return;
+    if ((size_t)pi != activePane_) SelectPane((size_t)pi);
+    RenamePath(path);
+}
+
+void MainWindow::ListKeyCommand(HWND list, int cmd)
+{
+    int pi = PaneOfList(list);
+    if (pi < 0) return;
+    if ((size_t)pi != activePane_) PostSelectPane((size_t)pi);
+    switch (cmd) {
+    case FileList::CmdCopy:            OnClipboard(false); break;
+    case FileList::CmdCut:             OnClipboard(true); break;
+    case FileList::CmdPaste:           OnPaste(); break;
+    case FileList::CmdDelete:          OnDelete(true); break;
+    case FileList::CmdDeleteNoRecycle: OnDelete(false); break;
+    case FileList::CmdRename:
+        WriteAppLog((L"RENAME key message received by list: pane=" +
+                     std::to_wstring(pi)).c_str());
+        OnRename();
+        break;
+    case FileList::CmdEscape:          HideToTray(); break;
+    }
+}
+
+void MainWindow::ListContextMenu(HWND list, const POINT& screenPt, bool keyboard)
+{
+    int pi = PaneOfList(list);
+    if (pi < 0) return;
+    if ((size_t)pi != activePane_) PostSelectPane((size_t)pi); // 激活延后（防重入）
+    std::wstring path;
+    if (keyboard) {
+        int sel = ListView_GetNextItem(list, -1, LVNI_SELECTED);
+        if (sel >= 0) path = PaneItemPath((size_t)pi, sel);
+    } else {
+        POINT clientPt = screenPt;
+        ScreenToClient(list, &clientPt);
+        LVHITTESTINFO hit{};
+        hit.pt = clientPt;
+        int item = ListView_HitTest(list, &hit);
+        if (item >= 0) {
+            path = PaneItemPath((size_t)pi, item);
+        } else {
+            // 空白处使用文件夹背景菜单，而不是沿用之前残留的选中项。
+            ListView_SetItemState(list, -1, 0, LVIS_SELECTED);
+        }
+    }
+    bool addFavorite = false;
+    std::wstring createdFolderPath;
+    bool renameSelected = false;
+    if (shell::ShowContextMenu(hwnd_, path, PaneActiveTab((size_t)pi).dir,
+                              const_cast<POINT&>(screenPt),
+                              L"添加当前目录到收藏", addFavorite, &createdFolderPath,
+                              &renameSelected, L"在 Explorer 中打开(&X)")) {
+        WriteAppLog((L"CONTEXT_MENU command completed: pane=" +
+                     std::to_wstring(pi) + L", selectedPath=" +
+                     (path.empty() ? L"(background)" : path) +
+                     L", createdFolder=" +
+                     (createdFolderPath.empty() ? L"(none)" : createdFolderPath)).c_str());
+        if (!createdFolderPath.empty())
+            RenamePath(createdFolderPath);
+        RefreshListFromDisk();   // 右键菜单可能增删改了文件（删除/粘贴/重命名）
+    } else {
+        WriteAppLog((L"CONTEXT_MENU command not invoked: pane=" +
+                     std::to_wstring(pi) + L", selectedPath=" +
+                     (path.empty() ? L"(background)" : path)).c_str());
+    }
+    if (renameSelected && !path.empty()) {
+        WriteAppLog((L"CONTEXT_MENU rename selected: " + path).c_str());
+        RenamePath(path);
+    }
+    if (addFavorite) OnAddFavorite();
+}
+
+void MainWindow::ListColumnClicked(HWND list, int col)
+{
+    OnColumnClick(col);
+}
+
+void MainWindow::ListItemActivated(HWND list, int item)
+{
+    int pi = PaneOfList(list);
+    if (pi < 0 || item < 0) return;
+    // 按所在窗格取路径（此前误用活动窗格的当前分页，多窗格下会打开错行）
+    std::wstring p = PaneItemPath((size_t)pi, item);
+    if (p.empty()) return;
+    DWORD attr = GetFileAttributesW(p.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        // 进入目录延后到主窗口执行：此时还在列表控件自己的消息过程里，
+        // 同步 Navigate 会重入列表（LVM_SETITEMCOUNT，崩在 COMCTL32）；
+        // 同时锁定分页不改目录，改在该窗格新开分页（见处理处）
+        PostMessageW(hwnd_, WM_APP_OPEN_PATH, (WPARAM)pi,
+                     reinterpret_cast<LPARAM>(new std::wstring(p)));
+    } else {
+        // 工作目录 = 当前文件视图所在目录，BAT/可执行文件内的相对路径以该目录为基准
+        SHELLEXECUTEINFOW sei{};
+        sei.cbSize = sizeof(sei);
+        sei.hwnd = hwnd_;
+        sei.lpVerb = L"open";
+        sei.lpFile = p.c_str();
+        sei.lpDirectory = PaneActiveTab((size_t)pi).dir.c_str();
+        sei.nShow = SW_SHOWNORMAL;
+        ShellExecuteExW(&sei);
+    }
+}
+
+bool MainWindow::GetItemText(HWND list, int item, int subItem, std::wstring& text)
+{
+    int pi = PaneOfList(list);
+    if (pi < 0) return false;
+    TabState& vt = PaneActiveTab((size_t)pi);
+    if (item < 0 || item >= (int)vt.pageItems.size()) return false;
+    FileEntry& e = vt.pageItems[item];
+    switch (subItem) {
+    case COL_NAME: text = e.name; return true;
+    case COL_TYPE:
+        // 类型列每帧每行都会来取：必须走缓存（枚举时已填 typeName），
+        // 直接 SHGetFileInfoW 会让滚动时每次重绘都打进 shell/注册表
+        if (!e.isFolder && e.typeName.empty())
+            e.typeName = shell::CachedTypeNameForEntry(e.path, false);
+        text = e.isFolder ? L"文件夹" : e.typeName;
+        return true;
+    case COL_SIZE: text = e.isFolder ? L"" : filelist::FormatSize(e.size); return true;
+    case COL_MTIME: text = filelist::FormatTime(e.writeTime); return true;
+    }
+    return false;
+}
+
+int MainWindow::GetItemIcon(HWND list, int item)
+{
+    int pi = PaneOfList(list);
+    if (pi < 0) return I_IMAGENONE;
+    TabState& vt = PaneActiveTab((size_t)pi);
+    if (item < 0 || item >= (int)vt.pageItems.size()) return I_IMAGENONE;
+    FileEntry& e = vt.pageItems[item];
     if (e.iconIndex < 0)
         e.iconIndex = shell::CachedSysIconIndexForEntry(e.path, e.isFolder);
     return e.iconIndex >= 0 ? e.iconIndex : I_IMAGENONE;
-}
-
-std::wstring FormatSize(unsigned long long sz)
-{
-    wchar_t buf[64];
-    if (sz < 1024) swprintf_s(buf, L"%I64u B", sz);
-    else if (sz < 1024ull * 1024) swprintf_s(buf, L"%.1f KB", sz / 1024.0);
-    else if (sz < 1024ull * 1024 * 1024) swprintf_s(buf, L"%.1f MB", sz / (1024.0 * 1024));
-    else swprintf_s(buf, L"%.2f GB", sz / (1024.0 * 1024 * 1024));
-    return buf;
-}
-
-std::wstring FormatTime(const FILETIME& ft)
-{
-    SYSTEMTIME st{};
-    FileTimeToSystemTime(&ft, &st);
-    wchar_t buf[64];
-    swprintf_s(buf, L"%04d-%02d-%02d %02d:%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
-    return buf;
 }
 
 std::wstring MainWindow::CurrentPagePath(int item) const
@@ -1697,6 +1921,14 @@ std::wstring MainWindow::CurrentPagePath(int item) const
 
 bool MainWindow::SelectedPath(std::wstring& out) const
 {
+    // shell 视图模式：从视图选中项取（该模式下自绘列表是隐藏的）
+    if (activePane_ < panes_.size() && panes_[activePane_].listMode == 1 &&
+        panes_[activePane_].shellView) {
+        auto paths = panes_[activePane_].shellView->SelectedPaths();
+        if (paths.empty()) return false;
+        out = std::move(paths.front());
+        return true;
+    }
     int sel = ListView_GetNextItem(CurList(), -1, LVNI_SELECTED);
     if (sel < 0) return false;
     out = CurrentPagePath(sel);
@@ -1705,6 +1937,10 @@ bool MainWindow::SelectedPath(std::wstring& out) const
 
 std::vector<std::wstring> MainWindow::SelectedPaths() const
 {
+    // shell 视图模式：从视图选中项取
+    if (activePane_ < panes_.size() && panes_[activePane_].listMode == 1 &&
+        panes_[activePane_].shellView)
+        return panes_[activePane_].shellView->SelectedPaths();
     std::vector<std::wstring> out;
     int sel = -1;
     for (;;) {
@@ -2473,7 +2709,7 @@ void MainWindow::UpdateNewTabButtons()
     for (size_t i = 0; i < panes_.size(); ++i) {
         Pane& p = panes_[i];
 
-        // 右上角“▾”外部工具按钮：贴本窗格 tab 条的最右端
+        // 右上角“Q”（列表实现切换）+“▾”（外部工具）：贴本窗格 tab 条的最右端
         int toolsLeft = -1;
         if (p.btnTools != nullptr && p.tab != nullptr) {
             RECT tc{};
@@ -2482,7 +2718,18 @@ void MainWindow::UpdateNewTabButtons()
                 MapWindowPoints(p.tab, hwnd_, &tr, 1);
                 SetWindowPos(p.btnTools, HWND_TOP, tr.x, tr.y, 24, 20,
                              SWP_NOACTIVATE | SWP_SHOWWINDOW);
-                toolsLeft = tr.x;
+                if (p.btnViewMode != nullptr) {
+                    // “Q”在“▾”左边：同样从 tab 客户区坐标出发，各换算一次
+                    // （tr 已是主窗口坐标，不能再拿去 MapWindowPoints，否则 Q 会被
+                    // 多加一次 tab 原点偏移、飘到外部工具按钮右边老远）
+                    POINT vr{ tc.right - 26 - 24 - 2, 1 };
+                    MapWindowPoints(p.tab, hwnd_, &vr, 1);
+                    SetWindowPos(p.btnViewMode, HWND_TOP, vr.x, vr.y, 24, 20,
+                                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                    toolsLeft = vr.x;   // “+”收起判断以最左的按钮为准
+                } else {
+                    toolsLeft = tr.x;
+                }
             }
         }
 
@@ -2875,8 +3122,13 @@ void MainWindow::Layout()
         paneRects_.push_back(r);
         SendMessageW(p.tab, TCM_GETITEMRECT, 0, reinterpret_cast<LPARAM>(&rrt));
         rtabH = rrt.bottom - rrt.top;
-        // list 是 p.tab 的子窗口，坐标相对 p.tab 客户区
+        // list 与 shell 视图宿主都是 p.tab 的子窗口，坐标相对 p.tab 客户区，
+        // 两者重叠摆放，可见性由 listMode 决定（ApplyPaneListMode）
         place(p.list, 4, rtabH + 6, w - 8, hh - rtabH - 12);
+        if (p.shellView) {
+            place(p.shellView->Host(), 4, rtabH + 6, w - 8, hh - rtabH - 12);
+            p.shellView->Layout();
+        }
     }
 
     // 每个窗格的“+”按钮贴在其最后一个分页头右侧（UpdateNewTabButtons 里算）
@@ -2908,175 +3160,6 @@ void MainWindow::Layout()
     // 所有子控件都已就位，统一重绘一次（只呈现最终状态，避免中间态闪动）
     RedrawWindow(hwnd_, nullptr, nullptr,
                  RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN);
-}
-
-LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
-{
-    if (msg == WM_LBUTTONDOWN || msg == WM_SETCURSOR) {
-        POINT pt{};
-        if (msg == WM_LBUTTONDOWN) {
-            pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-            ClientToScreen(h, &pt);
-        } else {
-            GetCursorPos(&pt);
-        }
-        ScreenToClient(hwnd_, &pt);
-
-        if (rowSplitY_ >= 0 && !paneRects_.empty() &&
-            pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitHit) {
-            int left = paneRects_.front().left;
-            int right = paneRects_.front().right;
-            for (const RECT& r : paneRects_) {
-                if (r.left < left) left = r.left;
-                if (r.right > right) right = r.right;
-            }
-            if (pt.x >= left && pt.x <= right) {
-                if (msg == WM_LBUTTONDOWN) {
-                    SendMessageW(hwnd_, WM_LBUTTONDOWN, wp, MAKELPARAM(pt.x, pt.y));
-                } else {
-                    SetCursor(LoadCursor(nullptr, IDC_SIZENS));
-                }
-                return msg == WM_SETCURSOR ? TRUE : 0;
-            }
-        }
-    }
-
-    // 慢双击（Explorer 习惯）：先单击选中、停顿一下再单击同一项 -> 进入重命名。
-    // 快速双击会被系统判定为双击、走 NM_DBLCLK 打开/进入；这里只拦截“慢”的那一次点击。
-    if (msg == WM_LBUTTONDOWN) {
-        LVHITTESTINFO ht{};
-        ht.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        int idx = ListView_HitTest(h, &ht);
-        DWORD now = GetMessageTime();
-        DWORD delta = (DWORD)(now - lastRenameClickTime_);
-        bool modifier = (GetKeyState(VK_CONTROL) & 0x8000) || (GetKeyState(VK_SHIFT) & 0x8000);
-        if (modifier) {
-            // Ctrl/Shift 是选择修饰键，不参与慢双击，并清掉记录避免误触发
-            lastRenameList_ = nullptr;
-            lastRenameClickItem_ = -1;
-            lastRenameClickTime_ = 0;
-        } else if (idx >= 0 && h == lastRenameList_ && idx == lastRenameClickItem_ &&
-                   ListView_GetItemState(h, idx, LVIS_SELECTED) &&
-                   delta >= (DWORD)GetDoubleClickTime() && delta <= kSlowRenameWindow) {
-            lastRenameList_ = nullptr;    // 复位，避免连点连续触发
-            lastRenameClickItem_ = -1;
-            lastRenameClickTime_ = 0;
-            int rpi = PaneOfList(h);
-            if (rpi >= 0) {
-                std::wstring path = PaneItemPath((size_t)rpi, idx);
-                if (!path.empty()) {
-                    if ((size_t)rpi != activePane_) SelectPane((size_t)rpi);
-                    RenamePath(path);
-                }
-            }
-            return 0;   // 吃掉这次点击（项已选中，无需再改选择）
-        } else {
-            lastRenameList_ = h;
-            lastRenameClickItem_ = idx;   // 空白处 idx<0 也记录，会覆盖上一项
-            lastRenameClickTime_ = now;
-        }
-    }
-
-    int pi = PaneOfList(h);
-    if (pi >= 0 && msg == WM_KEYDOWN && wp == VK_F2) {
-        int selected = ListView_GetNextItem(h, -1, LVNI_SELECTED);
-        std::wstring path = PaneItemPath(static_cast<size_t>(pi), selected);
-        if (!path.empty()) {
-            if (static_cast<size_t>(pi) != activePane_)
-                SelectPane(static_cast<size_t>(pi));
-            RenamePath(path);
-        }
-        return 0;
-    }
-    // 只有真正的用户输入（点击/按键）才激活窗格并同步目录树；
-    // 鼠标移动、悬停重绘、tooltip 等带来的消息一律不切换。
-    if (pi >= 0 && (size_t)pi != activePane_ &&
-        (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN ||
-         msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN))
-        PostSelectPane((size_t)pi);   // 在列表自己的消息过程里，激活延后（防重入 comctl32）
-    // 文件视图的常规键盘操作（资源管理器习惯）：Ctrl+C 复制 / Ctrl+X 剪切 /
-    // Ctrl+V 粘贴 / Delete 删除到回收站 / Shift+Delete 直接删除。
-    if (pi >= 0 && msg == WM_KEYDOWN) {
-        bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-        if (wp == VK_F2)
-            WriteAppLog((L"RENAME key message received by list: pane=" +
-                         std::to_wstring(pi)).c_str());
-        if (ctrl && wp == 'C')      { OnClipboard(false); return 0; }
-        if (ctrl && wp == 'X')      { OnClipboard(true);  return 0; }
-        if (ctrl && wp == 'V')      { OnPaste();          return 0; }
-        if (wp == VK_DELETE)        { OnDelete(!shift);   return 0; }
-    }
-    if (pi >= 0 && msg == WM_CONTEXTMENU) {
-        // 右键菜单：在列表空白/条目上弹出 Explorer 风格菜单
-        if ((size_t)pi != activePane_) PostSelectPane((size_t)pi); // 激活延后（防重入）
-        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        bool keyboardContext = pt.x == -1 && pt.y == -1;
-        if (keyboardContext) { // 键盘触发
-            pt = { 200, 200 };
-            ClientToScreen(hwnd_, &pt);
-        }
-        std::wstring path;
-        if (keyboardContext) {
-            int sel = ListView_GetNextItem(h, -1, LVNI_SELECTED);
-            if (sel >= 0) path = PaneItemPath((size_t)pi, sel);
-        } else {
-            POINT clientPt = pt;
-            ScreenToClient(h, &clientPt);
-            LVHITTESTINFO hit{};
-            hit.pt = clientPt;
-            int item = ListView_HitTest(h, &hit);
-            if (item >= 0) {
-                path = PaneItemPath((size_t)pi, item);
-            } else {
-                // 空白处使用文件夹背景菜单，而不是沿用之前残留的选中项。
-                ListView_SetItemState(h, -1, 0, LVIS_SELECTED);
-            }
-        }
-        bool addFavorite = false;
-        std::wstring createdFolderPath;
-        bool renameSelected = false;
-        if (shell::ShowContextMenu(hwnd_, path, PaneActiveTab((size_t)pi).dir, pt,
-                                  L"添加当前目录到收藏", addFavorite, &createdFolderPath,
-                                  &renameSelected, L"在 Explorer 中打开(&X)")) {
-            WriteAppLog((L"CONTEXT_MENU command completed: pane=" +
-                         std::to_wstring(pi) + L", selectedPath=" +
-                         (path.empty() ? L"(background)" : path) +
-                         L", createdFolder=" +
-                         (createdFolderPath.empty() ? L"(none)" : createdFolderPath)).c_str());
-            if (!createdFolderPath.empty())
-                RenamePath(createdFolderPath);
-            RefreshListFromDisk();   // 右键菜单可能增删改了文件（删除/粘贴/重命名）
-        } else {
-            WriteAppLog((L"CONTEXT_MENU command not invoked: pane=" +
-                         std::to_wstring(pi) + L", selectedPath=" +
-                         (path.empty() ? L"(background)" : path)).c_str());
-        }
-        if (renameSelected && !path.empty()) {
-            WriteAppLog((L"CONTEXT_MENU rename selected: " + path).c_str());
-            RenamePath(path);
-        }
-        if (addFavorite) OnAddFavorite();
-        return 0;
-    }
-    if (pi >= 0 && msg == WM_KEYDOWN && wp == VK_ESCAPE) {
-        // 列表聚焦时 ESC 同样等同于点关闭按钮：收进托盘
-        HideToTray();
-        return 0;
-    }
-    // 每个窗格各自保存原过程，别用别窗格的
-    WNDPROC orig = (pi >= 0) ? panes_[pi].listOld : nullptr;
-    if (orig) return CallWindowProcW(orig, h, msg, wp, lp);
-    return DefWindowProcW(h, msg, wp, lp);
-}
-
-LRESULT CALLBACK MainWindow::ListViewProcStatic(HWND h, UINT m, WPARAM wp, LPARAM lp,
-                                                UINT_PTR, DWORD_PTR ref)
-{
-    // 用 GWLP_USERDATA 取 self（CreateListView 时已设置）
-    auto* self = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(h, GWLP_USERDATA));
-    if (self) return self->ListViewProc(h, m, wp, lp);
-    return DefWindowProcW(h, m, wp, lp);
 }
 
 LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
@@ -3231,88 +3314,10 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         // 多窗格：窗格被删除后控件 ID 与下标不再对应，统一用 hwnd 反查窗格
         int pi = PaneOfList(nm->hwndFrom);
         if (pi >= 0) {
-            // 操作非激活窗格 -> 先激活它。只认真正的用户交互通知（点击/键盘/点列头）：
-            // 鼠标移动、悬停引起的重绘（NM_CUSTOMDRAW）、tooltip 等通知一律不切换窗格。
-            switch (nm->code) {
-            case NM_CLICK:
-            case NM_DBLCLK:
-            case NM_RCLICK:
-            case NM_RDBLCLK:
-            case NM_RETURN:
-            case LVN_COLUMNCLICK:
-            case LVN_KEYDOWN:
-                // 这些通知是列表控件在自己消息过程里同步发来的，激活窗格会
-                // 重入该列表（RefreshList -> LVM_SETITEMCOUNT），延后执行
-                if ((size_t)pi != activePane_) PostSelectPane((size_t)pi);
-                break;
-            }
-            if (nm->code == LVN_GETDISPINFOW) {
-                auto* di = reinterpret_cast<NMLVDISPINFOW*>(nm);
-                TabState& vt = PaneActiveTab((size_t)pi); // 取本窗格自己的分页数据
-                int i = di->item.iItem;
-                if (i < 0 || i >= (int)vt.pageItems.size()) return 0;
-                FileEntry& e = vt.pageItems[i];
-                if (di->item.mask & LVIF_TEXT) {
-                    std::wstring text;
-                    switch (di->item.iSubItem) {
-                    case COL_NAME: text = e.name; break;
-                    case COL_TYPE:
-                        // 类型列每帧每行都会来取：必须走缓存（枚举时已填 typeName），
-                        // 直接 SHGetFileInfoW 会让滚动时每次重绘都打进 shell/注册表
-                        if (!e.isFolder && e.typeName.empty())
-                            e.typeName = shell::CachedTypeNameForEntry(e.path, false);
-                        text = e.isFolder ? L"文件夹" : e.typeName;
-                        break;
-                    case COL_SIZE: text = e.isFolder ? L"" : FormatSize(e.size); break;
-                    case COL_MTIME: text = FormatTime(e.writeTime); break;
-                    }
-                    wcsncpy_s(di->item.pszText, di->item.cchTextMax, text.c_str(), _TRUNCATE);
-                }
-                if (di->item.mask & LVIF_IMAGE)
-                    di->item.iImage = EnsureIcon(e);
-            }
-            else if (nm->code == NM_DBLCLK) {
-                auto* ni = reinterpret_cast<NMITEMACTIVATE*>(nm);
-                if (ni->iItem >= 0) {
-                    std::wstring p = CurrentPagePath(ni->iItem);
-                    if (!p.empty()) {
-                        DWORD attr = GetFileAttributesW(p.c_str());
-                        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
-                            // 进入目录延后到主窗口执行：此时还在列表控件自己的
-                            // 消息过程里，同步 Navigate 会重入列表（LVM_SETITEMCOUNT，
-                            // 崩在 COMCTL32，同双击空白新建分页的修复）；同时
-                            // 锁定分页不改目录，改在该窗格新开分页（见处理处）
-                            PostMessageW(hwnd_, WM_APP_OPEN_PATH, (WPARAM)pi,
-                                         reinterpret_cast<LPARAM>(new std::wstring(p)));
-                        } else {
-                            // 工作目录 = 当前文件视图所在目录，BAT/可执行文件
-                            // 内的相对路径以该目录为基准。
-                            SHELLEXECUTEINFOW sei{};
-                            sei.cbSize = sizeof(sei);
-                            sei.hwnd = hwnd_;
-                            sei.lpVerb = L"open";
-                            sei.lpFile = p.c_str();
-                            sei.lpDirectory = PaneActiveTab((size_t)pi).dir.c_str();
-                            sei.nShow = SW_SHOWNORMAL;
-                            ShellExecuteExW(&sei);
-                        }
-                    }
-                }
-            }
-            else if (nm->code == LVN_COLUMNCLICK) {
-                auto* lv = reinterpret_cast<NMLISTVIEW*>(nm);
-                OnColumnClick(lv->iSubItem);
-            }
-            else if (nm->code == LVN_KEYDOWN) {
-                auto* kd = reinterpret_cast<NMLVKEYDOWN*>(nm);
-                if (kd->wVKey == VK_F2) {
-                    WriteAppLog((L"RENAME LVN_KEYDOWN received: pane=" +
-                                 std::to_wstring(pi)).c_str());
-                    OnRename();
-                }
-                // Delete/Shift+Delete 在 ListViewProc 的 WM_KEYDOWN 里处理
-            }
-            else if (nm->code == LVN_ODFINDITEM) {
+            // 交互与显示通知已抽到 FileList（控件侧）处理；未处理的通知
+            // （NM_CUSTOMDRAW、tooltip、LVN_ODFINDITEM 等）留在下面。
+            if (panes_[pi].fileList->HandleNotify(nm)) return 0;
+            if (nm->code == LVN_ODFINDITEM) {
                 // 虚拟列表的类型前置搜索：键入字符时控件要求我们给出匹配项下标，
                 // 不处理的话输入 g 无法定位到 github 这类条目
                 auto* fi = reinterpret_cast<NMLVFINDITEM*>(nm);
@@ -3419,6 +3424,17 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                     if (panes_[i].tag == tag) { ShowPaneToolsMenu(i); break; }
                 return 0;
             }
+            // 每个窗格一个“Q”按钮：切换文件列表实现（自绘虚拟列表 <-> shell 视图）。
+            // 切换会创建/销毁窗口与 COM 对象，与“+”按钮同样延后到消息循环执行。
+            if (id >= IDC_VIEWMODE_BASE && id < IDC_VIEWMODE_BASE + 8) {
+                int tag = id - IDC_VIEWMODE_BASE;
+                for (size_t i = 0; i < panes_.size(); ++i)
+                    if (panes_[i].tag == tag) {
+                        PostMessageW(hwnd_, WM_APP_TOGGLE_VIEWMODE, i, 0);
+                        break;
+                    }
+                return 0;
+            }
             break;
         case IDC_TREE_SYNC:
             SyncTreeToCurrentTab();
@@ -3506,6 +3522,10 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     }
+
+    case WM_APP_TOGGLE_VIEWMODE: // “Q”按钮：延后切换窗格的文件列表实现
+        ToggleListMode(static_cast<size_t>(wp));
+        return 0;
 
     case WM_APP_SELECT_PANE:    // 延后激活窗格（真正的切换在控件消息链之外执行）
         if (pendingSelectPane_ < panes_.size()) {
