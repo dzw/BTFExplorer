@@ -296,6 +296,7 @@ void MainWindow::OpenSettings()
     const bool prevAutoStart = data.autoStart;
 
     // “确定/应用”时即时套用；“取消”不走到 apply。
+    int savedAsym = asymMode_;            // 设置界面改不了不对称布局，应用后还原
     auto apply = [&](const SettingsData& d) {
         if (d.gridLines != showGridLines_) {
             showGridLines_ = d.gridLines;
@@ -310,9 +311,13 @@ void MainWindow::OpenSettings()
             Layout();                       // 显示/隐藏整条分页栏
         }
         if (d.triLayout != triLayout_)
-            SetTriLayout(d.triLayout);
+            SetTriLayout(d.triLayout);      // 会清掉 asymMode_
         if (d.paneCount != (int)panes_.size())
-            SetPaneCount(d.paneCount);
+            SetPaneCount(d.paneCount);      // 会清掉 asymMode_
+        if (savedAsym != 0 && panes_.size() == 3) {
+            asymMode_ = savedAsym;          // 仍是不对称 3 窗格：还原模式
+            Layout();
+        }
     };
     settings::Show(hwnd_, uiFont_, data, apply);
     SetFocus(CurList());
@@ -650,10 +655,11 @@ void MainWindow::AddPane()
 
 // Alt+1~4：窗格数量 1~4。减少时把多余窗格的分页并入最后一个保留窗格；
 // 增加时逐个 AddPane。
-void MainWindow::SetPaneCount(int n)
+void MainWindow::SetPaneCount(int n, bool keepAsym)
 {
     if (n < 1) n = 1;
     if (n > 4) n = 4;
+    if (!keepAsym) asymMode_ = 0;   // 切换到“数量”布局时回到对称形态（不对称仅由 Alt+4/6 触发）
     // 减少：把末尾窗格的分页逐个移进第 n-1 个窗格（MoveTabToPane 会自动关闭空窗格）；
     // 目标窗格已有相同目录的分页时，直接丢弃这个重复分页，不再搬过去
     const size_t target = (size_t)n - 1;
@@ -696,8 +702,18 @@ void MainWindow::SetTriLayout(int t)
     int v = t ? 1 : 0;
     bool changed = (triLayout_ != v);
     triLayout_ = v;
+    asymMode_ = 0;                  // 品/倒品是对称形态，清除不对称模式
     if (panes_.size() == 3) Layout();
     if (changed) SaveFavorites();
+}
+
+// 不对称 3 窗格：1=1左2右(上下排) 2=2左(上下排)1右。Alt+4 / Alt+6 触发。
+void MainWindow::SetAsymmetricTri(int mode)
+{
+    SetPaneCount(3);                // 先确保 3 窗格（会清掉旧 asymMode_，下面的赋值再设回去）
+    asymMode_ = mode;
+    Layout();
+    SaveFavorites();
 }
 
 // 启动时恢复上次布局：没有记录就用默认的倒品字形
@@ -706,7 +722,7 @@ void MainWindow::ApplySavedLayout()
     if (startupLayoutApplied_) return;
     startupLayoutApplied_ = true;
     if (savedPaneCount_ > 1 && savedPaneCount_ != (int)panes_.size())
-        SetPaneCount(savedPaneCount_);
+        SetPaneCount(savedPaneCount_, /*keepAsym=*/true); // 保留不对称模式（若存在）
 }
 
 // 销毁全部窗格与分页（窗格的 list 是 tab 的子窗口，随 DestroyWindow 一起没）
@@ -741,6 +757,8 @@ void MainWindow::SaveSession()
     putLine(L"sort=" + std::to_wstring(sortCol_) + L"," + std::to_wstring(sortAsc_ ? 1 : 0));
     putLine(L"panes=" + std::to_wstring(panes_.size()));
     putLine(L"tri=" + std::to_wstring(triLayout_));
+    putLine(L"asym=" + std::to_wstring(asymMode_));
+    putLine(L"col=" + std::to_wstring(colSplitPermille_));
     putLine(L"sel=" + std::to_wstring(activeTab_));
     putLine(L"sideWidth=" + std::to_wstring(sideWidth_));
     // 设置界面里的开关也要记住，重启后继续生效
@@ -815,6 +833,7 @@ bool MainWindow::RestoreSession()
         (f ? L" (opened)" : L" (NOT opened)")).c_str());
     struct TabRec { int pane = 0; int locked = 0; int histPos = 0; std::vector<std::wstring> history; };
     int paneCount = 1, tri = 1, sel = 0, sortCol = 0, sortAsc = 1;
+    int asym = 0, colSplit = 500;   // 不对称布局：模式 0/1/2 与左右栏比例
     int savedSideWidth = sideWidth_, windowMaximized = 0;
     RECT savedWindowRect{};
     bool hasSavedWindowRect = false;
@@ -846,6 +865,8 @@ bool MainWindow::RestoreSession()
             if (w.rfind(L"sort=", 0) == 0) { swscanf_s(w.c_str() + 5, L"%d,%d", &sortCol, &sortAsc); continue; }
             if (w.rfind(L"panes=", 0) == 0) { swscanf_s(w.c_str() + 6, L"%d", &paneCount); continue; }
             if (w.rfind(L"tri=", 0) == 0) { swscanf_s(w.c_str() + 4, L"%d", &tri); continue; }
+            if (w.rfind(L"asym=", 0) == 0) { swscanf_s(w.c_str() + 5, L"%d", &asym); continue; }
+            if (w.rfind(L"col=", 0) == 0) { swscanf_s(w.c_str() + 4, L"%d", &colSplit); continue; }
             if (w.rfind(L"sel=", 0) == 0) { swscanf_s(w.c_str() + 4, L"%d", &sel); continue; }
             if (w.rfind(L"sideWidth=", 0) == 0) {
                 swscanf_s(w.c_str() + 10, L"%d", &savedSideWidth);
@@ -1022,6 +1043,8 @@ bool MainWindow::RestoreSession()
     // 排序 / 布局 / 品字形态
     if (sortCol >= 0 && sortCol <= 3) { sortCol_ = sortCol; sortAsc_ = (sortAsc != 0); }
     triLayout_ = (tri != 0) ? 1 : 0;
+    asymMode_ = (asym >= 1 && asym <= 2) ? asym : 0;
+    if (colSplit >= 100 && colSplit <= 900) colSplitPermille_ = colSplit;
     savedPaneCount_ = (int)panes_.size();
 
     // 激活上次的分页
@@ -1745,6 +1768,18 @@ bool MainWindow::ReadFavoritesFromDisk(std::vector<std::wstring>& out)
             triLayout_ = t ? 1 : 0;
             continue;
         }
+        if (w.rfind(L"asym=", 0) == 0) {    // 不对称布局：0=关 1=1左2右 2=2左1右
+            int a = 0;
+            swscanf_s(w.c_str() + 5, L"%d", &a);
+            asymMode_ = (a >= 1 && a <= 2) ? a : 0;
+            continue;
+        }
+        if (w.rfind(L"col=", 0) == 0) {     // 左右两栏宽度比例（千分比）
+            int c = 500;
+            swscanf_s(w.c_str() + 4, L"%d", &c);
+            if (c >= 100 && c <= 900) colSplitPermille_ = c;
+            continue;
+        }
         out.push_back(std::move(w));
     }
     return true;
@@ -1796,6 +1831,8 @@ void MainWindow::SaveFavoritesCore(bool allowEmptyFavorites)
     putLine(L"sort=" + std::to_wstring(sortCol_) + L"," + std::to_wstring(sortAsc_ ? 1 : 0));
     putLine(L"panes=" + std::to_wstring(panes_.size())); // 下次启动沿用窗格数量
     putLine(L"tri=" + std::to_wstring(triLayout_));      // 下次启动沿用品字形态
+    putLine(L"asym=" + std::to_wstring(asymMode_));
+    putLine(L"col=" + std::to_wstring(colSplitPermille_));
     for (const auto& dir : favorites_)
         putLine(dir);
     fclose(f);
@@ -2188,17 +2225,16 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
         ClientToScreen(h, &pt);
         ScreenToClient(hwnd_, &pt);
         if (pt.y < splitTop_ || pt.y > splitBot_) return false;
-        if (rowSplitY_ >= 0 &&
+        // 上下两排之间的水平分隔条（行分隔）：限定在 rowSplitX0_~rowSplitX1_ 之间
+        if (rowSplitY_ >= 0 && !paneRects_.empty() &&
             pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitHit &&
-            !paneRects_.empty()) {
-            int left = paneRects_.front().left;
-            int right = paneRects_.front().right;
-            for (const RECT& r : paneRects_) {
-                if (r.left < left) left = r.left;
-                if (r.right > right) right = r.right;
-            }
-            if (pt.x >= left && pt.x <= right) return true;
-        }
+            pt.x >= rowSplitX0_ && pt.x <= rowSplitX1_)
+            return true;
+        // 左右两栏之间的竖向分隔条（列分隔，仅不对称布局有）
+        if (colSplitX_ >= 0 &&
+            pt.x >= colSplitX_ - kSplitHit && pt.x <= colSplitX_ + kSplitHit &&
+            pt.y >= rowSplitTop_ && pt.y <= rowSplitBottom_)
+            return true;
         for (const auto& pr : splitPairs_) {
             int edge = paneRects_[pr.first].right;
             if (pt.x >= edge && pt.x <= edge + kSplitHit &&
@@ -2221,12 +2257,13 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
         GetCursorPos(&pt);
         ScreenToClient(h, &pt);
         if (isSplitterHit(pt)) {
-            SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
+            SetCursor(LoadCursor(nullptr, IDC_SIZEWE));   // 默认竖分隔（列）
             ClientToScreen(h, &pt);
             ScreenToClient(hwnd_, &pt);
             if (rowSplitY_ >= 0 &&
-                pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitHit) {
-                SetCursor(LoadCursor(nullptr, IDC_SIZENS));
+                pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitHit &&
+                pt.x >= rowSplitX0_ && pt.x <= rowSplitX1_) {
+                SetCursor(LoadCursor(nullptr, IDC_SIZENS)); // 行分隔（上下排）
             }
             return TRUE;
         }
@@ -2466,15 +2503,63 @@ static std::vector<PaneTool> ParsePaneTools(const std::wstring& text)
     return out;
 }
 
+// 解析 VSCode 可执行文件路径（避免把用户名写死进源码）：
+// 优先 App Paths 注册表，其次 LocalAppData\Programs\...\Code.exe，都找不到则回退到 PATH 上的 code 命令。
+static std::wstring ResolveVSCodePath()
+{
+    // 1) App Paths 注册表（安装时写入，含完整路径）
+    HKEY roots[] = { HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER };
+    for (HKEY root : roots) {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(root,
+                L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\Code.exe",
+                0, KEY_READ | KEY_WOW64_64KEY, &key) == ERROR_SUCCESS) {
+            wchar_t buf[MAX_PATH] = {};
+            DWORD size = sizeof(buf);
+            if (RegQueryValueExW(key, nullptr, nullptr, nullptr,
+                                 reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS &&
+                buf[0]) {
+                std::wstring p(buf);
+                // App Paths 默认值常附带参数（如 "%1"），只取第一段可执行路径
+                size_t q = p.find(L'"');
+                if (q != std::wstring::npos) {
+                    size_t end = p.find(L'"', q + 1);
+                    if (end != std::wstring::npos) p = p.substr(q + 1, end - q - 1);
+                } else {
+                    size_t sp = p.find(L' ');
+                    if (sp != std::wstring::npos) p.resize(sp);
+                }
+                if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    RegCloseKey(key);
+                    return L"\"" + p + L"\"";
+                }
+            }
+            RegCloseKey(key);
+        }
+    }
+    // 2) LocalAppData\Programs\Microsoft VS Code\Code.exe（用户级安装默认位置，不含用户名硬编码）
+    wchar_t localAppData[MAX_PATH] = {};
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, localAppData))) {
+        std::wstring p = localAppData;
+        if (!p.empty() && p.back() != L'\\') p += L'\\';
+        p += L"Programs\\Microsoft VS Code\\Code.exe";
+        if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return L"\"" + p + L"\"";
+    }
+    // 3) 回退：PATH 上的 code 命令（交给 cmd 解析）
+    return L"cmd /c code";
+}
+
 // 读外部工具列表；文件不存在时先写入默认配置（CMD / PowerShell / VSCode）
 static std::vector<PaneTool> LoadPaneTools()
 {
     static const wchar_t* kDefaults =
         L"# 外部工具配置：每行一条，格式：名称|命令行（# 开头的行是注释）\n"
         L"# %DIR% 会替换为按钮所在窗格的当前目录；命令的工作目录也是该目录。\n"
+        L"# %VSCODE% 会替换为 VSCode 可执行文件路径（运行时解析，不写死用户名）。\n"
         L"CMD|cmd.exe\n"
         L"PowerShell|powershell.exe\n"
-        L"VSCode|cmd /c code \"%DIR%\"\n";
+        L"VSCode|%VSCODE% \"%DIR%\"\n";
 
     std::wstring text;
     HANDLE h = CreateFileW(ToolsFilePath().c_str(), GENERIC_READ,
@@ -2559,6 +2644,11 @@ void MainWindow::RunPaneTool(size_t paneIdx, const std::wstring& name,
     }
 
     std::wstring line = cmdline;
+    for (size_t pos = 0; (pos = line.find(L"%VSCODE%", pos)) != std::wstring::npos; ) {
+        std::wstring vsc = ResolveVSCodePath();
+        line.replace(pos, 8, vsc);
+        pos += vsc.size();
+    }
     for (size_t pos = 0; (pos = line.find(L"%DIR%", pos)) != std::wstring::npos; ) {
         line.replace(pos, 5, dir);
         pos += dir.size();
@@ -2651,6 +2741,8 @@ void MainWindow::Layout()
     paneRects_.clear();
     splitPairs_.clear();
     rowSplitY_ = -1;
+    colSplitX_ = -1;                 // 默认无左右栏分隔（对称布局）
+    rowSplitX0_ = 0; rowSplitX1_ = 0; // 行分隔可命中的 x 范围（对称布局在分支里铺满）
     rowSplitTop_ = y;
     rowSplitBottom_ = y + gh;
 
@@ -2678,18 +2770,40 @@ void MainWindow::Layout()
         if (halfH < 120) halfH = 120;
         if (availableH - halfH < 120) halfH = availableH - 120;
         rowSplitY_ = y + halfH;
-        if (triLayout_ == 1) { // 倒品字形：2 上 1 下（默认）
+        if (asymMode_ == 1) { // 1 左（整高）+ 2 右（上下排）：Alt+4
+            int colW = (int)((long long)(gw - S) * colSplitPermille_ / 1000);
+            if (colW < 160) colW = 160;
+            if (gw - S - colW < 160) colW = gw - S - 160;
+            if (colW < 160) colW = 160;
+            colSplitX_ = gx + colW;
+            rects[0] = { gx, y, gx + colW, y + gh };
+            rects[1] = { gx + colW + S, y, gx + gw, y + halfH };
+            rects[2] = { gx + colW + S, y + halfH + S, gx + gw, y + gh };
+            rowSplitX0_ = gx + colW + S; rowSplitX1_ = gx + gw; // 行分隔只限右栏
+        } else if (asymMode_ == 2) { // 2 左（上下排）+ 1 右（整高）：Alt+6
+            int colW = (int)((long long)(gw - S) * colSplitPermille_ / 1000);
+            if (colW < 160) colW = 160;
+            if (gw - S - colW < 160) colW = gw - S - 160;
+            if (colW < 160) colW = 160;
+            colSplitX_ = gx + colW;
+            rects[0] = { gx, y, gx + colW, y + halfH };
+            rects[1] = { gx, y + halfH + S, gx + colW, y + gh };
+            rects[2] = { gx + colW + S, y, gx + gw, y + gh };
+            rowSplitX0_ = gx; rowSplitX1_ = gx + colW; // 行分隔只限左栏
+        } else if (triLayout_ == 1) { // 倒品字形：2 上 1 下（默认）
             int w = rowW(0, 1);
             rects[0] = { gx, y, gx + w, y + halfH };
             rects[1] = { gx + w + S, y, gx + gw, y + halfH };
             rects[2] = { gx, y + halfH + S, gx + gw, y + gh };
             splitPairs_.push_back({ 0, 1 }); // 竖分隔条在上方两窗格之间
+            rowSplitX0_ = gx; rowSplitX1_ = gx + gw;
         } else {               // 品字形：1 上 2 下
             int w = rowW(1, 2);
             rects[0] = { gx, y, gx + gw, y + halfH };
             rects[1] = { gx, y + halfH + S, gx + w, y + gh };
             rects[2] = { gx + w + S, y + halfH + S, gx + gw, y + gh };
             splitPairs_.push_back({ 1, 2 }); // 竖分隔条在下方两窗格之间
+            rowSplitX0_ = gx; rowSplitX1_ = gx + gw;
         }
     } else if (n >= 4) { // 4：田字形（n==0 时哪个分支都不走：窗格尚未创建）
         int availableH = gh - S;
@@ -2705,6 +2819,7 @@ void MainWindow::Layout()
         rects[3] = { gx + wBot + S, y + halfH + S, gx + gw, y + gh };
         splitPairs_.push_back({ 0, 1 });
         splitPairs_.push_back({ 2, 3 });
+        rowSplitX0_ = gx; rowSplitX1_ = gx + gw;
     }
 
     RECT rrt{};
@@ -2881,7 +2996,7 @@ LRESULT MainWindow::ListViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         bool renameSelected = false;
         if (shell::ShowContextMenu(hwnd_, path, PaneActiveTab((size_t)pi).dir, pt,
                                   L"添加当前目录到收藏", addFavorite, &createdFolderPath,
-                                  &renameSelected)) {
+                                  &renameSelected, L"在 Explorer 中打开(&X)")) {
             WriteAppLog((L"CONTEXT_MENU command completed: pane=" +
                          std::to_wstring(pi) + L", selectedPath=" +
                          (path.empty() ? L"(background)" : path) +
@@ -3034,11 +3149,12 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         break;
 
     case WM_SYSKEYDOWN: // Alt+数字：窗格数量/布局；Alt+方向键：导航
-        // Alt+1~4 切换窗格数量（主键盘数字行；小键盘 2 另有“倒品字形”用途，不参与）
-        if (wp >= '1' && wp <= '4') {
-            SetPaneCount((int)(wp - '0'));
-            return 0;
-        }
+        // Alt+1~3 切换窗格数量（对称布局）；Alt+4 = 1左2右(上下排)；Alt+6 = 2左(上下排)1右
+        if (wp == '1') { SetPaneCount(1); return 0; }
+        if (wp == '2') { SetPaneCount(2); return 0; }
+        if (wp == '3') { SetPaneCount(3); return 0; }
+        if (wp == '4') { SetAsymmetricTri(1); return 0; }
+        if (wp == '6') { SetAsymmetricTri(2); return 0; }
         // Alt+小键盘8：品字形(1上2下)；Alt+小键盘2：倒品字形(2上1下)
         // （NumLock 关闭时小键盘 8/2 上报为 VK_UP/VK_DOWN，这里按非扩展键处理）
         if (wp == VK_NUMPAD8) { SetTriLayout(0); return 0; }
@@ -3495,20 +3611,21 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
     case WM_LBUTTONDOWN: {
         int x = static_cast<int>(GET_X_LPARAM(lp));
         int yy = static_cast<int>(GET_Y_LPARAM(lp));
+        // 左右两栏竖向分隔（仅不对称布局有）
+        if (colSplitX_ >= 0 && yy >= rowSplitTop_ && yy <= rowSplitBottom_ &&
+            x >= colSplitX_ - kSplitHit && x <= colSplitX_ + kSplitHit) {
+            colSplitDragging_ = true;
+            SetCapture(hwnd_);
+            SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
+            return 0;
+        }
         if (rowSplitY_ >= 0 && !paneRects_.empty() &&
-            yy >= rowSplitY_ - kSplitHit && yy <= rowSplitY_ + kSplitHit) {
-            int left = paneRects_.front().left;
-            int right = paneRects_.front().right;
-            for (const RECT& r : paneRects_) {
-                if (r.left < left) left = r.left;
-                if (r.right > right) right = r.right;
-            }
-            if (x >= left && x <= right) {
-                rowSplitDragging_ = true;
-                SetCapture(hwnd_);
-                SetCursor(LoadCursor(nullptr, IDC_SIZENS));
-                return 0;
-            }
+            yy >= rowSplitY_ - kSplitHit && yy <= rowSplitY_ + kSplitHit &&
+            x >= rowSplitX0_ && x <= rowSplitX1_) {
+            rowSplitDragging_ = true;
+            SetCapture(hwnd_);
+            SetCursor(LoadCursor(nullptr, IDC_SIZENS));
+            return 0;
         }
         // 窗格间分隔条命中：splitPairs_ 各对的右缘 .. +12（限该排高度内）
         if (yy >= splitTop_ && yy <= splitBot_) {
@@ -3534,6 +3651,23 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         break;
     }
     case WM_MOUSEMOVE:
+        if (colSplitDragging_) {
+            int minL = paneRects_[0].left, maxR = paneRects_[0].right;
+            for (const RECT& r : paneRects_) {
+                if (r.left < minL) minL = r.left;
+                if (r.right > maxR) maxR = r.right;
+            }
+            int avail = (maxR - minL) - kSplitGap;
+            int x = static_cast<int>(GET_X_LPARAM(lp));
+            int want = x - minL;
+            int minW = 160;
+            if (want < minW) want = minW;
+            if (want > avail - minW) want = avail - minW;
+            if (want < minW) want = minW;
+            int ratio = (int)((long long)want * 1000 / avail);
+            if (ratio != colSplitPermille_) { colSplitPermille_ = ratio; Layout(); }
+            return 0;
+        }
         if (rowSplitDragging_) {
             int availableH = rowSplitBottom_ - rowSplitTop_ - kSplitGap;
             if (availableH >= 240) {
@@ -3581,6 +3715,11 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
     case WM_LBUTTONUP:
+        if (colSplitDragging_) {
+            colSplitDragging_ = false;
+            ReleaseCapture();
+            return 0;
+        }
         if (rowSplitDragging_) {
             rowSplitDragging_ = false;
             ReleaseCapture();
@@ -3600,18 +3739,16 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         break;
     case WM_SETCURSOR: {
         POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd_, &pt);
+        if (colSplitX_ >= 0 && pt.y >= rowSplitTop_ && pt.y <= rowSplitBottom_ &&
+            pt.x >= colSplitX_ - kSplitHit && pt.x <= colSplitX_ + kSplitHit) {
+            SetCursor(LoadCursor(nullptr, IDC_SIZEWE));   // 列分隔（左右两栏）
+            return TRUE;
+        }
         if (rowSplitY_ >= 0 && !paneRects_.empty() &&
-            pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitHit) {
-            int left = paneRects_.front().left;
-            int right = paneRects_.front().right;
-            for (const RECT& r : paneRects_) {
-                if (r.left < left) left = r.left;
-                if (r.right > right) right = r.right;
-            }
-            if (pt.x >= left && pt.x <= right) {
-                SetCursor(LoadCursor(nullptr, IDC_SIZENS));
-                return TRUE;
-            }
+            pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitHit &&
+            pt.x >= rowSplitX0_ && pt.x <= rowSplitX1_) {
+            SetCursor(LoadCursor(nullptr, IDC_SIZENS));   // 行分隔（上下两排）
+            return TRUE;
         }
         // 窗格间分隔条光标
         if (pt.y >= splitTop_ && pt.y <= splitBot_) {

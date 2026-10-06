@@ -174,6 +174,11 @@ private:
     int rowSplitBottom_ = 0;            // 两排布局可用区域底部
     int layoutCount_ = 1;               // 窗格数 1~4（Alt+1~4 切换，= panes_.size()）
     int triLayout_ = 1;                 // 3 窗格形态：0=品字形(1上2下) 1=倒品字形(2上1下)，默认倒品
+    int asymMode_ = 0;                  // 不对称 3 窗格：0=关 1=1左2右(上下排) 2=2左(上下排)1右
+    int colSplitPermille_ = 500;        // 不对称布局里左右两栏宽度比例（千分比，可拖）
+    int colSplitX_ = -1;                // 左右栏竖向分隔条 x 坐标（<0 表示当前布局无）
+    int rowSplitX0_ = 0, rowSplitX1_ = 0; // 上下分隔条可命中的 x 范围（不对称时只限某一栏）
+    bool colSplitDragging_ = false;     // 正在拖左右栏分隔条
     int  savedPaneCount_ = 1;           // favorites.txt 的 panes= 恢复值
     bool startupLayoutApplied_ = false; // 启动恢复只做一次
     size_t pendingCloseTab_ = SIZE_MAX; // 中键点击待关闭的分页（延后到下一次消息循环）
@@ -202,8 +207,9 @@ private:
     // 窗格/分页管理
     void AddRightTab(bool navigateToDefault = true, size_t paneIdx = SIZE_MAX);
     void AddPane();                     // 新增窗格（含一个分页）
-    void SetPaneCount(int n);           // Alt+1~4：窗格数量 1~4
+    void SetPaneCount(int n, bool keepAsym = false);  // Alt+1~4：窗格数量 1~4（keepAsym 用于启动恢复）
     void SetTriLayout(int t);           // 3 窗格形态：0=品字形 1=倒品字形
+    void SetAsymmetricTri(int mode);    // 不对称 3 窗格：1=1左2右(上下排) 2=2左(上下排)1右
     int  AllocPaneTag();                // 分配未被占用的窗格编号（避免控件 ID 重复）
     void RemovePane(size_t idx);        // 销毁窗格并修正 TabState.pane 下标
     int  PaneOfList(HWND h) const;      // 列表 hwnd -> 窗格下标，-1 表示不是窗格列表

@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <exception>
 #include <vector>
+#include <string>
+#include <algorithm>
 #include "../UI/MainWindow.h"
 #include "../Util/AppLog.h"
 

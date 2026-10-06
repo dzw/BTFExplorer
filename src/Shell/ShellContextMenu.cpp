@@ -16,6 +16,7 @@ static constexpr UINT CMD_FIRST = 1;
 static constexpr UINT CMD_LAST  = 0x7FFF;
 static constexpr UINT CMD_CUSTOM = CMD_LAST + 1;
 static constexpr UINT CMD_RENAME = CMD_LAST + 2;
+static constexpr UINT CMD_EXPLORER = CMD_LAST + 3; // 在 Explorer 中打开
 
 static const std::vector<std::wstring>& DefaultHiddenNames()
 {
@@ -421,7 +422,7 @@ static LRESULT CALLBACK ContextMenuSubclassProc(HWND hwnd, UINT msg, WPARAM wp,
 bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& menuDir,
                      POINT ptScreen, const std::wstring& customItem,
                      bool& customItemSelected, std::wstring* createdFolderPath,
-                     bool* renameSelected)
+                     bool* renameSelected, const std::wstring& openInExplorerItem)
 {
     customItemSelected = false;
     if (createdFolderPath) createdFolderPath->clear();
@@ -485,6 +486,11 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
                 AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(menu, MF_STRING, CMD_CUSTOM, customItem.c_str());
         }
+        if (!openInExplorerItem.empty()) {
+            if (GetMenuItemCount(menu) > 0)
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING, CMD_EXPLORER, openInExplorerItem.c_str());
+        }
         ComPtr<IContextMenu3> cm3;
         ComPtr<IContextMenu2> cm2;
         bool hasMenu3 = SUCCEEDED(cm->QueryInterface(
@@ -511,6 +517,27 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
             RemoveWindowSubclass(hwnd, ContextMenuSubclassProc, subclassId);
         if (cmd == CMD_CUSTOM) {
             customItemSelected = true;
+        } else if (cmd == CMD_EXPLORER) {
+            // 在真实资源管理器中打开：文件 -> /select 定位并选中；文件夹/背景 -> 直接打开目录
+            std::wstring target = path.empty()
+                ? (menuDir.empty() ? L"C:\\" : menuDir)
+                : path;
+            std::wstring params;
+            DWORD attr = GetFileAttributesW(target.c_str());
+            bool isDir = (attr != INVALID_FILE_ATTRIBUTES) && (attr & FILE_ATTRIBUTE_DIRECTORY);
+            if (isDir)
+                params = L"\"" + target + L"\"";
+            else
+                params = L"/select,\"" + target + L"\"";
+            HINSTANCE r = ShellExecuteW(hwnd, L"open", L"explorer.exe",
+                                        params.c_str(), nullptr, SW_SHOWNORMAL);
+            if (reinterpret_cast<INT_PTR>(r) <= 32) {
+                MessageBoxW(hwnd, L"无法打开资源管理器。", L"在 Explorer 中打开",
+                            MB_OK | MB_ICONERROR);
+            } else {
+                WriteAppLog((L"CONTEXT_MENU open in explorer: " + params).c_str());
+            }
+            invoked = true;
         } else if (cmd == CMD_RENAME) {
             if (renameSelected) *renameSelected = true;
             WriteAppLog((L"CONTEXT_MENU rename command selected: " + path).c_str());
