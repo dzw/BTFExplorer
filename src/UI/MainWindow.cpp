@@ -27,6 +27,7 @@ static constexpr int WM_APP_TAB_CONTEXT = WM_APP + 11;
 static constexpr int WM_APP_DIR_CHANGED  = WM_APP + 12;
 static constexpr int WM_APP_OPEN_PATH   = WM_APP + 13; // 延后打开列表双击的目录（锁定分页则新开分页）
 static constexpr int WM_APP_NAV         = WM_APP + 14; // 延后工具栏导航（后退/前进/上级/刷新） // 外部目录变化（DirWatcher 投递） // 延后弹出分页头右键菜单 // 延后翻页（同上） // 目录树中键 -> 延后到主窗口新开分页
+static constexpr int WM_APP_TREE_NAV    = WM_APP + 15; // 目录树选中变化 -> 延后导航（shell 树控件消息链外执行）
 
 // 当前焦点窗格顶部分页栏的整行底色（淡粉绿）：涂在分页头之间的空隙上，
 // 分页头本身保持系统外观（见 PaneTabHandler 的 WM_PAINT）
@@ -410,9 +411,11 @@ void MainWindow::CreateSidePanel()
     addTab(L"目录树", 0);
     addTab(L"收藏", 1);
 
-    // 树和收藏列表都是 tab_ 的子窗口，显示由 SwitchSideTab 控制
-    directoryTree_.Create(tab_, IDC_TREE, uiFont_);
-    directoryTree_.PopulateDrives();
+    // 树和收藏列表都是 tab_ 的子窗口，显示由 SwitchSideTab 控制。
+    // 目录树用 shell 自带的命名空间树控件（Q-Dir 同款）：节点/图标/Infotip/
+    // 外部变化后的自动刷新全由 shell 维护，字体随系统主题（不再自设）。
+    if (!directoryTree_.Create(tab_))
+        WriteAppLog(L"DirectoryTree create failed: tree disabled");
     // 目录树中键点击：在当前活动窗格新开分页打开该目录。
     // 不能在树的窗口过程里直接 AddRightTab（Layout 会重入树/页签控件导致
     // COMCTL32 崩溃，同双击新建分页的修复），堆上带路径延后到主窗口处理。
@@ -420,8 +423,12 @@ void MainWindow::CreateSidePanel()
         PostMessageW(hwnd_, WM_APP_TREE_NEWTAB,
                      reinterpret_cast<WPARAM>(new std::wstring(path)), 0);
     });
-    // 树节点展开/收起后：把新展开的目录纳入外部变化监视
-    directoryTree_.expandedChanged = [this]() { UpdateWatcher(); };
+    // 树选中变化：事件在 shell 控件自己的消息链里发来，同步 Navigate 会反过来
+    // 重入该控件（SetItemState），延后到主窗口消息循环执行
+    directoryTree_.SetSelectionCallback([this](const std::wstring& path) {
+        PostMessageW(hwnd_, WM_APP_TREE_NAV, 0,
+                     reinterpret_cast<LPARAM>(new std::wstring(path)));
+    });
     btnTreeSync_ = CreateWindowExW(0, WC_BUTTONW, L"定",//定位
         WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
         0, 0, 0, 0, tab_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TREE_SYNC)), hInst, nullptr);
@@ -1528,7 +1535,8 @@ void MainWindow::UpdateWatcher()
     }
     for (const auto& t : tabs_)
         if (!t.dir.empty()) dirs.push_back(t.dir);
-    directoryTree_.CollectExpandedPaths(dirs);
+
+    // 目录树不再参与监视：命名空间树控件自己挂 shell 变化通知并自动刷新节点
 
     std::vector<std::wstring> uniq;
     for (const auto& d : dirs) {
@@ -1552,7 +1560,7 @@ void MainWindow::OnExternalDirChanged(const std::wstring& dir)
         if (_wcsicmp(t.dir.c_str(), dir.c_str()) == 0)
             RefreshPaneList(i);             // 可见窗格立即重载（后台线程枚举）
     }
-    directoryTree_.RefreshNode(dir);        // 树节点重新枚举子目录
+    // 树节点由命名空间树控件自己刷新（shell 变化通知），无需干预
 }
 
 void MainWindow::UpdateStatusBar()
@@ -3349,12 +3357,6 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                 }
             }
         }
-        else {
-            std::wstring selectedTreePath;
-            if (directoryTree_.HandleNotification(nm, selectedTreePath)) {
-                if (!selectedTreePath.empty()) NavigateFromSidebar(selectedTreePath);
-            }
-        }
         return 0;
     }
 
@@ -3462,6 +3464,15 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         auto* path = reinterpret_cast<std::wstring*>(wp);
         if (path) {
             OpenDirInNewTab(*path);
+            delete path;
+        }
+        return 0;
+    }
+
+    case WM_APP_TREE_NAV: {     // 目录树选中变化（延后到这里导航，见 CreateSidePanel）
+        auto* path = reinterpret_cast<std::wstring*>(lp);
+        if (path) {
+            if (!path->empty()) NavigateFromSidebar(*path);
             delete path;
         }
         return 0;

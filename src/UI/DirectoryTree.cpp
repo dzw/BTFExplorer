@@ -1,205 +1,186 @@
 #include "DirectoryTree.h"
 #include "../Shell/ShellUtil.h"
-#include <shellapi.h>
-#include <cwchar>
-#include <iterator>
+#include "../Util/AppLog.h"
+#include <shlwapi.h>
+#include <vector>
 
-HWND DirectoryTree::Create(HWND parent, int controlId, HFONT font)
-{
-    HINSTANCE instance = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(parent, GWLP_HINSTANCE));
-    hwnd_ = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
-        WS_CHILD | WS_TABSTOP | TVS_HASLINES | TVS_LINESATROOT | TVS_HASBUTTONS | TVS_SHOWSELALWAYS,
-        0, 0, 0, 0, parent,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(controlId)), instance, nullptr);
-    if (!hwnd_) return nullptr;
-    if (font) SendMessageW(hwnd_, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+// ---------------------------------------------------------------------------
+// 事件接收器。INameSpaceTreeControlEvents 是 local 控件接口（shell32 进程内直调），
+// 通过 INameSpaceTreeControl::TreeAdvise 挂钩，控件持有本对象的一个引用。
+// 回调收到的都是 IShellItem，比旧自建树的通知干净得多。
+// ---------------------------------------------------------------------------
+class DirectoryTree::EventSink : public INameSpaceTreeControlEvents {
+public:
+    explicit EventSink(DirectoryTree* owner) : owner_(owner) {}
 
-    SHFILEINFOW fileInfo{};
-    HIMAGELIST images = reinterpret_cast<HIMAGELIST>(
-        SHGetFileInfoW(L"C:\\", 0, &fileInfo, sizeof(fileInfo),
-                       SHGFI_SYSICONINDEX | SHGFI_SMALLICON));
-    if (images) TreeView_SetImageList(hwnd_, images, TVSIL_NORMAL);
+    // 树析构时先调用：之后即便控件还持引用，回调也不再进入已析构的树
+    void Detach() { owner_ = nullptr; }
 
-    // 子类化：TreeView 没有中键点击通知，中键在子类过程里捕获
-    SetWindowLongPtrW(hwnd_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
-    defaultProc_ = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(hwnd_, GWLP_WNDPROC,
-        reinterpret_cast<LONG_PTR>(&DirectoryTree::TreeProcStatic)));
-    return hwnd_;
-}
-
-LRESULT CALLBACK DirectoryTree::TreeProcStatic(HWND h, UINT msg, WPARAM wp, LPARAM lp)
-{
-    auto* self = reinterpret_cast<DirectoryTree*>(GetWindowLongPtrW(h, GWLP_USERDATA));
-    if (self && self->hwnd_ == h) return self->TreeProc(h, msg, wp, lp);
-    return DefWindowProcW(h, msg, wp, lp);
-}
-
-LRESULT DirectoryTree::TreeProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
-{
-    if (msg == WM_MBUTTONDOWN && onMiddleClick_) {
-        // 中键点在节点上（图标/文字，不含展开按钮）-> 回调路径
-        TVHITTESTINFO hit{};
-        hit.pt = { (int)(short)LOWORD(lp), (int)(short)HIWORD(lp) };
-        if (TreeView_HitTest(h, &hit) && (hit.flags & TVHT_ONITEM) && hit.hItem) {
-            TVITEMW item{};
-            item.hItem = hit.hItem;
-            item.mask = TVIF_PARAM;
-            if (TreeView_GetItem(h, &item) && item.lParam) {
-                onMiddleClick_(*reinterpret_cast<const std::wstring*>(item.lParam));
-                return 0;
-            }
+    // IUnknown（引用计数由控件 TreeAdvise/TreeUnadvise 平衡）
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == __uuidof(INameSpaceTreeControlEvents)) {
+            *ppv = static_cast<INameSpaceTreeControlEvents*>(this);
+            AddRef();
+            return S_OK;
         }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
     }
-    return CallWindowProcW(defaultProc_, h, msg, wp, lp);
-}
-
-void DirectoryTree::SetMiddleClickCallback(std::function<void(const std::wstring&)> callback)
-{
-    onMiddleClick_ = std::move(callback);
-}
-
-void DirectoryTree::PopulateDrives()
-{
-    if (!hwnd_) return;
-    wchar_t drives[512]{};
-    DWORD length = GetLogicalDriveStringsW(static_cast<DWORD>(std::size(drives)), drives);
-    if (!length || length >= std::size(drives)) return;
-
-    for (const wchar_t* drive = drives; *drive; drive += wcslen(drive) + 1) {
-        std::wstring root(drive);
-        if (root.size() >= 2 && root[1] == L'\\') root.resize(2);
-        root += L'\\';
-        int icon = shell::SysIconIndexForEntry(root, true);
-
-        auto* path = new std::wstring(root);
-        TVINSERTSTRUCTW insert{};
-        insert.hParent = TVI_ROOT;
-        insert.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_IMAGE |
-                           TVIF_SELECTEDIMAGE | TVIF_CHILDREN;
-        insert.item.pszText = root.data();
-        insert.item.lParam = reinterpret_cast<LPARAM>(path);
-        insert.item.iImage = insert.item.iSelectedImage = icon >= 0 ? icon : 0;
-        insert.item.cChildren = 1;
-        if (!TreeView_InsertItem(hwnd_, &insert)) delete path;
-    }
-}
-
-static bool InsertChildFolders(HWND tree, HTREEITEM parent, const std::wstring& directory)
-{
-    std::wstring pattern = directory;
-    if (pattern.empty() || pattern.back() != L'\\') pattern += L'\\';
-    pattern += L'*';
-
-    WIN32_FIND_DATAW data{};
-    HANDLE search = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &data,
-        FindExSearchLimitToDirectories, nullptr, FIND_FIRST_EX_LARGE_FETCH);
-    if (search == INVALID_HANDLE_VALUE) return false;
-
-    bool inserted = false;
-    do {
-        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-        if (data.cFileName[0] == L'.' &&
-            (data.cFileName[1] == 0 ||
-             (data.cFileName[1] == L'.' && data.cFileName[2] == 0)))
-            continue;
-        if (data.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))
-            continue;
-
-        std::wstring name = data.cFileName;
-        std::wstring path = directory;
-        if (path.empty() || path.back() != L'\\') path += L'\\';
-        path += name;
-        int icon = shell::SysIconIndexForEntry(path, true);
-
-        auto* itemPath = new std::wstring(path);
-        TVINSERTSTRUCTW insert{};
-        insert.hParent = parent;
-        insert.hInsertAfter = TVI_SORT;
-        insert.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_IMAGE |
-                           TVIF_SELECTEDIMAGE | TVIF_CHILDREN;
-        insert.item.pszText = name.data();
-        insert.item.lParam = reinterpret_cast<LPARAM>(itemPath);
-        insert.item.iImage = insert.item.iSelectedImage = icon >= 0 ? icon : 0;
-        insert.item.cChildren = 1;
-        if (TreeView_InsertItem(tree, &insert))
-            inserted = true;
-        else
-            delete itemPath;
-    } while (FindNextFileW(search, &data));
-    FindClose(search);
-    return inserted;
-}
-
-void DirectoryTree::ExpandNode(HTREEITEM item)
-{
-    HTREEITEM firstChild = TreeView_GetChild(hwnd_, item);
-    if (firstChild) {
-        TVITEMW child{};
-        child.hItem = firstChild;
-        child.mask = TVIF_PARAM;
-        if (TreeView_GetItem(hwnd_, &child) && child.lParam) return;
+    IFACEMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&refs_); }
+    IFACEMETHODIMP_(ULONG) Release() override {
+        ULONG remaining = InterlockedDecrement(&refs_);
+        if (!remaining) delete this;
+        return remaining;
     }
 
-    TVITEMW current{};
-    current.hItem = item;
-    current.mask = TVIF_PARAM;
-    if (!TreeView_GetItem(hwnd_, &current) || !current.lParam) return;
-    const auto directory = *reinterpret_cast<const std::wstring*>(current.lParam);
-
-    for (HTREEITEM child = TreeView_GetChild(hwnd_, item); child; ) {
-        HTREEITEM next = TreeView_GetNextSibling(hwnd_, child);
-        TreeView_DeleteItem(hwnd_, child);
-        child = next;
+    // INameSpaceTreeControlEvents（方法与 SDK 头文件声明一一对应；未使用的事件
+    // 返回 E_NOTIMPL，控件按“未处理”继续默认行为）
+    IFACEMETHODIMP OnItemClick(IShellItem* psi, NSTCEHITTEST /*hitTest*/,
+                               NSTCECLICKTYPE clickType) override {
+        if (owner_) owner_->OnItemClick(psi, 0, clickType);
+        return S_OK;
     }
-
-    if (!InsertChildFolders(hwnd_, item, directory)) {
-        TVITEMW update{};
-        update.hItem = item;
-        update.mask = TVIF_CHILDREN;
-        update.cChildren = 0;
-        TreeView_SetItem(hwnd_, &update);
-    }
-}
-
-bool DirectoryTree::HandleNotification(const NMHDR* notification,
-                                       std::wstring& selectedPath)
-{
-    selectedPath.clear();
-    if (!notification || notification->hwndFrom != hwnd_) return false;
-
-    if (notification->code == TVN_DELETEITEMW) {
-        const auto* treeNotification =
-            reinterpret_cast<const NMTREEVIEWW*>(notification);
-        delete reinterpret_cast<std::wstring*>(treeNotification->itemOld.lParam);
-        return true;
-    }
-    if (notification->code == TVN_ITEMEXPANDINGW) {
-        const auto* treeNotification =
-            reinterpret_cast<const NMTREEVIEWW*>(notification);
-        if (treeNotification->action & TVE_EXPAND)
-            ExpandNode(treeNotification->itemNew.hItem);
-        return true;
-    }
-    if (notification->code == TVN_ITEMEXPANDEDW) {
-        if (expandedChanged) expandedChanged();   // 监视集随展开状态更新
-        return true;
-    }
-    if (notification->code == TVN_SELCHANGEDW) {
-        const auto* treeNotification =
-            reinterpret_cast<const NMTREEVIEWW*>(notification);
-        if (!syncingSelection_ && treeNotification->itemNew.lParam) {
-            selectedPath = *reinterpret_cast<const std::wstring*>(
-                treeNotification->itemNew.lParam);
+    IFACEMETHODIMP OnPropertyItemCommit(IShellItem*) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnItemStateChanging(IShellItem*, NSTCITEMSTATE, NSTCITEMSTATE) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnItemStateChanged(IShellItem*, NSTCITEMSTATE, NSTCITEMSTATE) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnSelectionChanged(IShellItemArray* selection) override {
+        if (!owner_) return S_OK;
+        IShellItem* psi = nullptr;
+        if (selection && SUCCEEDED(selection->GetItemAt(0, &psi)) && psi) {
+            owner_->OnSelectionChanged(psi);
+            psi->Release();
         }
-        return true;
+        return S_OK;
     }
-    return false;
+    IFACEMETHODIMP OnKeyboardInput(UINT, WPARAM, LPARAM) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnBeforeExpand(IShellItem*) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnAfterExpand(IShellItem*) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnBeginLabelEdit(IShellItem*) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnEndLabelEdit(IShellItem*) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnGetToolTip(IShellItem*, LPWSTR, int) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnBeforeItemDelete(IShellItem*) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnItemAdded(IShellItem*, BOOL) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnItemDeleted(IShellItem*, BOOL) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnBeforeContextMenu(IShellItem*, REFIID, void**) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnAfterContextMenu(IShellItem*, IContextMenu*, REFIID, void**) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnBeforeStateImageChange(IShellItem*) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnGetDefaultIconIndex(IShellItem*, int*, int*) override { return E_NOTIMPL; }
+
+private:
+    ULONG refs_ = 1;
+    DirectoryTree* owner_ = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// DirectoryTree
+// ---------------------------------------------------------------------------
+
+bool DirectoryTree::Create(HWND parent)
+{
+    // CLSID 用 __uuidof(coclass) 取（头文件带 DECLSPEC_UUID），不用额外链 uuid.lib
+    HRESULT hr = CoCreateInstance(__uuidof(NamespaceTreeControl), nullptr,
+                                  CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&ctl_));
+    if (FAILED(hr) || !ctl_) {
+        WriteAppLog((L"NSTC CoCreateInstance failed hr=0x" +
+                     std::to_wstring(static_cast<unsigned long>(hr))).c_str());
+        return false;
+    }
+
+    // 资源管理器导航窗格观感：展开钮/连接线/整行选中/常显选中/横向滚动/边框；
+    // 关掉标签编辑和拖放（本树只做导航，不做文件操作）
+    DWORD style = NSTCS_HASEXPANDOS | NSTCS_HASLINES | NSTCS_FULLROWSELECT |
+                  NSTCS_SHOWSELECTIONALWAYS | NSTCS_HORIZONTALSCROLL | NSTCS_AUTOHSCROLL |
+                  NSTCS_TABSTOP | NSTCS_NOEDITLABELS | NSTCS_DISABLEDRAGDROP | NSTCS_BORDER;
+    RECT rc = { 0, 0, 0, 0 };
+    hr = ctl_->Initialize(parent, &rc, style);
+    if (FAILED(hr)) {
+        WriteAppLog((L"NSTC Initialize failed hr=0x" +
+                     std::to_wstring(static_cast<unsigned long>(hr))).c_str());
+        ctl_.Release();
+        return false;
+    }
+
+    // 挂事件接收器：初始引用 1，TreeAdvise 成功后交还给控件（失败则对象自毁）
+    sink_ = new EventSink(this);
+    hr = ctl_->TreeAdvise(sink_, &adviseCookie_);
+    sink_->Release();
+    if (FAILED(hr)) {
+        WriteAppLog((L"NSTC TreeAdvise failed hr=0x" +
+                     std::to_wstring(static_cast<unsigned long>(hr))).c_str());
+        sink_ = nullptr;
+        adviseCookie_ = 0;
+        ctl_.Release();
+        return false;
+    }
+
+    // 根 = 命名空间桌面：与资源管理器导航窗格同源（此电脑/驱动器/网络都在其下）
+    ComPtr<IShellItem> desktop;
+    if (FAILED(SHCreateItemInKnownFolder(FOLDERID_Desktop, 0, nullptr,
+                                         IID_PPV_ARGS(&desktop))) || !desktop) {
+        ctl_.Release();
+        return false;
+    }
+    ctl_->AppendRoot(desktop.Get(), SHCONTF_FOLDERS,
+                     NSTCRS_VISIBLE | NSTCRS_EXPANDED, nullptr);
+    ctl_->SetTheme(L"Explorer");
+
+    // 控件窗口以窗口类 "NamespaceTreeControl" 挂为 parent 子窗口；尺寸交给 Layout
+    hwnd_ = FindWindowExW(parent, nullptr, L"NamespaceTreeControl", nullptr);
+    if (!hwnd_) {
+        WriteAppLog(L"NSTC window not found after Initialize");
+        ctl_.Release();
+        return false;
+    }
+    return true;
+}
+
+DirectoryTree::~DirectoryTree()
+{
+    if (sink_) sink_->Detach();   // 先断回调再解绑，防解绑过程中的重入
+    if (ctl_ && adviseCookie_) ctl_->TreeUnadvise(adviseCookie_);
+    sink_ = nullptr;
+}
+
+std::wstring DirectoryTree::PathOfItem(IShellItem* psi)
+{
+    if (!psi) return {};
+    PWSTR psz = nullptr;
+    if (FAILED(psi->GetDisplayName(SIGDN_FILESYSPATH, &psz)) || !psz) return {};
+    std::wstring path = psz;
+    CoTaskMemFree(psz);
+    return path;
+}
+
+// UniquePIDL 持有的是 void*，调 shell API 前转回 PIDL
+static PCIDLIST_ABSOLUTE PidlOf(const UniquePIDL& p)
+{
+    return static_cast<PCIDLIST_ABSOLUTE>(p.get());
+}
+
+void DirectoryTree::OnSelectionChanged(IShellItem* psi)
+{
+    if (!psi || syncing_) return;      // SyncToPath 自己的选中不当作用户导航
+    std::wstring path = PathOfItem(psi);
+    if (path.empty()) return;          // 虚拟位置（此电脑/回收站等）不导航
+    if (onSelection_) onSelection_(path);
+}
+
+void DirectoryTree::OnItemClick(IShellItem* psi, NSTCEHITTEST, NSTCECLICKTYPE clickType)
+{
+    if (!psi || !onMiddleClick_) return;
+    if (!ISMBUTTON(clickType) || ISDBLCLICK(clickType)) return;   // 只处理中键单击
+    std::wstring path = PathOfItem(psi);
+    if (path.empty()) return;
+    onMiddleClick_(path);
 }
 
 void DirectoryTree::SyncToPath(const std::wstring& rawPath, bool showErrors)
 {
+    if (!hwnd_ || !ctl_ || rawPath.empty()) return;
+    (void)showErrors;   // 保留参数兼容旧调用点；失败时静默保持树的现状
+
     std::wstring target(rawPath.c_str());
-    if (target.empty() || !hwnd_) return;
     for (wchar_t& ch : target)
         if (ch == L'/') ch = L'\\';
     if (target.rfind(L"\\\\?\\UNC\\", 0) == 0)
@@ -207,167 +188,51 @@ void DirectoryTree::SyncToPath(const std::wstring& rawPath, bool showErrors)
     else if (target.rfind(L"\\\\?\\", 0) == 0 || target.rfind(L"\\??\\", 0) == 0)
         target.erase(0, 4);
 
-    HTREEITEM node = nullptr;
-    for (HTREEITEM root = TreeView_GetRoot(hwnd_); root;
-         root = TreeView_GetNextSibling(hwnd_, root)) {
-        TVITEMW item{};
-        item.hItem = root;
-        item.mask = TVIF_PARAM;
-        if (!TreeView_GetItem(hwnd_, &item) || !item.lParam) continue;
-        const auto* rootPath = reinterpret_cast<const std::wstring*>(item.lParam);
-        if (rootPath->size() >= 2 && (*rootPath)[1] == L':' &&
-            target.size() >= 2 && target[1] == L':' &&
-            _wcsnicmp(target.c_str(), rootPath->c_str(), 2) == 0) {
-            node = root;
-            break;
+    UniquePIDL pidl = shell::PIDLFromPath(target.c_str());
+    if (!pidl) return;
+
+    // 逐级展开祖先（最外层先展开）。默认非异步模式下展开是同步的，
+    // 展开后子项才在树里存在，最后才能选中目标并滚到可见。
+    syncing_ = true;
+
+    auto expandPrefix = [&](const std::wstring& prefix) {
+        UniquePIDL anc = shell::PIDLFromPath(prefix.c_str());
+        if (!anc) return;
+        ComPtr<IShellItem> ancItem;
+        if (SUCCEEDED(SHCreateItemFromIDList(PidlOf(anc), IID_PPV_ARGS(&ancItem))) && ancItem)
+            ctl_->SetItemState(ancItem.Get(), NSTCIS_EXPANDED, NSTCIS_EXPANDED);
+    };
+
+    // 根前缀："F:\" 或 UNC "\\server\share"；其下逐段补齐展开，目标本身不展开
+    // （与旧自建树行为一致）。段落切分沿用旧树的逻辑。
+    size_t pos = std::wstring::npos;
+    if (target.size() >= 2 && target[1] == L':') {
+        expandPrefix(target.substr(0, 2) + L'\\');
+        pos = 3;
+    } else if (target.size() >= 3 && target[0] == L'\\' && target[1] == L'\\') {
+        size_t share = target.find(L'\\', 2);
+        size_t rootEnd = (share == std::wstring::npos)
+                             ? std::wstring::npos : target.find(L'\\', share + 1);
+        if (rootEnd == std::wstring::npos) rootEnd = target.size();
+        expandPrefix(target.substr(0, rootEnd));
+        pos = rootEnd;
+    }
+    if (pos != std::wstring::npos) {
+        while (pos < target.size()) {
+            while (pos < target.size() && target[pos] == L'\\') ++pos;
+            if (pos >= target.size()) break;
+            size_t end = target.find(L'\\', pos);
+            if (end == std::wstring::npos) end = target.size();
+            if (end < target.size())
+                expandPrefix(target.substr(0, end));
+            pos = end;
         }
     }
 
-    if (!node) {
-        if (showErrors)
-            MessageBoxW(GetParent(hwnd_), L"当前路径不在目录树的本地磁盘范围内。",
-                        L"同步目录树", MB_OK | MB_ICONINFORMATION);
-        return;
+    ComPtr<IShellItem> item;
+    if (SUCCEEDED(SHCreateItemFromIDList(PidlOf(pidl), IID_PPV_ARGS(&item))) && item) {
+        ctl_->SetItemState(item.Get(), NSTCIS_SELECTED, NSTCIS_SELECTED);
+        ctl_->EnsureItemVisible(item.Get());
     }
-
-    size_t pos = target.size() >= 3 && target[2] == L'\\' ? 3 : 2;
-    while (pos < target.size()) {
-        while (pos < target.size() && target[pos] == L'\\') ++pos;
-        if (pos >= target.size()) break;
-        size_t end = target.find(L'\\', pos);
-        if (end == std::wstring::npos) end = target.size();
-        std::wstring component = target.substr(pos, end - pos);
-        std::wstring expectedPath = target.substr(0, end);
-
-        ExpandNode(node);
-        TreeView_Expand(hwnd_, node, TVE_EXPAND);
-        HTREEITEM child = nullptr;
-        for (HTREEITEM candidate = TreeView_GetChild(hwnd_, node); candidate;
-             candidate = TreeView_GetNextSibling(hwnd_, candidate)) {
-            wchar_t name[512]{};
-            TVITEMW item{};
-            item.hItem = candidate;
-            item.mask = TVIF_TEXT | TVIF_PARAM;
-            item.pszText = name;
-            item.cchTextMax = static_cast<int>(std::size(name));
-            if (!TreeView_GetItem(hwnd_, &item)) continue;
-            if (_wcsicmp(name, component.c_str()) == 0) {
-                child = candidate;
-                break;
-            }
-        }
-
-        if (!child && GetFileAttributesW(expectedPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            int icon = shell::SysIconIndexForEntry(expectedPath, true);
-            auto* path = new std::wstring(expectedPath);
-            TVINSERTSTRUCTW insert{};
-            insert.hParent = node;
-            insert.hInsertAfter = TVI_SORT;
-            insert.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_IMAGE |
-                               TVIF_SELECTEDIMAGE | TVIF_CHILDREN;
-            insert.item.pszText = component.data();
-            insert.item.lParam = reinterpret_cast<LPARAM>(path);
-            insert.item.iImage = insert.item.iSelectedImage = icon >= 0 ? icon : 0;
-            insert.item.cChildren = 1;
-            child = TreeView_InsertItem(hwnd_, &insert);
-            if (!child) delete path;
-        }
-
-        if (!child) {
-            if (showErrors) {
-                std::wstring message = L"无法在目录树中找到目录：\r\n" + expectedPath;
-                MessageBoxW(GetParent(hwnd_), message.c_str(), L"同步目录树",
-                            MB_OK | MB_ICONWARNING);
-            }
-            return;
-        }
-        node = child;
-        pos = end;
-    }
-
-    syncingSelection_ = true;
-    TreeView_SelectItem(hwnd_, node);
-    syncingSelection_ = false;
-    TreeView_EnsureVisible(hwnd_, node);
-}
-
-// 深度优先查找路径对应的节点（路径不区分大小写）
-HTREEITEM DirectoryTree::FindNodeByPath(HTREEITEM from, const std::wstring& path)
-{
-    for (HTREEITEM it = TreeView_GetChild(hwnd_, from); it;
-         it = TreeView_GetNextSibling(hwnd_, it)) {
-        TVITEMW item{};
-        item.hItem = it;
-        item.mask = TVIF_PARAM;
-        if (TreeView_GetItem(hwnd_, &item) && item.lParam) {
-            const auto* p = reinterpret_cast<const std::wstring*>(item.lParam);
-            if (_wcsicmp(p->c_str(), path.c_str()) == 0) return it;
-        }
-        HTREEITEM sub = FindNodeByPath(it, path);
-        if (sub) return sub;
-    }
-    return nullptr;
-}
-
-void DirectoryTree::CollectExpandedRecursive(HTREEITEM parent,
-                                             std::vector<std::wstring>& out)
-{
-    for (HTREEITEM it = TreeView_GetChild(hwnd_, parent); it;
-         it = TreeView_GetNextSibling(hwnd_, it)) {
-        TVITEMW item{};
-        item.hItem = it;
-        item.mask = TVIF_PARAM | TVIF_STATE;
-        item.stateMask = TVIS_EXPANDED;
-        if (!TreeView_GetItem(hwnd_, &item) || !item.lParam) continue;
-        const auto* p = reinterpret_cast<const std::wstring*>(item.lParam);
-        if (item.state & TVIS_EXPANDED) {
-            out.push_back(*p);
-            CollectExpandedRecursive(it, out);
-        }
-    }
-}
-
-void DirectoryTree::CollectExpandedPaths(std::vector<std::wstring>& out)
-{
-    if (!hwnd_) return;
-    CollectExpandedRecursive(TreeView_GetRoot(hwnd_), out);
-}
-
-// 外部变化后刷新节点：已展开则重新枚举子目录（保持展开与选中），
-// 未展开则只丢弃已填充的子项，下次展开时 ExpandNode 会重新枚举
-void DirectoryTree::RefreshNode(const std::wstring& dir)
-{
-    if (!hwnd_) return;
-    HTREEITEM sel = TreeView_GetSelection(hwnd_);
-    std::wstring selPath;
-    if (sel) {
-        TVITEMW item{};
-        item.hItem = sel;
-        item.mask = TVIF_PARAM;
-        if (TreeView_GetItem(hwnd_, &item) && item.lParam)
-            selPath = *reinterpret_cast<const std::wstring*>(item.lParam);
-    }
-
-    syncingSelection_ = true;   // 刷新期间的选择变化不当作用户导航
-    HTREEITEM node = FindNodeByPath(TreeView_GetRoot(hwnd_), dir);
-    if (node) {
-        TVITEMW item{};
-        item.hItem = node;
-        item.mask = TVIF_STATE;
-        item.stateMask = TVIS_EXPANDED;
-        TreeView_GetItem(hwnd_, &item);
-        bool expanded = (item.state & TVIS_EXPANDED) != 0;
-        for (HTREEITEM child = TreeView_GetChild(hwnd_, node); child; ) {
-            HTREEITEM next = TreeView_GetNextSibling(hwnd_, child);
-            TreeView_DeleteItem(hwnd_, child);
-            child = next;
-        }
-        if (expanded) InsertChildFolders(hwnd_, node, dir);
-    }
-    // 恢复选中：原选中项若随子树被删且路径仍存在则重选，否则选回刷新节点
-    HTREEITEM restore = selPath.empty() ? nullptr : FindNodeByPath(TreeView_GetRoot(hwnd_), selPath);
-    if (!restore) restore = node ? node : sel;
-    if (restore && TreeView_GetSelection(hwnd_) != restore)
-        TreeView_SelectItem(hwnd_, restore);
-    syncingSelection_ = false;
+    syncing_ = false;
 }
