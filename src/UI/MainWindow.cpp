@@ -24,7 +24,9 @@ static constexpr int WM_APP_SELECT_PANE = WM_APP + 8;  // 延后激活窗格（�
 static constexpr int WM_APP_SELECT_TAB  = WM_APP + 9;  // 延后激活分页（同上）
 static constexpr int WM_APP_PAGE_REFRESH = WM_APP + 10;
 static constexpr int WM_APP_TAB_CONTEXT = WM_APP + 11;
-static constexpr int WM_APP_DIR_CHANGED  = WM_APP + 12; // 外部目录变化（DirWatcher 投递） // 延后弹出分页头右键菜单 // 延后翻页（同上） // 目录树中键 -> 延后到主窗口新开分页
+static constexpr int WM_APP_DIR_CHANGED  = WM_APP + 12;
+static constexpr int WM_APP_OPEN_PATH   = WM_APP + 13; // 延后打开列表双击的目录（锁定分页则新开分页）
+static constexpr int WM_APP_NAV         = WM_APP + 14; // 延后工具栏导航（后退/前进/上级/刷新） // 外部目录变化（DirWatcher 投递） // 延后弹出分页头右键菜单 // 延后翻页（同上） // 目录树中键 -> 延后到主窗口新开分页
 
 // 当前焦点窗格顶部分页栏的整行底色（淡粉绿）：涂在分页头之间的空隙上，
 // 分页头本身保持系统外观（见 PaneTabHandler 的 WM_PAINT）
@@ -1321,10 +1323,12 @@ void MainWindow::RemoveTab(size_t index, bool& paneEmptied)
     paneEmptied = p.tabs.empty();
 }
 
-void MainWindow::CloseRightTab(size_t index)
+void MainWindow::CloseRightTab(size_t index, bool force)
 {
+    WriteAppLog((L"CLOSE_TAB idx=" + std::to_wstring(index) + L" force=" + std::to_wstring(force ? 1 : 0) +
+                 L" locked=" + std::to_wstring(index < tabs_.size() ? (tabs_[index].locked ? 1 : 0) : -1)).c_str());
     if (tabs_.size() <= 1 || index >= tabs_.size()) return; // 至少保留一个
-    if (tabs_[index].locked) return;                        // 锁定的不关
+    if (tabs_[index].locked && !force) return;              // 锁定的不关（中键 force 除外）
     size_t paneIdx = tabs_[index].pane;
     if (paneIdx >= panes_.size()) return;
     bool emptied = false;
@@ -1657,11 +1661,12 @@ void MainWindow::OpenTarget(const std::wstring& rawPath)
     if (path.empty()) return;
     DWORD attr = GetFileAttributesW(path.c_str());
     if (attr == INVALID_FILE_ATTRIBUTES) return; // 不存在，忽略
+    // 活动分页锁定时不改其目录：改走侧栏同款逻辑，同窗格新开分页
     if (attr & FILE_ATTRIBUTE_DIRECTORY) {
-        Navigate(path);
+        NavigateFromSidebar(path);
     } else {
         size_t s = path.find_last_of(L'\\');
-        if (s != std::wstring::npos && s > 0) Navigate(path.substr(0, s));
+        if (s != std::wstring::npos && s > 0) NavigateFromSidebar(path.substr(0, s));
     }
 }
 
@@ -3043,7 +3048,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             const std::wstring& dir = CurTab().dir;
             if (dir.size() > 3) {
                 size_t p = dir.find_last_of(L'\\');
-                if (p != std::wstring::npos && p > 2) Navigate(dir.substr(0, p));
+                if (p != std::wstring::npos && p > 2) NavigateFromSidebar(dir.substr(0, p)); // 锁定分页不改目录
             }
             return 0;
         }
@@ -3108,9 +3113,14 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                     std::wstring p = CurrentPagePath(ni->iItem);
                     if (!p.empty()) {
                         DWORD attr = GetFileAttributesW(p.c_str());
-                        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
-                            Navigate(p);
-                        else {
+                        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                            // 进入目录延后到主窗口执行：此时还在列表控件自己的
+                            // 消息过程里，同步 Navigate 会重入列表（LVM_SETITEMCOUNT，
+                            // 崩在 COMCTL32，同双击空白新建分页的修复）；同时
+                            // 锁定分页不改目录，改在该窗格新开分页（见处理处）
+                            PostMessageW(hwnd_, WM_APP_OPEN_PATH, (WPARAM)pi,
+                                         reinterpret_cast<LPARAM>(new std::wstring(p)));
+                        } else {
                             // 工作目录 = 当前文件视图所在目录，BAT/可执行文件
                             // 内的相对路径以该目录为基准。
                             SHELLEXECUTEINFOW sei{};
@@ -3224,32 +3234,11 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND: {
         int id = LOWORD(wp);
         switch (id) {
-        case IDC_BACK: {
-            TabState& t = CurTab();
-            if (t.histPos > 0) { --t.histPos; Navigate(t.history[t.histPos], false); }
-            return 0;
-        }
-        case IDC_FORWARD: {
-            TabState& t = CurTab();
-            if (t.histPos + 1 < (int)t.history.size()) { ++t.histPos; Navigate(t.history[t.histPos], false); }
-            return 0;
-        }
-        case IDC_UP: {
-            // 上一级：逐级去掉最后一段。一级文件夹的上一级就是盘根（F:\tts_out -> F:\），
-            // 原先的 find_last_of + (p>2) 判断会把这种“父目录就是盘根”的情况误拦，
-            // 所以这里显式区分：父目录只剩盘符时补上反斜杠。
-            const std::wstring& dir = CurTab().dir;
-            size_t end = dir.size();
-            while (end > 0 && (dir[end - 1] == L'\\' || dir[end - 1] == L'/')) --end; // 去尾分隔符
-            if (end <= 2) return 0;                    // 已在盘根（如 F:\）或无效路径，不动
-            size_t p = dir.find_last_of(L"\\/", end - 1);
-            std::wstring parent = (p == std::wstring::npos)
-                ? dir.substr(0, 2) + L'\\'             // "F:sub" 盘相对路径 -> 盘根
-                : dir.substr(0, p);
-            if (parent.size() == 2) parent += L'\\';   // "F:" -> "F:\"
-            if (!parent.empty() && parent != dir) Navigate(parent);
-            return 0;
-        }
+        // 工具栏导航延后到主循环执行（WM_APP_NAV）：不在按钮自己的消息链里
+        // 改动 ListView/树（重入 comctl32 会崩，同翻页按钮的处理）
+        case IDC_BACK:    PostMessageW(hwnd_, WM_APP_NAV, IDC_BACK, 0); return 0;
+        case IDC_FORWARD: PostMessageW(hwnd_, WM_APP_NAV, IDC_FORWARD, 0); return 0;
+        case IDC_UP:      PostMessageW(hwnd_, WM_APP_NAV, IDC_UP, 0); return 0;
         default:
             // 每个窗格一个“+”按钮，命令 ID 落在 IDC_NEWTAB_BASE..+7 区间
             if (id >= IDC_NEWTAB_BASE && id < IDC_NEWTAB_BASE + 8) {
@@ -3286,7 +3275,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         case IDC_LAYOUT4: SetPaneCount(4); return 0;
         case IDC_TRI_PINTOP:  SetTriLayout(0); return 0; // 品字形：1 上 2 下
         case IDC_TRI_PINDOWN: SetTriLayout(1); return 0; // 倒品字形：2 上 1 下
-        case IDC_REFRESH: RefreshListFromDisk(); return 0;   // 刷新=真正重新枚举目录
+        case IDC_REFRESH: PostMessageW(hwnd_, WM_APP_NAV, IDC_REFRESH, 0); return 0;   // 刷新=真正重新枚举目录（延后执行）
         case IDC_MENU_FILTERS:
             shell::OpenContextMenuFilterSettings(hwnd_);
             return 0;
@@ -3325,7 +3314,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
     }
 
     case WM_APP_CLOSE_TAB:      // 中键点击分页标题（延后到这里真正关闭）
-        CloseRightTab(pendingCloseTab_);
+        CloseRightTab(pendingCloseTab_, /*force=*/true);   // 中键是明确操作，锁定分页也可关
         pendingCloseTab_ = SIZE_MAX;
         return 0;
 
@@ -3395,6 +3384,62 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             std::wstring dir = std::move(*dirp);
             delete dirp;
             OnExternalDirChanged(dir);
+        }
+        return 0;
+    }
+
+    case WM_APP_NAV: {          // 延后工具栏导航（后退/前进/上级/刷新）
+        switch (wp) {
+        case IDC_BACK: {
+            TabState& t = CurTab();
+            if (t.histPos > 0) { --t.histPos; Navigate(t.history[t.histPos], false); }
+            return 0;
+        }
+        case IDC_FORWARD: {
+            TabState& t = CurTab();
+            if (t.histPos + 1 < (int)t.history.size()) { ++t.histPos; Navigate(t.history[t.histPos], false); }
+            return 0;
+        }
+        case IDC_UP: {
+            // 上一级：逐级去掉最后一段。一级文件夹的上一级就是盘根（F:\tts_out -> F:\），
+            // 原先的 find_last_of + (p>2) 判断会把这种“父目录就是盘根”的情况误拦，
+            // 所以这里显式区分：父目录只剩盘符时补上反斜杠。
+            // 锁定分页不改目录：上级目录改在同窗格新开分页打开
+            const std::wstring& dir = CurTab().dir;
+            size_t end = dir.size();
+            while (end > 0 && (dir[end - 1] == L'\\' || dir[end - 1] == L'/')) --end; // 去尾分隔符
+            if (end <= 2) return 0;                    // 已在盘根（如 F:\）或无效路径，不动
+            size_t p = dir.find_last_of(L"\\/", end - 1);
+            std::wstring parent = (p == std::wstring::npos)
+                ? dir.substr(0, 2) + L'\\'             // "F:sub" 盘相对路径 -> 盘根
+                : dir.substr(0, p);
+            if (parent.size() == 2) parent += L'\\';   // "F:" -> "F:\"
+            if (!parent.empty() && parent != dir) NavigateFromSidebar(parent);
+            return 0;
+        }
+        case IDC_REFRESH:
+            RefreshListFromDisk();             // 刷新=真正重新枚举目录
+            return 0;
+        }
+        return 0;
+    }
+
+    case WM_APP_OPEN_PATH: {    // 延后打开双击的目录（尊重锁定：锁定分页新开分页）
+        auto* pathp = reinterpret_cast<std::wstring*>(lp);
+        if (pathp) {
+            std::wstring path = std::move(*pathp);
+            delete pathp;
+            size_t paneIdx = (size_t)wp;
+            if (paneIdx < panes_.size()) {
+                if (paneIdx != activePane_) SelectPane(paneIdx); // 双击未激活窗格时先切过去
+                TabState& t = PaneActiveTab(paneIdx);
+                if (t.locked) {
+                    AddRightTab(false, paneIdx);  // 锁定：同窗格新开分页打开，不动锁定分页
+                    Navigate(path);
+                } else {
+                    Navigate(path);
+                }
+            }
         }
         return 0;
     }

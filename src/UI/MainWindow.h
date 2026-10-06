@@ -225,7 +225,8 @@ private:
     void PostSelectRightTab(size_t index);
     bool PaneHasDir(size_t paneIdx, const std::wstring& dir) const; // 该窗格是否已有同一目录的分页
     void RemoveTab(size_t index, bool& paneEmptied); // 删除分页（paneEmptied=所属窗格变空了吗）
-    void CloseRightTab(size_t index);
+    // force=true 时忽略锁定（中键关闭是用户对该分页的明确操作）
+    void CloseRightTab(size_t index, bool force = false);
     void MoveTabToPane(size_t tabIndex, size_t paneIdx); // 分页拖拽移动
     void UpdateRightTabLabels();
     void UpdateNewTabButtons(); // 每个窗格的“+”按钮贴在其最后一个分页头右侧
