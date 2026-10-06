@@ -35,6 +35,8 @@ struct TabState {
     int histPos = -1;
     std::vector<FileEntry> pageItems;
     size_t curPage = 0;
+    size_t shownPage = SIZE_MAX;   // pageItems 当前显示的页号（SIZE_MAX=未显示/已换目录）
+    bool pageStale = false;        // 目录被外部改动：显示内容可能过期，等整页重载后换入
     size_t pane = 0;                         // 所属窗格
     bool locked = false;                     // 锁定：不被批量/中键关闭
     std::unique_ptr<PageManager> pages;
@@ -94,6 +96,8 @@ private:
     HWND  CurList() const;            // 激活窗格的 ListView
     void RefreshList();               // 重新请求当前页（活动窗格）
     void RefreshPaneList(size_t paneIdx); // 重新请求指定窗格当前分页（外部变化刷新用）
+    void SwapInPage(size_t paneIdx, TabState& t, HWND list,
+                    std::vector<FileEntry> fresh); // 后台加载完成的一页一次性换入显示
     void UpdateWatcher();             // 把当前应监视的目录集推给 DirWatcher
     void OnExternalDirChanged(const std::wstring& dir);
     void RefreshListFromDisk();       // 文件增删改后：清分页缓存再刷新（防旧缓存）

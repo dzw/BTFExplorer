@@ -1433,6 +1433,8 @@ void MainWindow::Navigate(const std::wstring& rawPath, bool addHistory)
     t.dir = path;
     t.curPage = 0;
     t.pageItems.clear();
+    t.shownPage = SIZE_MAX;   // 换目录：显示页号作废，重载走清空等待路径
+    t.pageStale = false;
     SetWindowTextW(address_, path.c_str());
 
     if (addHistory) {
@@ -1477,41 +1479,66 @@ void MainWindow::RefreshList()
     RefreshPaneList(activePane_);
 }
 
-// 重载指定窗格当前分页：外部目录变化、翻页、排序都走这里
+// 重载指定窗格当前分页：外部目录变化、翻页、激活分页、排序后都走这里。
+// 外部变化属于“同一页重载”：重载期间保留旧内容显示（资源管理器/Q-Dir 的
+// 做法），后台加载完成后 OnPageLoaded 整体换入——避免“清空成空白再重填”
+// 的整屏闪烁。
 void MainWindow::RefreshPaneList(size_t paneIdx)
 {
     if (paneIdx >= panes_.size()) return;
     TabState& t = PaneActiveTab(paneIdx);
     HWND list = panes_[paneIdx].list;
-    t.pageItems.clear();
-    ListView_SetItemCountEx(list, 0, 0);
     t.pages->RequestPage(t.curPage); // 可能命中缓存，也可能后台加载
-    if (t.pages->TryGetPage(t.curPage, t.pageItems)) {
-        ApplyCurrentSort(paneIdx); // 套用已保存的排序
-        ListView_SetItemCountEx(list, t.pageItems.size(), LVSICF_NOINVALIDATEALL);
-        ListView_RedrawItems(list, 0, static_cast<int>(t.pageItems.size()) - 1);
+    if (t.shownPage == t.curPage && !t.pageStale && !t.pageItems.empty()) {
+        // 显示中的就是这页且不过期：重新换入只会造成无谓的整体重绘
+    } else {
+        std::vector<FileEntry> fresh;
+        if (t.pages->TryGetPage(t.curPage, fresh)) {
+            SwapInPage(paneIdx, t, list, std::move(fresh));
+        } else if (t.pageStale && t.shownPage == t.curPage && !t.pageItems.empty()) {
+            // 同一页的外部重载进行中：保留旧内容，加载完成后整体换入
+        } else {
+            // 翻页/首次加载：旧页内容不再适用，清空等待后台加载
+            t.pageItems.clear();
+            t.shownPage = SIZE_MAX;
+            ListView_SetItemCountEx(list, 0, 0);
+        }
     }
     if (paneIdx == activePane_) { UpdateStatusBar(); UpdatePaginationBar(); }
+}
+
+// 把后台加载好的一页一次性换入显示：设置条目数后排序并整体重绘，
+// 整个过程只有一次重绘（双缓冲下无闪烁）。换入前旧内容一直保留显示。
+void MainWindow::SwapInPage(size_t paneIdx, TabState& t, HWND list,
+                            std::vector<FileEntry> fresh)
+{
+    t.pageItems = std::move(fresh);
+    ListView_SetItemCountEx(list, static_cast<int>(t.pageItems.size()), LVSICF_NOINVALIDATEALL);
+    ApplyCurrentSort(paneIdx);   // 排序 + 0..n-1 整体重绘
+    t.shownPage = t.curPage;
+    t.pageStale = false;
 }
 
 void MainWindow::RefreshListFromDisk()
 {
     // 删除/粘贴/改名后页面数据已过期：清掉分页缓存再刷新，
-    // 否则 RequestPage 直接命中旧缓存，列表显示的还是操作前的内容
+    // 否则 RequestPage 直接命中旧缓存，列表显示的还是操作前的内容。
+    // 重载期间保留旧内容显示（pageStale），加载完成后整体换入（不闪）。
     CurTab().pages->Invalidate();
+    CurTab().pageStale = true;
     RefreshList();
 }
 
 void MainWindow::OnPageLoaded()
 {
-    // 后台加载完成后：任何窗格的当前分页若还没内容就填充
-    // （外部变化刷新/恢复会话会让多个窗格先后完成加载）
+    // 后台加载完成后：任何窗格的当前分页若“显示为空/内容过期/显示的还是
+    // 别的页”就换入新页；同页且已最新则跳过（预取完成也会走到这里）。
     for (size_t i = 0; i < panes_.size(); ++i) {
         TabState& t = PaneActiveTab(i);
-        if (t.pageItems.empty() && t.pages->TryGetPage(t.curPage, t.pageItems)) {
-            ApplyCurrentSort(i); // 套用已保存的排序
-            ListView_SetItemCountEx(panes_[i].list, t.pageItems.size(), LVSICF_NOINVALIDATEALL);
-            ListView_RedrawItems(panes_[i].list, 0, static_cast<int>(t.pageItems.size()) - 1);
+        if (t.pageItems.empty() || t.pageStale || t.shownPage != t.curPage) {
+            std::vector<FileEntry> fresh;
+            if (t.pages->TryGetPage(t.curPage, fresh))
+                SwapInPage(i, t, panes_[i].list, std::move(fresh));
         }
     }
     CurTab().pages->PrefetchAround(CurTab().curPage);
@@ -1553,8 +1580,10 @@ void MainWindow::OnExternalDirChanged(const std::wstring& dir)
 {
     WriteAppLog((L"EXTERNAL_REFRESH dir=" + dir).c_str());
     for (auto& t : tabs_)
-        if (_wcsicmp(t.dir.c_str(), dir.c_str()) == 0)
-            t.pages->Invalidate();          // 后台分页下次激活时重新枚举
+        if (_wcsicmp(t.dir.c_str(), dir.c_str()) == 0) {
+            t.pages->Invalidate();   // 后台分页下次激活时重新枚举
+            t.pageStale = true;      // 显示中的内容标记过期：重载完成后整体换入（不闪）
+        }
     for (size_t i = 0; i < panes_.size(); ++i) {
         TabState& t = PaneActiveTab(i);
         if (_wcsicmp(t.dir.c_str(), dir.c_str()) == 0)

@@ -84,16 +84,32 @@ void PageManager::Shutdown()
 
 void PageManager::WorkerLoop()
 {
-    unsigned long long gen = genAtomic_.load();
     for (;;) {
-        size_t page;
+        size_t page = SIZE_MAX;
         {
-            std::unique_lock<std::mutex> lk(cvMtx_);
-            cv_.wait(lk, [&] { return stop_ || queuedPage_ != SIZE_MAX; });
-            if (stop_) return;
-            page = queuedPage_;
-            queuedPage_ = SIZE_MAX;
+            // 最新请求优先：用户正在看的页先加载
+            std::lock_guard<std::mutex> lk(cvMtx_);
+            if (queuedPage_ != SIZE_MAX) {
+                page = queuedPage_;
+                queuedPage_ = SIZE_MAX;
+            }
         }
+        if (page == SIZE_MAX) {
+            {   // 单槽队列会被后来的请求覆盖：把还挂在 pending_ 里的旧请求
+                // 捡回来逐个消化，否则它们永远卡在 pending、页面永远加载不出
+                std::lock_guard<std::mutex> lk(mtx_);
+                for (const auto& entry : pending_)
+                    if (page == SIZE_MAX || entry.first < page) page = entry.first;
+            }
+            if (page == SIZE_MAX) {
+                std::unique_lock<std::mutex> lk(cvMtx_);
+                cv_.wait(lk, [&] { return stop_ || queuedPage_ != SIZE_MAX; });
+                if (stop_) return;
+                page = queuedPage_;
+                queuedPage_ = SIZE_MAX;
+            }
+        }
+        if (stop_) return;
 
         // 后台执行：先取这一页
         std::vector<FileEntry> entries;
