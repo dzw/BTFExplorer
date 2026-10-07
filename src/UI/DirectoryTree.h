@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <shobjidl.h>
 #include <functional>
+#include <map>
 #include <string>
 #include "../Shell/ShellUtil.h"
 
@@ -41,7 +42,11 @@ private:
     ComPtr<INameSpaceTreeControl2> ctl_;
     EventSink* sink_ = nullptr;              // TreeAdvise 后由控件持有引用
     DWORD adviseCookie_ = 0;
-    bool syncing_ = false;                   // SyncToPath 触发的选择事件不当作用户操作
+    // SyncToPath 程序化选中会触发 OnSelectionChanged，且控件可能异步回调——
+    // 同步调用段早已结束，布尔标志挡不住。改为按目标路径记待消费次数，
+    // 事件到达时匹配即吞掉；目标已选中时不记数（控件此时不发事件，记了会残留）。
+    std::map<std::wstring, int> pendingSelects_;
+    std::wstring SelectedPath();             // 当前选中项的文件系统路径（无/虚拟则空）
     std::function<void(const std::wstring&)> onSelection_;
     std::function<void(const std::wstring&)> onMiddleClick_;
 };

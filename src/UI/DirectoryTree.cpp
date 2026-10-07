@@ -158,10 +158,34 @@ static PCIDLIST_ABSOLUTE PidlOf(const UniquePIDL& p)
     return static_cast<PCIDLIST_ABSOLUTE>(p.get());
 }
 
+std::wstring DirectoryTree::SelectedPath()
+{
+    if (!ctl_) return {};
+    // GetSelectedItems 在基接口 INameSpaceTreeControl 上（2 接口只加了 SetOptionsVisible）
+    ComPtr<INameSpaceTreeControl> base;
+    if (FAILED(ctl_->QueryInterface(IID_PPV_ARGS(&base))) || !base) return {};
+    ComPtr<IShellItemArray> arr;
+    IShellItem* psi = nullptr;
+    std::wstring out;
+    if (SUCCEEDED(base->GetSelectedItems(&arr)) && arr &&
+        SUCCEEDED(arr->GetItemAt(0, &psi)) && psi) {
+        out = PathOfItem(psi);
+        psi->Release();
+    }
+    return out;
+}
+
 void DirectoryTree::OnSelectionChanged(IShellItem* psi)
 {
-    if (!psi || syncing_) return;      // SyncToPath 自己的选中不当作用户导航
+    if (!psi) return;
     std::wstring path = PathOfItem(psi);
+    // 程序化选中的事件（可能异步到达）按路径计数吞掉，不当作用户导航
+    for (auto it = pendingSelects_.begin(); it != pendingSelects_.end(); ++it) {
+        if (!path.empty() && _wcsicmp(it->first.c_str(), path.c_str()) == 0) {
+            if (--it->second == 0) pendingSelects_.erase(it);
+            return;
+        }
+    }
     if (path.empty()) return;          // 虚拟位置（此电脑/回收站等）不导航
     if (onSelection_) onSelection_(path);
 }
@@ -193,8 +217,6 @@ void DirectoryTree::SyncToPath(const std::wstring& rawPath, bool showErrors)
 
     // 逐级展开祖先（最外层先展开）。默认非异步模式下展开是同步的，
     // 展开后子项才在树里存在，最后才能选中目标并滚到可见。
-    syncing_ = true;
-
     auto expandPrefix = [&](const std::wstring& prefix) {
         UniquePIDL anc = shell::PIDLFromPath(prefix.c_str());
         if (!anc) return;
@@ -231,8 +253,13 @@ void DirectoryTree::SyncToPath(const std::wstring& rawPath, bool showErrors)
 
     ComPtr<IShellItem> item;
     if (SUCCEEDED(SHCreateItemFromIDList(PidlOf(pidl), IID_PPV_ARGS(&item))) && item) {
-        ctl_->SetItemState(item.Get(), NSTCIS_SELECTED, NSTCIS_SELECTED);
+        // 目标已是选中项：控件不会再发事件，不能记待消费数（残留会误吞
+        // 下一次真实用户选中）；否则先记数再选中，异步回来的事件按数吞掉
+        std::wstring cur = SelectedPath();
+        if (_wcsicmp(cur.c_str(), target.c_str()) != 0) {
+            ++pendingSelects_[target];
+            ctl_->SetItemState(item.Get(), NSTCIS_SELECTED, NSTCIS_SELECTED);
+        }
         ctl_->EnsureItemVisible(item.Get());
     }
-    syncing_ = false;
 }

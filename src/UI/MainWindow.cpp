@@ -1450,6 +1450,7 @@ void MainWindow::NavigateFromSidebar(const std::wstring& path)
 {
     if (path.empty()) return;
     if (!CurTab().locked) { Navigate(path); return; }
+    WriteAppLog((L"NEW_TAB_FROM_LOCK path=" + path + L" tab=" + CurTab().dir).c_str());
     size_t paneIdx = activePane_;
     AddRightTab(false, paneIdx);   // 新建并激活分页（先不跳默认目录）
     Navigate(path);                // 再在新分页里打开目标目录
@@ -3517,7 +3518,10 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
     case WM_APP_TREE_NAV: {     // 目录树选中变化（延后到这里导航，见 CreateSidePanel）
         auto* path = reinterpret_cast<std::wstring*>(lp);
         if (path) {
-            if (!path->empty()) NavigateFromSidebar(*path);
+            // 与当前分页同目录的事件不是导航：多是切分页时树同步回来的
+            // 滞后选中事件，误当用户点击会在锁定分页上克隆出新分页
+            if (!path->empty() && NormalizePath(*path) != CurTab().dir)
+                NavigateFromSidebar(*path);
             delete path;
         }
         return 0;
