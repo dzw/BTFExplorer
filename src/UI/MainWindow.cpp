@@ -1778,6 +1778,10 @@ void MainWindow::SyncShellView(size_t paneIdx)
             WriteAppLog((L"ShellFolderView sync navigate failed: " + t.dir).c_str());
     }
     ShowHidePaneShellViews(paneIdx);
+    // 刚显示（或刚懒创建，宿主尺寸还是 0）的视图必须重摆一次：
+    // Layout 对每个可见宿主 MoveWindow(...,TRUE)，强制 DefView 重绘。
+    // 否则 SW_HIDE->SW_SHOW 的分页会停在空白，直到点“Q”（其路径含 Layout）才恢复。
+    Layout();
 }
 
 // --- FileListDelegate：自绘列表交互回调（控件代码在 FileList.cpp） ---
