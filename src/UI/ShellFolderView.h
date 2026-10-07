@@ -78,6 +78,7 @@ private:
     HWND host_ = nullptr;            // 宿主窗口（窗格 tab 的子窗口，布局定位用）
     HWND view_ = nullptr;            // shell 视图窗口（SHELLDLL_DefView）
     WNDPROC origViewProc_ = nullptr; // 视图窗口原窗口过程（子类化前）
+    HWND subclassedOn_ = nullptr;    // 子类化实际装在该 HWND 上；沿用同窗口时不重装
     ComPtr<IShellView> viewObj_;
     std::wstring dir_;
     UniquePIDL dirPidl_;

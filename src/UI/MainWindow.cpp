@@ -56,6 +56,7 @@ static LRESULT CALLBACK SideTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp);
 enum { COL_NAME = 0, COL_TYPE, COL_SIZE, COL_MTIME };
 
 static constexpr int WM_APP_TOGGLE_VIEWMODE = WM_APP + 16; // 延后切换窗格列表实现
+static constexpr int WM_APP_SHELL_NAV = WM_APP + 17;       // shell 视图内激活文件夹 -> 当前分页视图内切换目录（不新建分页）
 
 class FileDropTarget final : public IDropTarget {
 public:
@@ -540,7 +541,7 @@ void MainWindow::RemovePane(size_t idx)
     if (panes_[idx].btnNewTab) DestroyWindow(panes_[idx].btnNewTab);
     if (panes_[idx].btnViewMode) DestroyWindow(panes_[idx].btnViewMode);
     if (panes_[idx].btnTools) DestroyWindow(panes_[idx].btnTools);
-    panes_.erase(panes_.begin() + idx);   // shellView（unique_ptr）随 Pane 析构解绑
+    panes_.erase(panes_.begin() + idx);   // 该窗格的分页 shell 视图宿主是 p.tab 的子窗口，随 tab 控件销毁
     for (auto& t : tabs_)
         if (t.pane > idx) --t.pane;
     if (panes_.empty()) activePane_ = 0;
@@ -1171,6 +1172,12 @@ void MainWindow::MoveTabToPane(size_t tabIndex, size_t paneIdx)
     SendMessageW(to.tab, TCM_INSERTITEMW, inPane, reinterpret_cast<LPARAM>(&ti));
     to.active = inPane;
 
+    // 分页自带的 shell 视图宿主原本挂在源窗格的 tab 控件下；分页迁到目标窗格后
+    // 必须把宿主重新挂到目标窗格 tab 控件，否则源窗格被销毁时会连带销毁它，
+    // 且布局位置也错。重挂后交给 Layout 定位、ShowHide 控制显隐。
+    if (tabs_[tabIndex].shellView && tabs_[tabIndex].shellView->Host())
+        SetParent(tabs_[tabIndex].shellView->Host(), to.tab);
+
     // 源窗格空了：关掉它
     if (panes_[oldPane].tabs.empty())
         RemovePane(oldPane);
@@ -1669,44 +1676,67 @@ void MainWindow::ApplyCurrentSort(size_t paneIdx)
 // ---------------------------------------------------------------------------
 // 文件列表双实现：自绘虚拟列表（FileList） <-> shell 视图（ShellFolderView）
 // ---------------------------------------------------------------------------
+// 懒创建该分页自己的 shell 视图（宿主为窗格 tab 的子窗口），并导航到分页目录。
+bool MainWindow::EnsureTabShellView(size_t paneIdx, TabState& t)
+{
+    if (t.shellView) return true;
+    if (paneIdx >= panes_.size()) return false;
+    auto sv = std::make_unique<ShellFolderView>();
+    if (!sv->Create(panes_[paneIdx].tab)) {
+        WriteAppLog(L"ShellFolderView create failed");
+        return false;
+    }
+    // 视图内双击目录 -> 浏览请求：必须延后（回调发生在视图自己的消息链内，
+    // 处理中的 Navigate 会销毁发起回调的这个视图）。用 SHELL_NAV 而非 TREE_NAV：
+    // 在视图自己的分页内切换目录，不因分页被锁定而克隆出新分页。
+    sv->onBrowse = [this](const std::wstring& dir) {
+        PostMessageW(hwnd_, WM_APP_SHELL_NAV, 0,
+                     reinterpret_cast<LPARAM>(new std::wstring(dir)));
+    };
+    sv->onStatusText = [this](const std::wstring& text) {
+        // 视图的“N 个对象”等状态文本：只在该窗格是活动窗格时显示
+        if (activePane_ < panes_.size() && panes_[activePane_].listMode == 1)
+            SendMessageW(status_, SB_SETTEXTW, 0,
+                         reinterpret_cast<LPARAM>(text.c_str()));
+    };
+    t.shellView = std::move(sv);
+    if (!t.dir.empty() && !t.shellView->Navigate(t.dir)) {
+        WriteAppLog((L"ShellFolderView navigate failed: " + t.dir).c_str());
+        t.shellView.reset();
+        return false;
+    }
+    return true;
+}
+
+// 窗格 shell 模式下只显示当前分页的视图，隐藏同窗格其余分页的视图：
+// 切分页既不重建也不导航，各分页的 SHELLDLL_DefView 句柄因此保持稳定。
+void MainWindow::ShowHidePaneShellViews(size_t paneIdx)
+{
+    if (paneIdx >= panes_.size()) return;
+    Pane& p = panes_[paneIdx];
+    for (size_t k = 0; k < p.tabs.size(); ++k) {
+        TabState& tt = tabs_[p.tabs[k]];
+        if (!tt.shellView) continue;
+        bool show = (p.listMode == 1 && k == p.active);
+        ShowWindow(tt.shellView->Host(), show ? SW_SHOW : SW_HIDE);
+    }
+}
+
 // 窗格右上角“Q”按钮（延后到这里执行）：切换两种实现
 void MainWindow::ToggleListMode(size_t paneIdx)
 {
     if (paneIdx >= panes_.size()) return;
     Pane& p = panes_[paneIdx];
     if (p.listMode == 0) {
-        // 切到 shell 视图：懒创建宿主 + 视图，导航到当前分页目录
-        if (!p.shellView) {
-            auto sv = std::make_unique<ShellFolderView>();
-            if (!sv->Create(p.tab)) {
-                WriteAppLog(L"ShellFolderView create failed");
-                return;
-            }
-            // 视图内双击目录 -> 浏览请求：必须延后（回调发生在视图自己的消息链内，
-            // 处理中的 Navigate 会销毁发起回调的这个视图）
-            sv->onBrowse = [this](const std::wstring& dir) {
-                PostMessageW(hwnd_, WM_APP_TREE_NAV, 0,
-                             reinterpret_cast<LPARAM>(new std::wstring(dir)));
-            };
-            sv->onStatusText = [this](const std::wstring& text) {
-                // 视图的“N 个对象”等状态文本：只在该窗格是活动窗格时显示
-                if (activePane_ < panes_.size() && panes_[activePane_].listMode == 1)
-                    SendMessageW(status_, SB_SETTEXTW, 0,
-                                 reinterpret_cast<LPARAM>(text.c_str()));
-            };
-            p.shellView = std::move(sv);
-        }
-        const std::wstring& dir = PaneActiveTab(paneIdx).dir;
-        if (!dir.empty() && !p.shellView->Navigate(dir)) {
-            WriteAppLog((L"ShellFolderView navigate failed: " + dir).c_str());
-            return;
-        }
+        // 切到 shell 视图：确保当前分页有独立视图（懒创建 + 导航到其目录）
+        if (!EnsureTabShellView(paneIdx, PaneActiveTab(paneIdx))) return;
         p.listMode = 1;
         ApplyPaneListMode(paneIdx);
-        if (paneIdx == activePane_ && p.shellView->HasView())
-            SetFocus(p.shellView->ViewWindow());
+        TabState& t = PaneActiveTab(paneIdx);
+        if (paneIdx == activePane_ && t.shellView && t.shellView->HasView())
+            SetFocus(t.shellView->ViewWindow());
     } else {
-        // 切回自绘虚拟列表
+        // 切回自绘虚拟列表：各分页的 shell 视图只隐藏不销毁（切回 shell 时复用）
         p.listMode = 0;
         ApplyPaneListMode(paneIdx);
         RefreshPaneList(paneIdx);   // 隐藏期间分页数据可能没跟上
@@ -1726,25 +1756,28 @@ void MainWindow::ApplyPaneListMode(size_t paneIdx)
     Pane& p = panes_[paneIdx];
     BOOL listVisible = (p.listMode == 0) ? SW_SHOW : SW_HIDE;
     ShowWindow(p.list, listVisible);
-    if (p.shellView)
-        ShowWindow(p.shellView->Host(), listVisible == SW_SHOW ? SW_HIDE : SW_SHOW);
+    ShowHidePaneShellViews(paneIdx);
     // 宿主可能是在上次 Layout 之后才创建的（尺寸还是 0），统一重摆一次：
-    // 宿主跟随列表位置/尺寸，shell 视图再填满宿主
+    // 宿主跟随列表位置/尺寸，shell 视图再填满宿主（Layout 内逐视图处理）
     Layout();
-    if (p.shellView) p.shellView->Layout();
 }
 
-// 窗格处于 shell 视图模式时，把视图导航到该窗格当前分页的目录
+// 窗格处于 shell 视图模式时，让当前分页的视图对上该分页的目录。
+// 切分页走到这里通常目录未变 -> 只做 Show/Hide（视图句柄不变，不重建）；
+// 仅当该分页自身导航过（Directory()!=dir）才 Navigate 重建其内部视图。
 void MainWindow::SyncShellView(size_t paneIdx)
 {
     if (paneIdx >= panes_.size()) return;
     Pane& p = panes_[paneIdx];
-    if (p.listMode != 1 || !p.shellView) return;
-    const std::wstring& dir = PaneActiveTab(paneIdx).dir;
-    if (!dir.empty() && p.shellView->Directory() != dir) {
-        if (!p.shellView->Navigate(dir))
-            WriteAppLog((L"ShellFolderView sync navigate failed: " + dir).c_str());
+    if (p.listMode != 1) { ShowHidePaneShellViews(paneIdx); return; }
+    TabState& t = PaneActiveTab(paneIdx);
+    if (!t.shellView) {
+        if (!EnsureTabShellView(paneIdx, t)) return;
+    } else if (!t.dir.empty() && t.shellView->Directory() != t.dir) {
+        if (!t.shellView->Navigate(t.dir))
+            WriteAppLog((L"ShellFolderView sync navigate failed: " + t.dir).c_str());
     }
+    ShowHidePaneShellViews(paneIdx);
 }
 
 // --- FileListDelegate：自绘列表交互回调（控件代码在 FileList.cpp） ---
@@ -1927,10 +1960,10 @@ std::wstring MainWindow::CurrentPagePath(int item) const
 
 bool MainWindow::SelectedPath(std::wstring& out) const
 {
-    // shell 视图模式：从视图选中项取（该模式下自绘列表是隐藏的）
+    // shell 视图模式：从当前分页视图的选中项取（该模式下自绘列表是隐藏的）
     if (activePane_ < panes_.size() && panes_[activePane_].listMode == 1 &&
-        panes_[activePane_].shellView) {
-        auto paths = panes_[activePane_].shellView->SelectedPaths();
+        CurTab().shellView) {
+        auto paths = CurTab().shellView->SelectedPaths();
         if (paths.empty()) return false;
         out = std::move(paths.front());
         return true;
@@ -1943,10 +1976,10 @@ bool MainWindow::SelectedPath(std::wstring& out) const
 
 std::vector<std::wstring> MainWindow::SelectedPaths() const
 {
-    // shell 视图模式：从视图选中项取
+    // shell 视图模式：从当前分页视图的选中项取
     if (activePane_ < panes_.size() && panes_[activePane_].listMode == 1 &&
-        panes_[activePane_].shellView)
-        return panes_[activePane_].shellView->SelectedPaths();
+        CurTab().shellView)
+        return CurTab().shellView->SelectedPaths();
     std::vector<std::wstring> out;
     int sel = -1;
     for (;;) {
@@ -3131,9 +3164,13 @@ void MainWindow::Layout()
         // list 与 shell 视图宿主都是 p.tab 的子窗口，坐标相对 p.tab 客户区，
         // 两者重叠摆放，可见性由 listMode 决定（ApplyPaneListMode）
         place(p.list, 4, rtabH + 6, w - 8, hh - rtabH - 12);
-        if (p.shellView) {
-            place(p.shellView->Host(), 4, rtabH + 6, w - 8, hh - rtabH - 12);
-            p.shellView->Layout();
+        // 每个分页各自持有 shell 视图宿主，全部重叠摆到列表位置；可见性由
+        // ShowHidePaneShellViews 决定，这里只保证尺寸跟随窗格
+        for (size_t ti = 0; ti < p.tabs.size(); ++ti) {
+            TabState& tt = tabs_[p.tabs[ti]];
+            if (!tt.shellView) continue;
+            place(tt.shellView->Host(), 4, rtabH + 6, w - 8, hh - rtabH - 12);
+            tt.shellView->Layout();
         }
     }
 
@@ -3527,6 +3564,18 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             // 滞后选中事件，误当用户点击会在锁定分页上克隆出新分页
             if (!path->empty() && NormalizePath(*path) != CurTab().dir)
                 NavigateFromSidebar(*path);
+            delete path;
+        }
+        return 0;
+    }
+
+    case WM_APP_SHELL_NAV: {    // shell 视图内双击文件夹：在本分页自己的视图内切换目录
+        auto* path = reinterpret_cast<std::wstring*>(lp);
+        if (path) {
+            // 直接 Navigate 当前分页（视图已按分页独立，切换只重建该视图内部），
+            // 不走 NavigateFromSidebar 的“锁定即新开分页”逻辑
+            if (!path->empty() && NormalizePath(*path) != CurTab().dir)
+                Navigate(*path);
             delete path;
         }
         return 0;

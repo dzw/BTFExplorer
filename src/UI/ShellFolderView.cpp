@@ -67,7 +67,7 @@ bool ShellFolderView::Navigate(const std::wstring& dir)
     UniquePIDL pidl = shell::PIDLFromPath(dir);
     if (!pidl) return false;
 
-    Destroy();   // 简单可靠：每次导航重建视图（shell 视图自己异步加载）
+    Destroy();   // 单视图生命周期内换目录：销毁再重建（切分页不再走这里）
 
     ComPtr<IShellFolder> folder;
     if (FAILED(SHBindToObject(nullptr, static_cast<PCIDLIST_ABSOLUTE>(pidl.get()),
@@ -88,7 +88,7 @@ bool ShellFolderView::Navigate(const std::wstring& dir)
     view_ = viewHwnd;
     dir_ = dir;
     dirPidl_ = std::move(pidl);
-    InstallViewSubclass();   // 拦下视图内文件夹激活，改为站内导航（见 ViewProc）
+    InstallViewSubclass();           // 拦下视图内文件夹激活，改为站内导航（见 ViewProc）
     // 以“无焦点激活”挂上浏览器：视图才会向状态栏发条目数等消息
     viewObj_->UIActivate(SVUIA_ACTIVATE_NOFOCUS);
     return true;
@@ -96,10 +96,13 @@ bool ShellFolderView::Navigate(const std::wstring& dir)
 
 void ShellFolderView::InstallViewSubclass()
 {
-    if (!view_) return;
+    // 同一个视图窗口只装一次：pPriorView 复用窗口时 view_ 不变，重装会把本类的
+    // ViewProcStatic 当作“原过程”存下来，形成自嵌套。换了新 HWND 才重装。
+    if (!view_ || subclassedOn_ == view_) return;
     SetWindowLongPtrW(view_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
     origViewProc_ = reinterpret_cast<WNDPROC>(
         SetWindowLongPtrW(view_, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&ShellFolderView::ViewProcStatic)));
+    subclassedOn_ = view_;
 }
 
 LRESULT CALLBACK ShellFolderView::ViewProcStatic(HWND h, UINT msg, WPARAM wp, LPARAM lp)
@@ -152,6 +155,8 @@ void ShellFolderView::Destroy()
         viewObj_.Release();   // 视图析构时会 Release 本对象（IShellBrowser）
     }
     view_ = nullptr;
+    subclassedOn_ = nullptr;    // 窗口随视图析构；下次新建需重装子类化
+    origViewProc_ = nullptr;
     dir_.clear();
     dirPidl_.reset();
 }

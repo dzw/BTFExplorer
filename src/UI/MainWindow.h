@@ -43,6 +43,9 @@ struct TabState {
     size_t pane = 0;                         // 所属窗格
     bool locked = false;                     // 锁定：不被批量/中键关闭
     std::unique_ptr<PageManager> pages;
+    // Q-Dir 式 shell 视图：每个分页一个独立实例（独立 SHELLDLL_DefView 窗口），
+    // 切分页只 Show/Hide 不重建，故分页的视图句柄稳定。懒创建。
+    std::unique_ptr<ShellFolderView> shellView;
     TabState() : pages(std::make_unique<PageManager>()) {}
 };
 
@@ -55,7 +58,6 @@ struct Pane {
     // FileList 用堆持有：panes_ 是 vector，扩容搬移 Pane 时列表子类过程经
     // GWLP_USERDATA 取 FileList*，地址必须稳定，不能跟着 vector 搬走
     std::unique_ptr<FileList> fileList;
-    std::unique_ptr<ShellFolderView> shellView; // Q-Dir 式 shell 视图实现（懒创建）
     int listMode = 0;                        // 文件列表实现：0=自绘虚拟列表 1=shell 视图
     HWND btnViewMode = nullptr;              // 该窗格右上角“Q”列表实现切换按钮
     int tag = -1;                            // 窗格唯一编号（控件 ID 后缀，删除后编号可复用）
@@ -130,7 +132,9 @@ private:
     // 文件列表双实现（自绘虚拟列表 <-> shell 视图）
     void ToggleListMode(size_t paneIdx);     // 窗格右上角“Q”按钮：切换实现
     void ApplyPaneListMode(size_t paneIdx);  // 按 listMode 摆放两套实现的可见性
-    void SyncShellView(size_t paneIdx);      // shell 模式下把视图导航到当前分页目录
+    void SyncShellView(size_t paneIdx);      // shell 模式下让当前分页的视图对上其目录
+    bool EnsureTabShellView(size_t paneIdx, TabState& t);  // 懒创建该分页自己的 shell 视图
+    void ShowHidePaneShellViews(size_t paneIdx);           // 只显示当前分页的视图，隐藏同窗格其余
 
     // FileListDelegate：自绘列表的交互回调（控件侧只管显示与命中，业务在这里）
     bool HitRowSplit(HWND list, const POINT& clientPt) override;
