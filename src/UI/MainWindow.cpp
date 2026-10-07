@@ -780,19 +780,14 @@ void MainWindow::SaveSession()
         widths += std::to_wstring(panes_[i].width);
     }
     putLine(L"widths=" + widths);
-    // 每个窗格的文件列表实现（0=自绘虚拟列表 1=shell 视图）
-    std::wstring modes;
-    for (size_t i = 0; i < panes_.size(); ++i) {
-        if (i) modes += L",";
-        modes += std::to_wstring(panes_[i].listMode);
-    }
-    putLine(L"viewmodes=" + modes);
 
     for (size_t i = 0; i < tabs_.size(); ++i) {
         const TabState& t = tabs_[i];
         putLine(L"[tab]");
         putLine(L"pane=" + std::to_wstring(t.pane));
         putLine(L"locked=" + std::to_wstring(t.locked ? 1 : 0));
+        // 文件列表实现属于分页（0=自绘虚拟列表 1=shell 视图），不是窗格
+        putLine(L"listmode=" + std::to_wstring(t.listMode));
         putLine(L"hist=" + std::to_wstring(t.histPos));
         std::wstring hist = t.history.empty() ? t.dir : t.history[0];
         for (size_t k = 1; k < t.history.size(); ++k) {
@@ -817,7 +812,8 @@ bool MainWindow::RestoreSession()
     _wfopen_s(&f, path.c_str(), L"rb");
     WriteAppLog((L"RESTORE session file path=" + path +
         (f ? L" (opened)" : L" (NOT opened)")).c_str());
-    struct TabRec { int pane = 0; int locked = 0; int histPos = 0; std::vector<std::wstring> history; };
+    struct TabRec { int pane = 0; int locked = 0; int listMode = -1; int histPos = 0;
+                    std::vector<std::wstring> history; };
     int paneCount = 1, tri = 1, sel = 0, sortCol = 0, sortAsc = 1;
     int asym = 0, colSplit = 500;   // 不对称布局：模式 0/1/2 与左右栏比例
     int savedSideWidth = sideWidth_, windowMaximized = 0;
@@ -915,6 +911,7 @@ bool MainWindow::RestoreSession()
             if (inTab) {
                 if (w.rfind(L"pane=", 0) == 0) cur.pane = _wtoi(w.c_str() + 5);
                 else if (w.rfind(L"locked=", 0) == 0) cur.locked = _wtoi(w.c_str() + 7);
+                else if (w.rfind(L"listmode=", 0) == 0) cur.listMode = _wtoi(w.c_str() + 9);
                 else if (w.rfind(L"hist=", 0) == 0) cur.histPos = _wtoi(w.c_str() + 5);
                 else if (w.rfind(L"history=", 0) == 0) {
                     std::wstring v = w.substr(8);
@@ -1004,7 +1001,6 @@ bool MainWindow::RestoreSession()
         panes_.emplace_back();
         CreatePane(panes_.back());
         if (i < (int)widths.size() && widths[i] > 0) panes_.back().width = widths[i];
-        if (i < (int)viewModes.size()) panes_.back().listMode = viewModes[i] ? 1 : 0;
     }
     for (const TabRec& r : recs) {
         size_t pi = (size_t)r.pane;
@@ -1014,6 +1010,9 @@ bool MainWindow::RestoreSession()
         TabState& t = tabs_[idx];
         t.pane = pi;
         t.locked = (r.locked != 0);
+        // 分页实现：新模式直接读 listmode；旧会话（无 listmode）回退到窗格的 viewmodes
+        if (r.listMode >= 0) t.listMode = r.listMode ? 1 : 0;
+        else t.listMode = (pi < viewModes.size() && viewModes[pi]) ? 1 : 0;
         t.history = r.history;
         if (t.history.empty()) t.history.push_back(L"");
         t.histPos = r.histPos;
@@ -1053,14 +1052,13 @@ bool MainWindow::RestoreSession()
     SelectRightTab(act);
     UpdateRightTabLabels();
     Layout();
-    // 恢复各窗格的文件列表实现（shell 视图此刻才创建——需要窗格/分页就绪）。
-    // ToggleListMode 语义是“从自绘切到另一侧”，这里先把解析出的模式归零再切换。
-    for (size_t i = 0; i < panes_.size(); ++i) {
-        if (panes_[i].listMode == 1) {
-            panes_[i].listMode = 0;
-            ToggleListMode(i);
-        }
-    }
+    // 恢复各分页的文件列表实现（shell 视图此刻才创建——需要窗格/分页都已就绪）。
+    // 先为所有标记 shell 的分页懒建视图，再按各窗格当前分页的模式摆放可见性。
+    for (size_t i = 0; i < tabs_.size(); ++i)
+        if (tabs_[i].listMode == 1 && tabs_[i].pane < panes_.size())
+            EnsureTabShellView(tabs_[i].pane, tabs_[i]);
+    for (size_t pi = 0; pi < panes_.size(); ++pi)
+        ApplyPaneListMode(pi);
     UpdateWatcher();
     return true;
 }
@@ -1597,7 +1595,7 @@ void MainWindow::OnExternalDirChanged(const std::wstring& dir)
 void MainWindow::UpdateStatusBar()
 {
     // shell 视图模式：条目数由视图自己发状态文本（SetStatusTextSB），别覆盖
-    if (activePane_ < panes_.size() && panes_[activePane_].listMode == 1) return;
+    if (activePane_ < panes_.size() && PaneActiveTab(activePane_).listMode == 1) return;
     wchar_t buf[160];
     unsigned long long total = CurTab().pages->TotalCount();
     if (total > 0 && !paginationEnabled_)
@@ -1613,7 +1611,7 @@ void MainWindow::UpdateStatusBar()
 void MainWindow::UpdatePaginationBar()
 {
     if (!paginationEnabled_) return;   // 分页栏整条已隐藏
-    if (activePane_ < panes_.size() && panes_[activePane_].listMode == 1) {
+    if (activePane_ < panes_.size() && PaneActiveTab(activePane_).listMode == 1) {
         // shell 视图整目录显示，没有分页概念
         SetWindowTextW(pagerLabel_, L"Shell 视图");
         EnableWindow(pagerFirst_, FALSE);
@@ -1695,7 +1693,7 @@ bool MainWindow::EnsureTabShellView(size_t paneIdx, TabState& t)
     };
     sv->onStatusText = [this](const std::wstring& text) {
         // 视图的“N 个对象”等状态文本：只在该窗格是活动窗格时显示
-        if (activePane_ < panes_.size() && panes_[activePane_].listMode == 1)
+        if (activePane_ < panes_.size() && PaneActiveTab(activePane_).listMode == 1)
             SendMessageW(status_, SB_SETTEXTW, 0,
                          reinterpret_cast<LPARAM>(text.c_str()));
     };
@@ -1717,27 +1715,27 @@ void MainWindow::ShowHidePaneShellViews(size_t paneIdx)
     for (size_t k = 0; k < p.tabs.size(); ++k) {
         TabState& tt = tabs_[p.tabs[k]];
         if (!tt.shellView) continue;
-        bool show = (p.listMode == 1 && k == p.active);
+        bool show = (tt.listMode == 1 && k == p.active);
         ShowWindow(tt.shellView->Host(), show ? SW_SHOW : SW_HIDE);
     }
 }
 
-// 窗格右上角“Q”按钮（延后到这里执行）：切换两种实现
+// 当前分页右上角“Q”按钮（延后到这里执行）：只切换该分页的实现（窗格内其余分页不受影响）
 void MainWindow::ToggleListMode(size_t paneIdx)
 {
     if (paneIdx >= panes_.size()) return;
     Pane& p = panes_[paneIdx];
-    if (p.listMode == 0) {
+    TabState& t = PaneActiveTab(paneIdx);
+    if (t.listMode == 0) {
         // 切到 shell 视图：确保当前分页有独立视图（懒创建 + 导航到其目录）
-        if (!EnsureTabShellView(paneIdx, PaneActiveTab(paneIdx))) return;
-        p.listMode = 1;
+        if (!EnsureTabShellView(paneIdx, t)) return;
+        t.listMode = 1;
         ApplyPaneListMode(paneIdx);
-        TabState& t = PaneActiveTab(paneIdx);
         if (paneIdx == activePane_ && t.shellView && t.shellView->HasView())
             SetFocus(t.shellView->ViewWindow());
     } else {
         // 切回自绘虚拟列表：各分页的 shell 视图只隐藏不销毁（切回 shell 时复用）
-        p.listMode = 0;
+        t.listMode = 0;
         ApplyPaneListMode(paneIdx);
         RefreshPaneList(paneIdx);   // 隐藏期间分页数据可能没跟上
         if (paneIdx == activePane_) SetFocus(p.list);
@@ -1749,12 +1747,12 @@ void MainWindow::ToggleListMode(size_t paneIdx)
     SaveSession();   // 模式是会话状态，立即落盘
 }
 
-// 按 listMode 摆放两套实现的可见性（两者在布局里重叠摆放）
+// 按“当前分页”的 listMode 摆放两套实现的可见性（两者在布局里重叠摆放）
 void MainWindow::ApplyPaneListMode(size_t paneIdx)
 {
     if (paneIdx >= panes_.size()) return;
     Pane& p = panes_[paneIdx];
-    BOOL listVisible = (p.listMode == 0) ? SW_SHOW : SW_HIDE;
+    BOOL listVisible = (PaneActiveTab(paneIdx).listMode == 0) ? SW_SHOW : SW_HIDE;
     ShowWindow(p.list, listVisible);
     ShowHidePaneShellViews(paneIdx);
     // 宿主可能是在上次 Layout 之后才创建的（尺寸还是 0），统一重摆一次：
@@ -1762,21 +1760,26 @@ void MainWindow::ApplyPaneListMode(size_t paneIdx)
     Layout();
 }
 
-// 窗格处于 shell 视图模式时，让当前分页的视图对上该分页的目录。
+// 当前分页处于 shell 视图模式时，让该分页的视图对上其目录。
 // 切分页走到这里通常目录未变 -> 只做 Show/Hide（视图句柄不变，不重建）；
 // 仅当该分页自身导航过（Directory()!=dir）才 Navigate 重建其内部视图。
 void MainWindow::SyncShellView(size_t paneIdx)
 {
     if (paneIdx >= panes_.size()) return;
     Pane& p = panes_[paneIdx];
-    if (p.listMode != 1) { ShowHidePaneShellViews(paneIdx); return; }
     TabState& t = PaneActiveTab(paneIdx);
-    if (!t.shellView) {
-        if (!EnsureTabShellView(paneIdx, t)) return;
-    } else if (!t.dir.empty() && t.shellView->Directory() != t.dir) {
-        if (!t.shellView->Navigate(t.dir))
-            WriteAppLog((L"ShellFolderView sync navigate failed: " + t.dir).c_str());
+    if (t.listMode == 1) {
+        if (!t.shellView) {
+            if (!EnsureTabShellView(paneIdx, t)) return;
+        } else if (!t.dir.empty() && t.shellView->Directory() != t.dir) {
+            if (!t.shellView->Navigate(t.dir))
+                WriteAppLog((L"ShellFolderView sync navigate failed: " + t.dir).c_str());
+        }
     }
+    // 分页实现是“按分页”的：切到本分页后，两套实现的可见性都要以本分页的
+    // listMode 为准。共享的自绘列表若不在此处显隐，从 shell 分页切回自绘分页
+    // 会停在隐藏态（空白）。
+    ShowWindow(p.list, t.listMode == 0 ? SW_SHOW : SW_HIDE);
     ShowHidePaneShellViews(paneIdx);
     // 刚显示（或刚懒创建，宿主尺寸还是 0）的视图必须重摆一次：
     // Layout 对每个可见宿主 MoveWindow(...,TRUE)，强制 DefView 重绘。
@@ -1965,8 +1968,10 @@ std::wstring MainWindow::CurrentPagePath(int item) const
 bool MainWindow::SelectedPath(std::wstring& out) const
 {
     // shell 视图模式：从当前分页视图的选中项取（该模式下自绘列表是隐藏的）
-    if (activePane_ < panes_.size() && panes_[activePane_].listMode == 1 &&
-        CurTab().shellView) {
+    if (activePane_ >= panes_.size()) return false;
+    const Pane& ap = panes_[activePane_];
+    const TabState& at = tabs_[ap.tabs[ap.active]];
+    if (at.listMode == 1 && CurTab().shellView) {
         auto paths = CurTab().shellView->SelectedPaths();
         if (paths.empty()) return false;
         out = std::move(paths.front());
@@ -1981,9 +1986,12 @@ bool MainWindow::SelectedPath(std::wstring& out) const
 std::vector<std::wstring> MainWindow::SelectedPaths() const
 {
     // shell 视图模式：从当前分页视图的选中项取
-    if (activePane_ < panes_.size() && panes_[activePane_].listMode == 1 &&
-        CurTab().shellView)
-        return CurTab().shellView->SelectedPaths();
+    if (activePane_ < panes_.size()) {
+        const Pane& ap = panes_[activePane_];
+        const TabState& at = tabs_[ap.tabs[ap.active]];
+        if (at.listMode == 1 && CurTab().shellView)
+            return CurTab().shellView->SelectedPaths();
+    }
     std::vector<std::wstring> out;
     int sel = -1;
     for (;;) {

@@ -42,6 +42,10 @@ struct TabState {
     bool pageStale = false;        // 目录被外部改动：显示内容可能过期，等整页重载后换入
     size_t pane = 0;                         // 所属窗格
     bool locked = false;                     // 锁定：不被批量/中键关闭
+    // 本分页的文件列表实现：0=自绘虚拟列表 1=shell 视图。
+    // 作用域是分页而非窗格——同一窗格内各分页可各自独立选择实现，
+    // “Q”按钮只切换当前分页，切分页时按该分页自己的模式显示。
+    int listMode = 0;
     std::unique_ptr<PageManager> pages;
     // Q-Dir 式 shell 视图：每个分页一个独立实例（独立 SHELLDLL_DefView 窗口），
     // 切分页只 Show/Hide 不重建，故分页的视图句柄稳定。懒创建。
@@ -58,8 +62,7 @@ struct Pane {
     // FileList 用堆持有：panes_ 是 vector，扩容搬移 Pane 时列表子类过程经
     // GWLP_USERDATA 取 FileList*，地址必须稳定，不能跟着 vector 搬走
     std::unique_ptr<FileList> fileList;
-    int listMode = 0;                        // 文件列表实现：0=自绘虚拟列表 1=shell 视图
-    HWND btnViewMode = nullptr;              // 该窗格右上角“Q”列表实现切换按钮
+    HWND btnViewMode = nullptr;              // 该窗格右上角“Q”列表实现切换按钮（只作用于当前分页）
     int tag = -1;                            // 窗格唯一编号（控件 ID 后缀，删除后编号可复用）
     int width = 340;                         // 窗格宽度（分隔条可拖）
     std::vector<size_t> tabs;                // 本窗格持有的 TabState 下标
