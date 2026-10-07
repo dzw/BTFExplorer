@@ -1476,23 +1476,28 @@ void MainWindow::RefreshList()
 void MainWindow::RefreshPaneList(size_t paneIdx)
 {
     if (paneIdx >= panes_.size()) return;
+    Pane& p = panes_[paneIdx];
     TabState& t = PaneActiveTab(paneIdx);
-    HWND list = panes_[paneIdx].list;
+    HWND list = p.list;
+    // 切分页：list 里的行还属于上一个分页，必须换入本分页内容（或清空等后台加载），
+    // 否则命中下面“同页且不过期就跳过重绘”的优化会沿用旧分页显示。
+    bool tabChanged = (p.renderedTab != p.active);
     t.pages->RequestPage(t.curPage); // 可能命中缓存，也可能后台加载
-    if (t.shownPage == t.curPage && !t.pageStale && !t.pageItems.empty()) {
-        // 显示中的就是这页且不过期：重新换入只会造成无谓的整体重绘
+    if (!tabChanged && t.shownPage == t.curPage && !t.pageStale && !t.pageItems.empty()) {
+        // 同一分页、显示中的就是这页且不过期：重新换入只会造成无谓的整体重绘
     } else {
         std::vector<FileEntry> fresh;
         if (t.pages->TryGetPage(t.curPage, fresh)) {
             SwapInPage(paneIdx, t, list, std::move(fresh));
-        } else if (t.pageStale && t.shownPage == t.curPage && !t.pageItems.empty()) {
-            // 同一页的外部重载进行中：保留旧内容，加载完成后整体换入
+        } else if (!tabChanged && t.pageStale && t.shownPage == t.curPage && !t.pageItems.empty()) {
+            // 同一分页的外部重载进行中：保留旧内容，加载完成后整体换入
         } else {
-            // 翻页/首次加载：旧页内容不再适用，清空等待后台加载
+            // 翻页/首次加载/切到尚未缓存的分页：旧内容不再适用，清空等待后台加载
             t.pageItems.clear();
             t.shownPage = SIZE_MAX;
             ListView_SetItemCountEx(list, 0, 0);
         }
+        p.renderedTab = p.active;   // list 现在归属本分页（内容或“等待加载”状态）
     }
     if (paneIdx == activePane_) { UpdateStatusBar(); UpdatePaginationBar(); }
 }

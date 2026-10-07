@@ -1,6 +1,6 @@
 #include "ShellFolderView.h"
-#include "../Util/AppLog.h"
 #include <shlwapi.h>
+#include <commctrl.h>
 
 namespace {
 
@@ -88,9 +88,61 @@ bool ShellFolderView::Navigate(const std::wstring& dir)
     view_ = viewHwnd;
     dir_ = dir;
     dirPidl_ = std::move(pidl);
+    InstallViewSubclass();   // 拦下视图内文件夹激活，改为站内导航（见 ViewProc）
     // 以“无焦点激活”挂上浏览器：视图才会向状态栏发条目数等消息
     viewObj_->UIActivate(SVUIA_ACTIVATE_NOFOCUS);
     return true;
+}
+
+void ShellFolderView::InstallViewSubclass()
+{
+    if (!view_) return;
+    SetWindowLongPtrW(view_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+    origViewProc_ = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtrW(view_, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&ShellFolderView::ViewProcStatic)));
+}
+
+LRESULT CALLBACK ShellFolderView::ViewProcStatic(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    auto* self = reinterpret_cast<ShellFolderView*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    return self ? self->ViewProc(h, msg, wp, lp) : DefWindowProcW(h, msg, wp, lp);
+}
+
+LRESULT ShellFolderView::ViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_NOTIFY && lp) {
+        auto* nh = reinterpret_cast<NMHDR*>(lp);
+        // 内层列表发来的“双击/回车激活”：若激活项是文件夹，站内导航并吞掉，
+        // 不转给原过程即可阻止 shell 打开新的资源管理器窗口。
+        if (nh->code == NM_DBLCLK || nh->code == NM_RETURN) {
+            std::wstring folder = ActivatedFolderPath();
+            if (!folder.empty() && onBrowse) {
+                onBrowse(folder);   // 延后 PostMessage 导航（不在本视图消息链内销毁自己）
+                return 1;
+            }
+        }
+    }
+    return CallWindowProcW(origViewProc_, h, msg, wp, lp);
+}
+
+std::wstring ShellFolderView::ActivatedFolderPath() const
+{
+    if (!viewObj_) return {};
+    ComPtr<IFolderView> fv;
+    if (FAILED(viewObj_->QueryInterface(IID_PPV_ARGS(&fv))) || !fv) return {};
+    ComPtr<IEnumIDList> en;
+    if (FAILED(fv->Items(SVGIO_SELECTION, IID_PPV_ARGS(&en))) || !en) return {};
+    PIDLIST_RELATIVE rel = nullptr;
+    ULONG got = 0;
+    if (en->Next(1, &rel, &got) != S_OK || got == 0 || !rel) return {};
+    UniquePIDL abs(ILCombine(static_cast<PCIDLIST_ABSOLUTE>(dirPidl_.get()), rel));
+    CoTaskMemFree(rel);
+    wchar_t buf[MAX_PATH * 2]{};
+    if (!abs || !SHGetPathFromIDListW(static_cast<PCIDLIST_ABSOLUTE>(abs.get()), buf) || !buf[0])
+        return {};
+    DWORD fa = GetFileAttributesW(buf);
+    if (fa == INVALID_FILE_ATTRIBUTES || !(fa & FILE_ATTRIBUTE_DIRECTORY)) return {};
+    return buf;   // 虚拟位置取不到文件系统路径，返回空 -> 放行原行为
 }
 
 void ShellFolderView::Destroy()

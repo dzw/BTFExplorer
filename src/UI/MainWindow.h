@@ -62,6 +62,11 @@ struct Pane {
     int width = 340;                         // 窗格宽度（分隔条可拖）
     std::vector<size_t> tabs;                // 本窗格持有的 TabState 下标
     size_t active = 0;                       // 本窗格当前显示的分页
+    // 本窗格共享的 list 控件当前正显示哪个分页（tabs 下标；SIZE_MAX=空/未确定）。
+    // 同窗格内切分页时 list 里的行仍属于上一个分页，不能按分页自身的
+    // shownPage/pageItems 判断“无需重绘”——那会让新分页沿用旧分页的内容，
+    // 表现为“切回来还是新分页的文件列表，点刷新才正常”。
+    size_t renderedTab = SIZE_MAX;
     int lastTabRight = 0;                    // 最后一个 tab 头右缘（“+”按钮定位用）
     HWND btnNewTab = nullptr;                // 本窗格的“+”新增分页按钮
     HWND btnTools = nullptr;                 // 本窗格右上角的“▾”外部工具按钮

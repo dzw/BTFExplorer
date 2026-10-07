@@ -30,7 +30,7 @@ public:
     void Destroy();                  // 解绑并销毁视图（切回自绘列表/窗格销毁时）
     void Layout();                   // 宿主尺寸变化后让视图填满客户区
 
-    // 视图内双击文件夹/上级 -> 目标目录路径（ BrowseObject 触发；
+    // 视图内激活文件夹（双击/回车）或请求上级 -> 目标目录路径（onBrowse 触发；
     // 接收方必须延后处理：Navigate 会销毁发起回调的这个视图）
     std::function<void(const std::wstring&)> onBrowse;
     // 视图发来的状态栏文本（“N 个对象”等）
@@ -65,8 +65,19 @@ private:
     static LRESULT CALLBACK HostProcStatic(HWND, UINT, WPARAM, LPARAM);
     LRESULT HostProc(HWND, UINT, WPARAM, LPARAM);
 
+    // 视图窗口（SHELLDLL_DefView）子类化：内层 SysListView32 激活文件夹时把
+    // NM_DBLCLK/NM_RETURN 发到本视图窗口，shell 默认会 ShellExecute 出新
+    // 资源管理器窗口，并不会调用本站点的 IShellBrowser::BrowseObject。
+    // 在这里拦下“选中项是文件夹”的激活通知，转成站内导航（onBrowse），
+    // 不转给原过程即可阻止新窗口；其余消息一律原样转交。
+    static LRESULT CALLBACK ViewProcStatic(HWND, UINT, WPARAM, LPARAM);
+    LRESULT ViewProc(HWND, UINT, WPARAM, LPARAM);
+    void InstallViewSubclass();          // 每次 Navigate 新建视图后安装
+    std::wstring ActivatedFolderPath() const;  // 当前选中项若是文件夹返回其绝对路径
+
     HWND host_ = nullptr;            // 宿主窗口（窗格 tab 的子窗口，布局定位用）
     HWND view_ = nullptr;            // shell 视图窗口（SHELLDLL_DefView）
+    WNDPROC origViewProc_ = nullptr; // 视图窗口原窗口过程（子类化前）
     ComPtr<IShellView> viewObj_;
     std::wstring dir_;
     UniquePIDL dirPidl_;
