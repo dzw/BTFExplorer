@@ -10,6 +10,7 @@
 #include "DirectoryTree.h"
 #include "TrayIcon.h"
 #include "FileList.h"
+#include "PaneHost.h"
 #include "ShellFolderView.h"
 
 // 控件 ID（主窗口与 main.cpp 的加速键 / 单实例逻辑共享）
@@ -22,6 +23,7 @@ enum {
     IDC_NEWTAB_BASE = 1200,    // 每个窗格一个“+”按钮，命令 ID = IDC_NEWTAB_BASE + 窗格 tag
     IDC_TOOLS_BASE = 1210,     // 每个窗格一个“▾”外部工具按钮，命令 ID = IDC_TOOLS_BASE + tag
     IDC_VIEWMODE_BASE = 1220,  // 每个窗格一个“Q”列表实现切换按钮，命令 ID = IDC_VIEWMODE_BASE + tag
+    IDC_PANEHOST_BASE = 1240,  // 每个窗格的容器窗口（PaneHost）控件 ID = 基址 + tag
     IDC_LAYOUT1 = 1020, IDC_LAYOUT2 = 1021, IDC_LAYOUT3 = 1022, IDC_LAYOUT4 = 1023,
     IDC_TRI_PINTOP = 1024, IDC_TRI_PINDOWN = 1025,
     IDC_MENU_FILTERS = 1026,
@@ -29,6 +31,7 @@ enum {
     IDC_SETTINGS = 1028,   // 工具栏“设置”按钮（对话框控件 ID 见 SettingsDialog.cpp）
     // 分页标题右键菜单：关闭 / 关闭其他 / 关闭右边 / 锁定
     IDC_TM_LOCK = 1030, IDC_TM_CLOSE = 1031, IDC_TM_OTHERS = 1032, IDC_TM_RIGHT = 1033,
+    IDC_LAYOUT6 = 1034, IDC_LAYOUT8 = 1035,   // Alt+6 / Alt+8 排布方向（见 main.cpp 加速键）
 };
 
 // 每个右侧分页的独立状态（目录/页码/历史/加载器各自独立）
@@ -53,11 +56,14 @@ struct TabState {
     TabState() : pages(std::make_unique<PageManager>()) {}
 };
 
-// 右侧窗格：一个窗格 = 一个 Tab 容器 + 一个文件列表（两种实现可切换），
+// 右侧窗格：一个窗格 = 一个容器窗口，容器里是“分页栏 + 文件列表（两种实现可切换）”，
 // 可水平摆放多个
 static constexpr int IDC_LIST_BASE = 1100;   // 窗格列表的 ID = IDC_LIST_BASE + tag
 struct Pane {
-    HWND tab = nullptr;                      // 该窗格的 Tab 容器
+    // 窗格容器（Q-Dir 结构：容器里只放“只占标题行的分页栏 + 内容区”）。
+    // 用堆持有：panes_ 是 vector，容器对象地址必须稳定。
+    std::unique_ptr<PaneHost> host;
+    HWND tab = nullptr;                      // 该窗格的分页栏（容器之子）
     HWND list = nullptr;                     // 该窗格的自绘虚拟 ListView（默认实现）
     // FileList 用堆持有：panes_ 是 vector，扩容搬移 Pane 时列表子类过程经
     // GWLP_USERDATA 取 FileList*，地址必须稳定，不能跟着 vector 搬走
@@ -71,6 +77,8 @@ struct Pane {
     // 同窗格内切分页时 list 里的行仍属于上一个分页，不能按分页自身的
     // shownPage/pageItems 判断“无需重绘”——那会让新分页沿用旧分页的内容，
     // 表现为“切回来还是新分页的文件列表，点刷新才正常”。
+    // 新分页还没加载完时这里保持指向上一个分页（旧行留着不闪空白），
+    // 所以按行号取数据一律走 RenderedTab，不走 PaneActiveTab。
     size_t renderedTab = SIZE_MAX;
     int lastTabRight = 0;                    // 最后一个 tab 头右缘（“+”按钮定位用）
     HWND btnNewTab = nullptr;                // 本窗格的“+”新增分页按钮
@@ -210,6 +218,7 @@ private:
     int layoutCount_ = 1;               // 窗格数 1~4（Alt+1~4 切换，= panes_.size()）
     int triLayout_ = 1;                 // 3 窗格形态：0=品字形(1上2下) 1=倒品字形(2上1下)，默认倒品
     int asymMode_ = 0;                  // 不对称 3 窗格：0=关 1=1左2右(上下排) 2=2左(上下排)1右
+    int twoVert_ = 0;                   // 2 窗格形态：0=左右并排 1=上下排列
     int colSplitPermille_ = 500;        // 不对称布局里左右两栏宽度比例（千分比，可拖）
     int colSplitX_ = -1;                // 左右栏竖向分隔条 x 坐标（<0 表示当前布局无）
     int rowSplitX0_ = 0, rowSplitX1_ = 0; // 上下分隔条可命中的 x 范围（不对称时只限某一栏）
@@ -223,13 +232,15 @@ private:
     int    pendingMovePane_ = -1;       // 拖拽目标窗格
     size_t menuTab_ = SIZE_MAX;         // 右键菜单作用的分页
     bool tabDragActive_ = false;        // 分页拖拽进行中
+    // 真的发生了换序/跨窗格移动：TCN_SELCHANGE 是 tab 控件在 WM_LBUTTONDOWN 里
+    // 同步发来的，所以不能用 tabDragActive_ 当“别切页”的判据——那会连普通单击
+    // 一起吞掉（表现为点了别的分页头，列表还是原分页）。只在拖出过位置后置真。
+    bool tabDragMoved_ = false;
     int  tabDragPane_ = -1;             // 拖拽源窗格
     int  tabDragIndex_ = -1;            // 拖拽源窗格内的 tab 序号（重排后随之更新）
     // 同窗格内拖动实时重排：鼠标当前所在的目标槽位（-1=未变化）
     int  pendingReorderSlot_ = -1;
     size_t pendingReorderPane_ = SIZE_MAX; // 待重排的窗格（延后到主窗口消息循环执行）
-    DWORD lastBlankClickTime_ = 0;      // 分页栏空白区单击时间（双击检测用）
-    POINT lastBlankClickPt_ = {0, 0};   // 分页栏空白区单击位置（双击检测用）
 
     DirWatcher watcher_;                  // 外部目录变化监视（所有分页目录 + 已展开树节点）
     size_t pendingSelectPane_ = SIZE_MAX; // 延后激活的窗格（避免在 comctl 控件自身过程里重入）
@@ -245,11 +256,13 @@ private:
     void SetPaneCount(int n, bool keepAsym = false);  // Alt+1~4：窗格数量 1~4（keepAsym 用于启动恢复）
     void SetTriLayout(int t);           // 3 窗格形态：0=品字形 1=倒品字形
     void SetAsymmetricTri(int mode);    // 不对称 3 窗格：1=1左2右(上下排) 2=2左(上下排)1右
+    void SetTwoPaneVert(int v);         // 2 窗格形态：0=左右并排 1=上下排列
     int  AllocPaneTag();                // 分配未被占用的窗格编号（避免控件 ID 重复）
     void RemovePane(size_t idx);        // 销毁窗格并修正 TabState.pane 下标
     int  PaneOfList(HWND h) const;      // 列表 hwnd -> 窗格下标，-1 表示不是窗格列表
     int  PaneOfTab(HWND h) const;       // Tab 容器 hwnd -> 窗格下标
     TabState& PaneActiveTab(size_t pi); // 指定窗格当前显示的分页
+    TabState& RenderedTab(size_t pi);   // 指定窗格“列表里那几行”所属的分页
     std::wstring PaneItemPath(size_t pi, int item); // 指定窗格某行的完整路径
     void ApplySavedLayout();            // 启动时恢复上次布局（默认倒品字形）
     void ResetAllPanes();               // 销毁全部窗格/分页（启动恢复会话前清空）

@@ -18,7 +18,7 @@ static constexpr int WM_APP_PAGELOADED = WM_APP + 1;
 static constexpr UINT WM_APP_WIN_E = WM_APP + 2;   // Win+E 被拦截后激活本窗口
 static constexpr int WM_APP_CLOSE_TAB = WM_APP + 3; // 中键点击分页 -> 延后到主窗口关闭
 static constexpr int WM_APP_MOVE_TAB  = WM_APP + 4; // 拖拽分页 -> 延后到主窗口移动
-static constexpr int WM_APP_ADD_TAB   = WM_APP + 6; // 双击空白新建分页 -> 延后到主窗口添加（+5 是托盘回调）
+static constexpr int WM_APP_ADD_TAB   = WM_APP + 6; // 单击空白新建分页 -> 延后到主窗口添加（+5 是托盘回调）
 static constexpr int WM_APP_TREE_NEWTAB = WM_APP + 7;
 static constexpr int WM_APP_SELECT_PANE = WM_APP + 8;  // 延后激活窗格（重入 comctl32 会崩）
 static constexpr int WM_APP_SELECT_TAB  = WM_APP + 9;  // 延后激活分页（同上）
@@ -233,7 +233,7 @@ MainWindow* MainWindow::Create(HINSTANCE hInst)
     int w = rcWork.right - rcWork.left - 120, h = rcWork.bottom - rcWork.top - 120;
 
     self->hwnd_ = CreateWindowExW(0, wc.lpszClassName, L"分页资源管理器 - Paged Explorer",
-        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, w, h,
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, w, h,
         nullptr, nullptr, hInst, self);
     if (!self->hwnd_) { delete self; return nullptr; }
 
@@ -479,18 +479,31 @@ void MainWindow::CreatePane(Pane& p)
     HINSTANCE hInst = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd_, GWLP_HINSTANCE));
     // 编号不直接用作窗格下标：删除窗格后下标会重排，编号保持唯一，避免 ID 撞车
     p.tag = AllocPaneTag();
+    // Q-Dir 的窗格结构：容器窗口（PaneHost，WTL/ATL 实现）里面只放“只占标题行的
+    // 分页栏”和“内容区”。主窗口只管摆容器，内部怎么切分由容器自己在 WM_SIZE 里做。
+    p.host = std::make_unique<PaneHost>();
+    if (!p.host->Create(hwnd_, IDC_PANEHOST_BASE + p.tag)) {
+        WriteAppLog(L"PaneHost create failed");
+        p.host.reset();
+        return;
+    }
+    HWND host = p.host->Handle();
     p.tab = CreateWindowExW(0, WC_TABCONTROLW, L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | TCS_TABS,
-        0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RIGHTTAB + p.tag)), hInst, nullptr);
+        0, 0, 0, 0, host, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RIGHTTAB + p.tag)), hInst, nullptr);
     if (uiFont_) SendMessageW(p.tab, WM_SETFONT, (WPARAM)uiFont_, TRUE);
     // 子类化：支持分页拖拽到其它窗格
     SetWindowLongPtrW(p.tab, GWLP_USERDATA, GetWindowLongPtrW(p.tab, GWLP_WNDPROC));
     SetWindowLongPtrW(p.tab, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&PaneTabProc));
 
     // 自绘虚拟列表（默认文件列表实现，控件细节在 FileList 里维护）
+    // 列表与分页栏是容器里的兄弟窗口（不是父子）：分页栏只占标题行，
+    // 列表填满余下的内容区，位置由容器摆放。
     p.fileList = std::make_unique<FileList>();
-    p.fileList->Create(p.tab, this, uiFont_, IDC_LIST_BASE + p.tag);
+    p.fileList->Create(host, this, uiFont_, IDC_LIST_BASE + p.tag);
     p.list = p.fileList->Handle();
+    p.host->SetTabStrip(p.tab);
+    p.host->SetList(p.list);
     auto* dropTarget = new FileDropTarget(this, p.list);
     HRESULT dropResult = RegisterDragDrop(p.list, dropTarget);
     dropTarget->Release();
@@ -528,7 +541,8 @@ int MainWindow::AllocPaneTag()
     return (int)panes_.size();
 }
 
-// 销毁窗格（list 是 tab 的子窗口，随之销毁），并修正所有分页的 pane 下标
+// 销毁窗格：先拆列表（自己析构自己的窗口），再拆容器（分页栏以及还挂在容器里的
+// 视图宿主随窗口一起销毁），最后修正所有分页的 pane 下标
 void MainWindow::RemovePane(size_t idx)
 {
     if (idx >= panes_.size()) return;
@@ -540,11 +554,14 @@ void MainWindow::RemovePane(size_t idx)
         pendingReorderSlot_ = -1;
     }
     if (panes_[idx].list) RevokeDragDrop(panes_[idx].list);
-    DestroyWindow(panes_[idx].tab);
+    panes_[idx].fileList.reset();
+    panes_[idx].host.reset();
+    panes_[idx].tab = nullptr;
+    panes_[idx].list = nullptr;
     if (panes_[idx].btnNewTab) DestroyWindow(panes_[idx].btnNewTab);
     if (panes_[idx].btnViewMode) DestroyWindow(panes_[idx].btnViewMode);
     if (panes_[idx].btnTools) DestroyWindow(panes_[idx].btnTools);
-    panes_.erase(panes_.begin() + idx);   // 该窗格的分页 shell 视图宿主是 p.tab 的子窗口，随 tab 控件销毁
+    panes_.erase(panes_.begin() + idx);   // 该窗格分页的 shell 视图宿主随 TabState 析构销毁
     for (auto& t : tabs_)
         if (t.pane > idx) --t.pane;
     if (panes_.empty()) activePane_ = 0;
@@ -574,10 +591,22 @@ TabState& MainWindow::PaneActiveTab(size_t pi)
     return tabs_[p.tabs[p.active]];
 }
 
+// 列表窗口里的行归属哪个分页：切到还没加载完的分页时旧行会留着（避免闪空白），
+// 所以按行号取数据必须走这里，而不是 PaneActiveTab。
+TabState& MainWindow::RenderedTab(size_t pi)
+{
+    if (pi < panes_.size()) {
+        Pane& p = panes_[pi];
+        if (p.renderedTab != SIZE_MAX && p.renderedTab < p.tabs.size())
+            return tabs_[p.tabs[p.renderedTab]];
+    }
+    return PaneActiveTab(pi);
+}
+
 std::wstring MainWindow::PaneItemPath(size_t pi, int item)
 {
     if (pi >= panes_.size() || item < 0) return {};
-    TabState& t = PaneActiveTab(pi);
+    TabState& t = RenderedTab(pi);
     if (item >= (int)t.pageItems.size()) return {};
     return t.pageItems[item].path;
 }
@@ -697,6 +726,17 @@ void MainWindow::SetAsymmetricTri(int mode)
     SaveFavorites();
 }
 
+// 2 窗格形态：0=左右并排（Alt+4/6）1=上下排列（Alt+2/8）。
+// 无论当前几个窗格都先记住选择（并持久化），两窗格时立刻生效。
+void MainWindow::SetTwoPaneVert(int v)
+{
+    int n = v ? 1 : 0;
+    bool changed = (twoVert_ != n);
+    twoVert_ = n;
+    if (panes_.size() == 2) Layout();
+    if (changed) SaveFavorites();
+}
+
 // 启动时恢复上次布局：没有记录就用默认的倒品字形
 void MainWindow::ApplySavedLayout()
 {
@@ -752,6 +792,7 @@ void MainWindow::SaveSession()
     putLine(L"panes=" + std::to_wstring(panes_.size()));
     putLine(L"tri=" + std::to_wstring(triLayout_));
     putLine(L"asym=" + std::to_wstring(asymMode_));
+    putLine(L"twovert=" + std::to_wstring(twoVert_));
     putLine(L"col=" + std::to_wstring(colSplitPermille_));
     putLine(L"sel=" + std::to_wstring(selRank));
     putLine(L"sideWidth=" + std::to_wstring(sideWidth_));
@@ -834,6 +875,7 @@ bool MainWindow::RestoreSession()
                     std::vector<std::wstring> history; };
     int paneCount = 1, tri = 1, sel = 0, sortCol = 0, sortAsc = 1;
     int asym = 0, colSplit = 500;   // 不对称布局：模式 0/1/2 与左右栏比例
+    int twoVert = 0;                // 2 窗格形态：0=左右 1=上下
     int savedSideWidth = sideWidth_, windowMaximized = 0;
     RECT savedWindowRect{};
     bool hasSavedWindowRect = false;
@@ -867,6 +909,7 @@ bool MainWindow::RestoreSession()
             if (w.rfind(L"panes=", 0) == 0) { swscanf_s(w.c_str() + 6, L"%d", &paneCount); continue; }
             if (w.rfind(L"tri=", 0) == 0) { swscanf_s(w.c_str() + 4, L"%d", &tri); continue; }
             if (w.rfind(L"asym=", 0) == 0) { swscanf_s(w.c_str() + 5, L"%d", &asym); continue; }
+            if (w.rfind(L"twovert=", 0) == 0) { swscanf_s(w.c_str() + 8, L"%d", &twoVert); continue; }
             if (w.rfind(L"col=", 0) == 0) { swscanf_s(w.c_str() + 4, L"%d", &colSplit); continue; }
             if (w.rfind(L"sel=", 0) == 0) { swscanf_s(w.c_str() + 4, L"%d", &sel); continue; }
             if (w.rfind(L"sideWidth=", 0) == 0) {
@@ -1060,6 +1103,7 @@ bool MainWindow::RestoreSession()
     if (sortCol >= 0 && sortCol <= 3) { sortCol_ = sortCol; sortAsc_ = (sortAsc != 0); }
     triLayout_ = (tri != 0) ? 1 : 0;
     asymMode_ = (asym >= 1 && asym <= 2) ? asym : 0;
+    twoVert_ = twoVert ? 1 : 0;
     if (colSplit >= 100 && colSplit <= 900) colSplitPermille_ = colSplit;
     savedPaneCount_ = (int)panes_.size();
 
@@ -1188,15 +1232,24 @@ void MainWindow::MoveTabToPane(size_t tabIndex, size_t paneIdx)
     SendMessageW(to.tab, TCM_INSERTITEMW, inPane, reinterpret_cast<LPARAM>(&ti));
     to.active = inPane;
 
-    // 分页自带的 shell 视图宿主原本挂在源窗格的 tab 控件下；分页迁到目标窗格后
-    // 必须把宿主重新挂到目标窗格 tab 控件，否则源窗格被销毁时会连带销毁它，
-    // 且布局位置也错。重挂后交给 Layout 定位、ShowHide 控制显隐。
-    if (tabs_[tabIndex].shellView && tabs_[tabIndex].shellView->Host())
-        SetParent(tabs_[tabIndex].shellView->Host(), to.tab);
+    // 分页的 shell 视图宿主挂在“所属窗格的容器”里：迁到别的窗格必须重挂父窗口，
+    // 否则源窗格因清空被销毁时，会把它一起带走（TabState 还拿着它的句柄）。
+    if (tabs_[tabIndex].shellView) {
+        HWND viewHost = tabs_[tabIndex].shellView->Host();
+        from.host->RemoveContent(viewHost);
+        SetParent(viewHost, to.host->Handle());
+        to.host->AddContent(viewHost);
+    }
 
     // 源窗格空了：关掉它
-    if (panes_[oldPane].tabs.empty())
+    if (panes_[oldPane].tabs.empty()) {
         RemovePane(oldPane);
+    } else {
+        // 删掉的正好是选中项时，tab 控件的 cursel 会停在 -1：表头没有高亮，
+        // 列表还显示被拖走那一页的内容。选中落回钳位后的 active 并重刷。
+        SendMessageW(from.tab, TCM_SETCURSEL, static_cast<WPARAM>(from.active), 0);
+        RefreshPaneList(oldPane);
+    }
     SelectRightTab(tabIndex);
     Layout();
     UpdateWatcher();
@@ -1419,6 +1472,10 @@ void MainWindow::RemoveTab(size_t index, bool& paneEmptied)
             break;
         }
 
+    // 视图宿主登记在窗格容器里：分页没了要先摘掉，别给容器留个死句柄
+    if (tabs_[index].shellView)
+        panes_[paneIdx].host->RemoveContent(tabs_[index].shellView->Host());
+
     tabs_[index].pages->Shutdown();
     tabs_.erase(tabs_.begin() + index);
     // 窗格里记录的 tab 下标整体前移（pane 下标不受影响）
@@ -1559,8 +1616,9 @@ void MainWindow::RefreshPaneList(size_t paneIdx)
     Pane& p = panes_[paneIdx];
     TabState& t = PaneActiveTab(paneIdx);
     HWND list = p.list;
-    // 切分页：list 里的行还属于上一个分页，必须换入本分页内容（或清空等后台加载），
-    // 否则命中下面“同页且不过期就跳过重绘”的优化会沿用旧分页显示。
+    // 切分页：list 里的行还属于上一个分页，必须换入本分页内容（本分页还没加载
+    // 完就先把它的旧行换回去、或维持上一个分页的行等后台加载），否则命中下面
+    // “同页且不过期就跳过重绘”的优化会沿用旧分页显示。
     bool tabChanged = (p.renderedTab != p.active);
     t.pages->RequestPage(t.curPage); // 可能命中缓存，也可能后台加载
     if (!tabChanged && t.shownPage == t.curPage && !t.pageStale && !t.pageItems.empty()) {
@@ -1571,13 +1629,26 @@ void MainWindow::RefreshPaneList(size_t paneIdx)
             SwapInPage(paneIdx, t, list, std::move(fresh));
         } else if (!tabChanged && t.pageStale && t.shownPage == t.curPage && !t.pageItems.empty()) {
             // 同一分页的外部重载进行中：保留旧内容，加载完成后整体换入
+        } else if (tabChanged && !t.pageItems.empty()) {
+            // 切到本分页、它还留着上一次的行（可能已过期）：先原样换回本分页的内容，
+            // 后台加载完成后由 OnPageLoaded 整体换入。切分页不再清空列表，就不闪那下空白。
+            t.shownPage = SIZE_MAX;
+            p.renderedTab = p.active;
+            ListView_SetItemCountEx(list, static_cast<int>(t.pageItems.size()),
+                                    LVSICF_NOINVALIDATEALL);
+            ApplyCurrentSort(paneIdx);
+        } else if (tabChanged) {
+            // 切到一个从未加载过的分页：列表里保留上一个分页的行不动（清空会闪白），
+            // renderedTab 不更新，行数据仍按上一个分页解析；加载完成后整体换入。
+            t.shownPage = SIZE_MAX;
         } else {
-            // 翻页/首次加载/切到尚未缓存的分页：旧内容不再适用，清空等待后台加载
+            // 同一分页换目录/翻页：旧行属于别的内容，留着会误导（点它会打开不该开的项），
+            // 清空等后台加载完成
             t.pageItems.clear();
             t.shownPage = SIZE_MAX;
             ListView_SetItemCountEx(list, 0, 0);
+            p.renderedTab = p.active;
         }
-        p.renderedTab = p.active;   // list 现在归属本分页（内容或“等待加载”状态）
     }
     if (paneIdx == activePane_) { UpdateStatusBar(); UpdatePaginationBar(); }
 }
@@ -1592,6 +1663,8 @@ void MainWindow::SwapInPage(size_t paneIdx, TabState& t, HWND list,
     ApplyCurrentSort(paneIdx);   // 排序 + 0..n-1 整体重绘
     t.shownPage = t.curPage;
     t.pageStale = false;
+    if (paneIdx < panes_.size())
+        panes_[paneIdx].renderedTab = panes_[paneIdx].active;  // 列表里的行现在属于本分页
 }
 
 void MainWindow::RefreshListFromDisk()
@@ -1742,20 +1815,22 @@ void MainWindow::ApplyCurrentSort(size_t paneIdx)
         }
         return false;
     });
-    if (paneIdx < panes_.size() && !t.pageItems.empty())
+    // 列表里不是本分页的行时不重绘：重绘会按本分页的条数去刷上一个分页的行
+    if (paneIdx < panes_.size() && !t.pageItems.empty() &&
+        panes_[paneIdx].renderedTab == panes_[paneIdx].active)
         ListView_RedrawItems(panes_[paneIdx].list, 0, static_cast<int>(t.pageItems.size()) - 1);
 }
 
 // ---------------------------------------------------------------------------
 // 文件列表双实现：自绘虚拟列表（FileList） <-> shell 视图（ShellFolderView）
 // ---------------------------------------------------------------------------
-// 懒创建该分页自己的 shell 视图（宿主为窗格 tab 的子窗口），并导航到分页目录。
+// 懒创建该分页自己的 shell 视图（宿主为主窗口的子窗口，与列表重叠摆放），并导航到分页目录。
 bool MainWindow::EnsureTabShellView(size_t paneIdx, TabState& t)
 {
     if (t.shellView) return true;
     if (paneIdx >= panes_.size()) return false;
     auto sv = std::make_unique<ShellFolderView>();
-    if (!sv->Create(panes_[paneIdx].tab)) {
+    if (!sv->Create(panes_[paneIdx].host->Handle())) {
         WriteAppLog(L"ShellFolderView create failed");
         return false;
     }
@@ -1773,8 +1848,11 @@ bool MainWindow::EnsureTabShellView(size_t paneIdx, TabState& t)
                          reinterpret_cast<LPARAM>(text.c_str()));
     };
     t.shellView = std::move(sv);
+    // 视图宿主登记给容器摆放（它与自绘列表重叠，显隐由 listMode 决定）
+    panes_[paneIdx].host->AddContent(t.shellView->Host());
     if (!t.dir.empty() && !t.shellView->Navigate(t.dir)) {
         WriteAppLog((L"ShellFolderView navigate failed: " + t.dir).c_str());
+        panes_[paneIdx].host->RemoveContent(t.shellView->Host());
         t.shellView.reset();
         return false;
     }
@@ -2004,7 +2082,7 @@ bool MainWindow::GetItemText(HWND list, int item, int subItem, std::wstring& tex
 {
     int pi = PaneOfList(list);
     if (pi < 0) return false;
-    TabState& vt = PaneActiveTab((size_t)pi);
+    TabState& vt = RenderedTab((size_t)pi);
     if (item < 0 || item >= (int)vt.pageItems.size()) return false;
     FileEntry& e = vt.pageItems[item];
     switch (subItem) {
@@ -2026,7 +2104,7 @@ int MainWindow::GetItemIcon(HWND list, int item)
 {
     int pi = PaneOfList(list);
     if (pi < 0) return I_IMAGENONE;
-    TabState& vt = PaneActiveTab((size_t)pi);
+    TabState& vt = RenderedTab((size_t)pi);
     if (item < 0 || item >= (int)vt.pageItems.size()) return I_IMAGENONE;
     FileEntry& e = vt.pageItems[item];
     if (e.iconIndex < 0)
@@ -2036,8 +2114,14 @@ int MainWindow::GetItemIcon(HWND list, int item)
 
 std::wstring MainWindow::CurrentPagePath(int item) const
 {
-    if (item < 0 || item >= static_cast<int>(CurTab().pageItems.size())) return {};
-    return CurTab().pageItems[item].path;
+    // 行号来自列表控件的选中项：按“列表里当前那几行”所属的分页解析
+    if (activePane_ >= panes_.size()) return {};
+    const Pane& p = panes_[activePane_];
+    size_t slot = p.renderedTab != SIZE_MAX ? p.renderedTab : p.active;
+    if (slot >= p.tabs.size()) return {};
+    const TabState& t = tabs_[p.tabs[slot]];
+    if (item < 0 || item >= static_cast<int>(t.pageItems.size())) return {};
+    return t.pageItems[item].path;
 }
 
 bool MainWindow::SelectedPath(std::wstring& out) const
@@ -2184,6 +2268,12 @@ bool MainWindow::ReadFavoritesFromDisk(std::vector<std::wstring>& out)
             if (c >= 100 && c <= 900) colSplitPermille_ = c;
             continue;
         }
+        if (w.rfind(L"twovert=", 0) == 0) { // 两窗格形态：0=左右并排 1=上下排列
+            int v = 0;
+            swscanf_s(w.c_str() + 8, L"%d", &v);
+            twoVert_ = v ? 1 : 0;
+            continue;
+        }
         out.push_back(std::move(w));
     }
     return true;
@@ -2236,6 +2326,7 @@ void MainWindow::SaveFavoritesCore(bool allowEmptyFavorites)
     putLine(L"panes=" + std::to_wstring(panes_.size())); // 下次启动沿用窗格数量
     putLine(L"tri=" + std::to_wstring(triLayout_));      // 下次启动沿用品字形态
     putLine(L"asym=" + std::to_wstring(asymMode_));
+    putLine(L"twovert=" + std::to_wstring(twoVert_));
     putLine(L"col=" + std::to_wstring(colSplitPermille_));
     for (const auto& dir : favorites_)
         putLine(dir);
@@ -2617,7 +2708,10 @@ static LRESULT CALLBACK PaneTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         HWND parent = GetParent(h);
         if (parent) return SendMessageW(parent, m, wp, lp);
     }
-    auto* self = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(GetParent(h), GWLP_USERDATA));
+    // 分页栏现在是窗格容器的子窗口，MainWindow 只挂在主窗口上：按根窗口找，
+    // 不能按直接父窗口找（那是容器）。
+    auto* self = reinterpret_cast<MainWindow*>(
+        GetWindowLongPtrW(GetAncestor(h, GA_ROOT), GWLP_USERDATA));
     if (self) return self->PaneTabHandler(h, m, wp, lp, orig);
     return CallWindowProcW(orig, h, m, wp, lp);
 }
@@ -2709,23 +2803,6 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
         ReleaseDC(h, hdc);
         return r;
     }
-    case WM_LBUTTONDBLCLK: {
-        // 分页栏空白区双击 = 新建分页。tab 控件类带 CS_DBLCLKS，双击的第二次
-        // 点击以本消息到达。不在这里直接 AddRightTab：那会在 tab 控件自己的
-        // 窗口过程里 TCM_INSERTITEM + Layout(对它 SetWindowPos)，重入 comctl32
-        // 内部状态会把它点崩（COMCTL32 c000041d），丢给主窗口消息循环处理。
-        TCHITTESTINFO ht{};
-        ht.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        int idx = (int)SendMessageW(h, TCM_HITTEST, 0, reinterpret_cast<LPARAM>(&ht));
-        int pi = PaneOfTab(h);
-        if (idx < 0 && pi >= 0) {
-            lastBlankClickTime_ = 0;    // 收尾，避免再触发一次时间差检测
-            if (!PostMessageW(hwnd_, WM_APP_ADD_TAB, static_cast<WPARAM>(pi), 0))
-                WriteAppLog(L"ADD_TAB post failed after blank-area double-click");
-            return 0;
-        }
-        break;
-    }
     case WM_LBUTTONDOWN: {
         TCHITTESTINFO ht{};
         ht.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
@@ -2734,25 +2811,20 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
         if (idx >= 0) {
             // 记录拖拽起点，但不拦截：继续走默认过程完成 tab 切换
             tabDragActive_ = true;
+            tabDragMoved_ = false;   // 本次按下暂时只是“单击”，换序发生时才置真
             tabDragPane_ = pi;
             tabDragIndex_ = idx;
             pendingReorderPane_ = SIZE_MAX;
             pendingReorderSlot_ = -1;
             SetCapture(h);
         } else if (pi >= 0) {
-            // 分页栏空白区域：双击新建分页（不依赖 CS_DBLCLKS，自己测时间差）。
-            // 同样延后到主窗口处理，原因同 WM_LBUTTONDBLCLK 分支。
-            DWORD now = GetMessageTime();
-            if (now - lastBlankClickTime_ <= (DWORD)GetDoubleClickTime() &&
-                abs(ht.pt.x - lastBlankClickPt_.x) <= GetSystemMetrics(SM_CXDOUBLECLK) &&
-                abs(ht.pt.y - lastBlankClickPt_.y) <= GetSystemMetrics(SM_CYDOUBLECLK)) {
-                lastBlankClickTime_ = 0;
-                if (!PostMessageW(hwnd_, WM_APP_ADD_TAB, static_cast<WPARAM>(pi), 0))
-                    WriteAppLog(L"ADD_TAB post failed after blank-area double-click");
-                return 0;
-            }
-            lastBlankClickTime_ = now;
-            lastBlankClickPt_ = ht.pt;
+            // 分页栏空白区域：单击新建分页（Q-Dir 就是这么点的）。
+            // 不在这里直接 AddRightTab：那会在 tab 控件自己的窗口过程里
+            // TCM_INSERTITEM + Layout(对它 SetWindowPos)，重入 comctl32 内部状态
+            // 会把它点崩（COMCTL32 c000041d），丢给主窗口消息循环处理。
+            if (!PostMessageW(hwnd_, WM_APP_ADD_TAB, static_cast<WPARAM>(pi), 0))
+                WriteAppLog(L"ADD_TAB post failed after blank-area click");
+            return 0;
         }
         break;
     }
@@ -2761,6 +2833,10 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
             tabDragPane_ >= 0 && tabDragPane_ < (int)panes_.size()) {
             POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             POINT ctlPt = pt;                  // 本来就是 tab 控件的客户区坐标
+            // lp 是 tab 控件的客户区坐标，得先转屏幕再转主窗口客户区；直接
+            // ScreenToClient 会把客户区数值当屏幕数值用，算出来永远是负偏移，
+            // 落不进任何窗格矩形 -> 跨窗格拖拽从来没生效过。
+            ClientToScreen(h, &pt);
             ScreenToClient(hwnd_, &pt);        // 主窗口客户区坐标（窗格矩形用它判断）
             // 落在其它窗格区域 -> 移动分页（整块矩形判定：上下排也能分清）
             int dstPane = -1;
@@ -2773,6 +2849,7 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
                 if (tabDragIndex_ >= 0 && (size_t)tabDragIndex_ < panes_[tabDragPane_].tabs.size())
                     tabIndex = panes_[tabDragPane_].tabs[tabDragIndex_];
                 tabDragActive_ = false; // 拖拽状态先收尾
+                tabDragMoved_ = true;   // 跨窗格移动会增删分页头：期间的选中变化不作数
                 if (GetCapture() == h) ReleaseCapture();
                 tabDragIndex_ = -1;
                 pendingReorderPane_ = SIZE_MAX;
@@ -2804,6 +2881,7 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
                     else if (ctlPt.x < self.left && tabDragIndex_ > 0) slot = tabDragIndex_ - 1;
                 }
                 if (slot != tabDragIndex_ && pendingReorderPane_ == SIZE_MAX) {
+                    tabDragMoved_ = true;   // 换序中：增删分页头带来的选中变化不是用户点了别的分页
                     pendingReorderPane_ = (size_t)tabDragPane_;
                     pendingReorderSlot_ = slot;
                     PostMessageW(hwnd_, WM_APP_REORDER_TAB, 0, 0);
@@ -2913,8 +2991,8 @@ void MainWindow::UpdateNewTabButtons()
             ShowWindow(p.btnNewTab, SW_HIDE);
             continue;
         }
-        // 不带 SWP_NOZORDER：tab 控件铺满整个窗格矩形，若“+”被它压在下面，
-        // 拖动分页触发重绘时“+”会被擦掉，点击也会落到 tab 控件上。
+        // 不带 SWP_NOZORDER：“+”与 tab 控件是兄弟窗口，被压在下面时重绘会把它擦掉、
+        // 点击也会落到 tab 控件上，所以每次摆放都抬到最前。
         SetWindowPos(p.btnNewTab, HWND_TOP, x, y, 26, 22,
                      SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
@@ -3212,10 +3290,21 @@ void MainWindow::Layout()
     if (n == 1) {
         rects[0] = { gx, y, gx + gw, y + gh };
     } else if (n == 2) {
-        int w = rowW(0, 1);
-        rects[0] = { gx, y, gx + w, y + gh };
-        rects[1] = { gx + w + S, y, gx + gw, y + gh };
-        splitPairs_.push_back({ 0, 1 });
+        if (twoVert_ == 1) { // 上下两排（Alt+2/8）：横分隔可拖，同 3 窗格的上下排
+            int availableH = gh - S;
+            int halfH = (int)((long long)availableH * rowSplitPermille_ / 1000);
+            if (halfH < 120) halfH = 120;
+            if (availableH - halfH < 120) halfH = availableH - 120;
+            rowSplitY_ = y + halfH;
+            rects[0] = { gx, y, gx + gw, y + halfH };
+            rects[1] = { gx, y + halfH + S, gx + gw, y + gh };
+            rowSplitX0_ = gx; rowSplitX1_ = gx + gw;
+        } else {             // 左右并排（Alt+4/6）：竖分隔可拖
+            int w = rowW(0, 1);
+            rects[0] = { gx, y, gx + w, y + gh };
+            rects[1] = { gx + w + S, y, gx + gw, y + gh };
+            splitPairs_.push_back({ 0, 1 });
+        }
     } else if (n == 3) {
         int availableH = gh - S;
         int halfH = (int)((long long)availableH * rowSplitPermille_ / 1000);
@@ -3274,27 +3363,21 @@ void MainWindow::Layout()
         rowSplitX0_ = gx; rowSplitX1_ = gx + gw;
     }
 
-    RECT rrt{};
-    int rtabH = 24;
     for (size_t i = 0; i < panes_.size(); ++i) {
         Pane& p = panes_[i];
         RECT& r = rects[i];
         int w = r.right - r.left, hh = r.bottom - r.top;
-        ShowWindow(p.tab, SW_SHOW); // 曾经被隐藏过（切换布局）的窗格要恢复
-        place(p.tab, r.left, r.top, w, hh);
+        HWND host = p.host->Handle();
+        ShowWindow(host, SW_SHOW); // 曾经被隐藏过（切换布局）的窗格要恢复
+        place(host, r.left, r.top, w, hh);
         paneRects_.push_back(r);
-        SendMessageW(p.tab, TCM_GETITEMRECT, 0, reinterpret_cast<LPARAM>(&rrt));
-        rtabH = rrt.bottom - rrt.top;
-        // list 与 shell 视图宿主都是 p.tab 的子窗口，坐标相对 p.tab 客户区，
-        // 两者重叠摆放，可见性由 listMode 决定（ApplyPaneListMode）
-        place(p.list, 4, rtabH + 6, w - 8, hh - rtabH - 12);
-        // 每个分页各自持有 shell 视图宿主，全部重叠摆到列表位置；可见性由
-        // ShowHidePaneShellViews 决定，这里只保证尺寸跟随窗格
+        // 分页栏/列表/视图宿主的内部切分由容器自己做。尺寸没变时 SetWindowPos
+        // 不会发 WM_SIZE，而新建或迁入的内容窗口还停在 0 尺寸，所以显式催一次。
+        p.host->Relayout();
+        // 容器只管摆宿主窗口，宿主内部的 shell 视图要自己填满新尺寸
         for (size_t ti = 0; ti < p.tabs.size(); ++ti) {
             TabState& tt = tabs_[p.tabs[ti]];
-            if (!tt.shellView) continue;
-            place(tt.shellView->Host(), 4, rtabH + 6, w - 8, hh - rtabH - 12);
-            tt.shellView->Layout();
+            if (tt.shellView) tt.shellView->Layout();
         }
     }
 
@@ -3440,13 +3523,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
 
-    case WM_SYSKEYDOWN: // Alt+数字：窗格数量/布局；Alt+方向键：导航
-        // Alt+1~3 切换窗格数量（对称布局）；Alt+4 = 1左2右(上下排)；Alt+6 = 2左(上下排)1右
-        if (wp == '1') { SetPaneCount(1); return 0; }
-        if (wp == '2') { SetPaneCount(2); return 0; }
-        if (wp == '3') { SetPaneCount(3); return 0; }
-        if (wp == '4') { SetAsymmetricTri(1); return 0; }
-        if (wp == '6') { SetAsymmetricTri(2); return 0; }
+    case WM_SYSKEYDOWN: // Alt+方向键：导航（Alt+数字布局键走加速键 → WM_COMMAND）
         // Alt+小键盘8：品字形(1上2下)；Alt+小键盘2：倒品字形(2上1下)
         // （NumLock 关闭时小键盘 8/2 上报为 VK_UP/VK_DOWN，这里按非扩展键处理）
         if (wp == VK_NUMPAD8) { SetTriLayout(0); return 0; }
@@ -3514,8 +3591,11 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             }
         }
         else if (nm->code == TCN_SELCHANGE && PaneOfTab(nm->hwndFrom) >= 0) {
-            // 拖动分页进行中：头位置是重排造成的，不是用户点了别的分页，别切页
-            if (tabDragActive_) break;
+            // 分页真的被拖挪过位置：头的选中变化是增删分页头造成的，不是用户点了
+            // 别的分页，别切页。不能用 tabDragActive_ 判：TCN_SELCHANGE 是 tab 控件
+            // 在本次 WM_LBUTTONDOWN 里同步发来的，那时它还是 true，普通单击会被一起
+            // 吞掉——表现为点了另一个分页头，列表内容纹丝不动。
+            if (tabDragMoved_ || pendingReorderPane_ != SIZE_MAX) break;
             // 某个窗格的 tab 头点击：切换该窗格的当前分页
             int tipi = PaneOfTab(nm->hwndFrom);
             size_t inPane = (size_t)SendMessageW(panes_[tipi].tab, TCM_GETCURSEL, 0, 0);
@@ -3612,10 +3692,25 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         case IDC_TM_OTHERS: CloseOtherTabs(menuTab_); return 0;
         case IDC_TM_RIGHT:  CloseRightTabs(menuTab_); return 0;
         case IDC_TM_LOCK:   ToggleTabLock(menuTab_); return 0;
+        // Alt+数字（加速键 → 这里，见 main.cpp）：
+        //   Alt+1~3 窗格数量；
+        //   2 窗格：Alt+4/6 = 左右并排，Alt+2/8 = 上下排列；
+        //   3 窗格：Alt+4 = 1 左 + 2 右（上下排），Alt+6 = 2 左（上下排）+ 1 右。
+        //   四窗格（田字）由设置对话框选。
         case IDC_LAYOUT1: SetPaneCount(1); return 0;
-        case IDC_LAYOUT2: SetPaneCount(2); return 0;
+        case IDC_LAYOUT2:
+            if (panes_.size() == 2) SetTwoPaneVert(1); else SetPaneCount(2);
+            return 0;
         case IDC_LAYOUT3: SetPaneCount(3); return 0;
-        case IDC_LAYOUT4: SetPaneCount(4); return 0;
+        case IDC_LAYOUT4:
+            if (panes_.size() == 2) SetTwoPaneVert(0); else SetAsymmetricTri(1);
+            return 0;
+        case IDC_LAYOUT6:
+            if (panes_.size() == 2) SetTwoPaneVert(0); else SetAsymmetricTri(2);
+            return 0;
+        case IDC_LAYOUT8:
+            if (panes_.size() == 2) SetTwoPaneVert(1);
+            return 0;
         case IDC_TRI_PINTOP:  SetTriLayout(0); return 0; // 品字形：1 上 2 下
         case IDC_TRI_PINDOWN: SetTriLayout(1); return 0; // 倒品字形：2 上 1 下
         case IDC_REFRESH: PostMessageW(hwnd_, WM_APP_NAV, IDC_REFRESH, 0); return 0;   // 刷新=真正重新枚举目录（延后执行）
@@ -3669,7 +3764,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         pendingMovePane_ = -1;
         return 0;
 
-    case WM_APP_ADD_TAB:        // 双击分页栏空白（延后到这里真正新建，见 PaneTabHandler）
+    case WM_APP_ADD_TAB:        // 单击分页栏空白（延后到这里真正新建，见 PaneTabHandler）
         if (static_cast<size_t>(wp) < panes_.size())
             AddRightTab(true, static_cast<size_t>(wp));
         return 0;

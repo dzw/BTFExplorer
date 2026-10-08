@@ -19,13 +19,21 @@
   <ImportGroup Label="PropertySheets" />
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup><OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir><IntDir>$(SolutionDir)obj\$(Configuration)\</IntDir></PropertyGroup>
+  <!-- WTL 头文件已入库（third_party/wtl）；ATL 取本机 VS2019，换机器用 /p:AtlMfcDir=<atlmfc 路径> 覆盖 -->
+  <PropertyGroup Label="WTL">
+    <WtlInclude>$(ProjectDir)third_party\wtl\include</WtlInclude>
+    <AtlMfcDir Condition="'$(AtlMfcDir)'==''">C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Tools\MSVC\14.29.30133\atlmfc</AtlMfcDir>
+    <!-- 链接 atls.lib 会触发 MSBuild 的 ATL 安装检查（MSB8041），它只看当前工具集目录；
+         本机的 ATL 在 VS2019 下，所以把校验用的关键文件指向那里。 -->
+    <ATL_KeyFile>$(AtlMfcDir)\lib\x64\atls.lib</ATL_KeyFile>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <ClCompile><WarningLevel>Level4</WarningLevel><SDLCheck>true</SDLCheck><LanguageStandard>stdcpp20</LanguageStandard><AdditionalOptions>/utf-8 /FS %(AdditionalOptions)</AdditionalOptions><PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
-    <Link><SubSystem>Windows</SubSystem><AdditionalDependencies>Comctl32.lib;Shell32.lib;Ole32.lib;OleAut32.lib;Shlwapi.lib;Propsys.lib;User32.lib;Gdi32.lib;Advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+    <ClCompile><WarningLevel>Level4</WarningLevel><SDLCheck>true</SDLCheck><LanguageStandard>stdcpp20</LanguageStandard><AdditionalOptions>/utf-8 /FS %(AdditionalOptions)</AdditionalOptions><PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions><AdditionalIncludeDirectories>$(WtlInclude);$(AtlMfcDir)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories></ClCompile>
+    <Link><SubSystem>Windows</SubSystem><AdditionalLibraryDirectories>$(AtlMfcDir)\lib\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories><AdditionalDependencies>atls.lib;Comctl32.lib;Shell32.lib;Ole32.lib;OleAut32.lib;Shlwapi.lib;Propsys.lib;User32.lib;Gdi32.lib;Advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <ClCompile><WarningLevel>Level4</WarningLevel><SDLCheck>true</SDLCheck><LanguageStandard>stdcpp20</LanguageStandard><AdditionalOptions>/utf-8 /FS %(AdditionalOptions)</AdditionalOptions><PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
-    <Link><SubSystem>Windows</SubSystem><AdditionalDependencies>Comctl32.lib;Shell32.lib;Ole32.lib;OleAut32.lib;Shlwapi.lib;Propsys.lib;User32.lib;Gdi32.lib;Advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+    <ClCompile><WarningLevel>Level4</WarningLevel><SDLCheck>true</SDLCheck><LanguageStandard>stdcpp20</LanguageStandard><AdditionalOptions>/utf-8 /FS %(AdditionalOptions)</AdditionalOptions><PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions><AdditionalIncludeDirectories>$(WtlInclude);$(AtlMfcDir)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories></ClCompile>
+    <Link><SubSystem>Windows</SubSystem><AdditionalLibraryDirectories>$(AtlMfcDir)\lib\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories><AdditionalDependencies>atls.lib;Comctl32.lib;Shell32.lib;Ole32.lib;OleAut32.lib;Shlwapi.lib;Propsys.lib;User32.lib;Gdi32.lib;Advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\App\main.cpp" />
@@ -40,6 +48,7 @@
     <ClCompile Include="src\UI\FileList.cpp" />
     <ClCompile Include="src\UI\ShellFolderView.cpp" />
     <ClCompile Include="src\UI\MainWindow.cpp" />
+    <ClCompile Include="src\UI\PaneHost.cpp" />
     <ClCompile Include="src\UI\SettingsDialog.cpp" />
     <ClCompile Include="src\UI\TrayIcon.cpp" />
   </ItemGroup>
@@ -51,6 +60,7 @@
     <ClInclude Include="src\UI\FileList.h" />
     <ClInclude Include="src\UI\ShellFolderView.h" />
     <ClInclude Include="src\UI\MainWindow.h" />
+    <ClInclude Include="src\UI\PaneHost.h" />
     <ClInclude Include="src\UI\SettingsDialog.h" />
     <ClInclude Include="src\UI\TrayIcon.h" />
     <ClInclude Include="src\Util\AppLog.h" />

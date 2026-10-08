@@ -47,6 +47,7 @@ public:
     enum KeyCmd { CmdCopy, CmdCut, CmdPaste, CmdDelete, CmdDeleteNoRecycle, CmdRename, CmdEscape };
 
     bool Create(HWND parent, FileListDelegate* delegate, HFONT font, int controlId);
+    ~FileList();
     HWND Handle() const { return list_; }
 
     // “显示网格线”设置开关

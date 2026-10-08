@@ -143,10 +143,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
     }
 
     // 加速键：焦点在列表/地址栏等子控件上时也能生效（Alt+消息不会自动转到主窗口）
-    //   Alt+方向键导航，Alt+1~4 切窗格数量，Alt+小键盘8/2 切品字形态
+    //   Alt+方向键导航；Alt+1~8 排布（语义见 MainWindow 的 WM_COMMAND：
+    //   1/2/3 = 窗格数量，4/6/8 = 该窗格数下的排布方向）；Alt+小键盘8/2 切品字形态
     // 小键盘 NumLock 关闭时 8/2 会被上报成 VK_UP/VK_DOWN：
     // 8 与 Alt+Up（上级目录）冲突，保持导航；2 无冲突，额外绑 Alt+Down 兜底
-    ACCEL accel[10] = {};
+    ACCEL accel[12] = {};
     accel[0].fVirt = FVIRTKEY | FALT; accel[0].key = VK_UP;      accel[0].cmd = IDC_UP;
     accel[1].fVirt = FVIRTKEY | FALT; accel[1].key = VK_LEFT;    accel[1].cmd = IDC_BACK;
     accel[2].fVirt = FVIRTKEY | FALT; accel[2].key = VK_RIGHT;   accel[2].cmd = IDC_FORWARD;
@@ -154,10 +155,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
     accel[4].fVirt = FVIRTKEY | FALT; accel[4].key = '2';        accel[4].cmd = IDC_LAYOUT2;
     accel[5].fVirt = FVIRTKEY | FALT; accel[5].key = '3';        accel[5].cmd = IDC_LAYOUT3;
     accel[6].fVirt = FVIRTKEY | FALT; accel[6].key = '4';        accel[6].cmd = IDC_LAYOUT4;
+    // Alt+6 / Alt+8：两窗格时切排布方向，三窗格时切不对称形态（见 MainWindow 的 WM_COMMAND）
+    accel[10].fVirt = FVIRTKEY | FALT; accel[10].key = '6';      accel[10].cmd = IDC_LAYOUT6;
+    accel[11].fVirt = FVIRTKEY | FALT; accel[11].key = '8';      accel[11].cmd = IDC_LAYOUT8;
     accel[7].fVirt = FVIRTKEY | FALT; accel[7].key = VK_NUMPAD8; accel[7].cmd = IDC_TRI_PINTOP;
     accel[8].fVirt = FVIRTKEY | FALT; accel[8].key = VK_NUMPAD2; accel[8].cmd = IDC_TRI_PINDOWN;
     accel[9].fVirt = FVIRTKEY | FALT; accel[9].key = VK_DOWN;    accel[9].cmd = IDC_TRI_PINDOWN;
-    HACCEL hAccel = CreateAcceleratorTableW(accel, 10);
+    HACCEL hAccel = CreateAcceleratorTableW(accel, 12);
 
     int ret = 1;
     if (MainWindow* w = MainWindow::Create(hInst)) {

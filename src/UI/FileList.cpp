@@ -40,6 +40,13 @@ HIMAGELIST SysImageList()
 
 } // namespace filelist
 
+// 列表现在是主窗口的直接子窗口（不再随 tab 控件一起销毁），关窗格时要显式销毁
+FileList::~FileList()
+{
+    if (list_) DestroyWindow(list_);
+    list_ = nullptr;
+}
+
 bool FileList::Create(HWND parent, FileListDelegate* delegate, HFONT font, int controlId)
 {
     delegate_ = delegate;
@@ -86,9 +93,6 @@ void FileList::SetGridLines(bool show)
 // 业务动作全部经 FileListDelegate 交回主窗口。
 LRESULT FileList::Proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
-    // TEMP-DEBUG: pass-through everything
-    return origProc_ ? CallWindowProcW(origProc_, h, msg, wp, lp) : DefWindowProcW(h, msg, wp, lp);
-
     if (msg == WM_LBUTTONDOWN || msg == WM_SETCURSOR) {
         // 上下两排窗格之间的水平分隔条：命中区比可见留白宽，从列表顶部伸进来
         POINT pt{};
