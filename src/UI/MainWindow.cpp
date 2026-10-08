@@ -2913,8 +2913,10 @@ void MainWindow::UpdateNewTabButtons()
             ShowWindow(p.btnNewTab, SW_HIDE);
             continue;
         }
+        // 不带 SWP_NOZORDER：tab 控件铺满整个窗格矩形，若“+”被它压在下面，
+        // 拖动分页触发重绘时“+”会被擦掉，点击也会落到 tab 控件上。
         SetWindowPos(p.btnNewTab, HWND_TOP, x, y, 26, 22,
-                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
 }
 
