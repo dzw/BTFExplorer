@@ -1,8 +1,11 @@
 #include "PaneHost.h"
 
 #include <windows.h>
+#include <windowsx.h>
 #include <commctrl.h>
+#include <string>
 #include <vector>
+#include "../Util/AppLog.h"
 
 #include <atlbase.h>
 #include <atltypes.h>  // ATL 的 CPoint/CSize/CRect（WTL 的 MSG_WM_* 宏按这些类型拆参数）
@@ -14,6 +17,7 @@ namespace {
 constexpr int kEdgePad = 4;        // 内容区与容器左/右/下的留白
 constexpr int kStripPad = 6;       // 分页标题行下方的留白
 constexpr int kDefaultStripH = 30; // 分页头未量到时的标题行高度（24 行高 + 留白）
+constexpr wchar_t kBlankHitClass[] = L"PEShellTabBlankHit";
 }
 
 // 容器窗口本体。分页栏、列表、shell 视图宿主都由主窗口创建后登记进来，
@@ -22,6 +26,7 @@ struct PaneHost::Impl : public ATL::CWindowImpl<Impl> {
     DECLARE_WND_CLASS_EX(L"PEShellPaneHost", 0, COLOR_WINDOW + 1)
 
     HWND tab = nullptr;
+    HWND blankHit = nullptr;
     HWND list = nullptr;
     std::vector<HWND> contents;
     int stripH = kDefaultStripH;
@@ -33,6 +38,43 @@ struct PaneHost::Impl : public ATL::CWindowImpl<Impl> {
         MESSAGE_HANDLER(WM_COMMAND, ForwardToParent)
         MESSAGE_HANDLER(WM_NOTIFY, ForwardToParent)
     END_MSG_MAP()
+
+    static LRESULT CALLBACK BlankHitProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+    {
+        auto* self = reinterpret_cast<Impl*>(::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (msg == WM_NCCREATE) {
+            auto* create = reinterpret_cast<CREATESTRUCTW*>(lp);
+            self = static_cast<Impl*>(create->lpCreateParams);
+            ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        }
+        if (!self)
+            return ::DefWindowProcW(hwnd, msg, wp, lp);
+
+        if (msg == WM_ERASEBKGND) return 1;
+        if (msg == WM_PAINT) {
+            PAINTSTRUCT ps{};
+            ::BeginPaint(hwnd, &ps);
+            ::EndPaint(hwnd, &ps);
+            return 0;
+        }
+        if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK) {
+            const POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            WriteAppLog((L"TAB_BLANK_HIT event=" + std::to_wstring(msg) +
+                         L" client=" + std::to_wstring(pt.x) + L"," +
+                         std::to_wstring(pt.y)).c_str());
+            if (msg == WM_LBUTTONDBLCLK) {
+                HWND main = GetAncestor(hwnd, GA_ROOT);
+                if (!main || !::PostMessageW(
+                        main, WM_APP_PANE_TAB_BLANK_DBLCLK,
+                        reinterpret_cast<WPARAM>(self->tab), 0)) {
+                    WriteAppLog((L"TAB_BLANK_HIT post failed err=" +
+                                 std::to_wstring(GetLastError())).c_str());
+                }
+            }
+            return 0;
+        }
+        return ::DefWindowProcW(hwnd, msg, wp, lp);
+    }
 
     // ATL 默认在 PostNcDestroy 里 delete this；本对象由 PaneHost 持有，
     // 销毁窗口后还要读一眼状态，所以留给 PaneHost::~PaneHost 来删。
@@ -140,6 +182,46 @@ void PaneHost::SetTabStrip(HWND tab)
 {
     if (!impl_) return;
     impl_->tab = tab;
+    if (impl_->blankHit) SetWindowPos(impl_->blankHit, HWND_TOP, 0, 0, 0, 0,
+                                      SWP_NOACTIVATE | SWP_HIDEWINDOW);
+    if (!tab) return;
+
+    HINSTANCE instance = GetModuleHandleW(nullptr);
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    if (!GetClassInfoExW(instance, kBlankHitClass, &wc)) {
+        wc.style = CS_DBLCLKS;
+        wc.lpfnWndProc = &Impl::BlankHitProc;
+        wc.hInstance = instance;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = kBlankHitClass;
+        if (!RegisterClassExW(&wc)) {
+            WriteAppLog((L"TAB_BLANK_HIT class registration failed err=" +
+                         std::to_wstring(GetLastError())).c_str());
+            return;
+        }
+    }
+    impl_->blankHit = CreateWindowExW(
+        WS_EX_TRANSPARENT | WS_EX_NOACTIVATE, kBlankHitClass, L"",
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+        0, 0, 0, 0, hwnd_, nullptr, instance, impl_);
+    if (!impl_->blankHit)
+        WriteAppLog((L"TAB_BLANK_HIT window creation failed err=" +
+                     std::to_wstring(GetLastError())).c_str());
+}
+
+void PaneHost::SetTabBlankHitArea(const RECT& area)
+{
+    if (!impl_ || !impl_->blankHit) return;
+    const int width = area.right - area.left;
+    const int height = area.bottom - area.top;
+    if (width <= 0 || height <= 0) {
+        ShowWindow(impl_->blankHit, SW_HIDE);
+        return;
+    }
+    SetWindowPos(impl_->blankHit, HWND_TOP,
+                 area.left, area.top, width, height,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
 void PaneHost::SetList(HWND list)

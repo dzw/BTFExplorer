@@ -20,7 +20,6 @@ static constexpr int WM_APP_PAGELOADED = WM_APP + 1;
 static constexpr UINT WM_APP_WIN_E = WM_APP + 2;   // Win+E 被拦截后激活本窗口
 static constexpr int WM_APP_CLOSE_TAB = WM_APP + 3; // 中键点击分页 -> 延后到主窗口关闭
 static constexpr int WM_APP_MOVE_TAB  = WM_APP + 4; // 拖拽分页 -> 延后到主窗口移动
-static constexpr int WM_APP_ADD_TAB   = WM_APP + 6; // 双击空白新建分页 -> 延后到主窗口添加（+5 是托盘回调）
 static constexpr int WM_APP_TREE_NEWTAB = WM_APP + 7;
 static constexpr int WM_APP_SELECT_PANE = WM_APP + 8;  // 延后激活窗格（重入 comctl32 会崩）
 static constexpr int WM_APP_SELECT_TAB  = WM_APP + 9;  // 延后激活分页（同上）
@@ -2807,7 +2806,17 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
         }
         return pt.x >= sideWidth_ && pt.x <= sideWidth_ + kSplitHit;
     };
-
+    auto isTabItemAt = [&](POINT pt) {
+        int count = static_cast<int>(SendMessageW(h, TCM_GETITEMCOUNT, 0, 0));
+        for (int i = 0; i < count; ++i) {
+            RECT item{};
+            if (SendMessageW(h, TCM_GETITEMRECT, static_cast<WPARAM>(i),
+                             reinterpret_cast<LPARAM>(&item)) &&
+                PtInRect(&item, pt))
+                return true;
+        }
+        return false;
+    };
     if (m == WM_LBUTTONDOWN) {
         POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         if (isSplitterHit(pt)) {
@@ -2874,7 +2883,8 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
         ht.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         int idx = (int)SendMessageW(h, TCM_HITTEST, 0, reinterpret_cast<LPARAM>(&ht));
         int pi = PaneOfTab(h);
-        if (idx >= 0) {
+        bool onTabItem = isTabItemAt(ht.pt);
+        if (idx >= 0 && onTabItem) {
             // 记录拖拽起点，但不拦截：继续走默认过程完成 tab 切换
             tabDragActive_ = true;
             tabDragMoved_ = false;   // 本次按下暂时只是“单击”，换序发生时才置真
@@ -2883,32 +2893,6 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
             pendingReorderPane_ = SIZE_MAX;
             pendingReorderSlot_ = -1;
             SetCapture(h);
-            tabLastClickTime_ = 0;          // 点在分页头上：重新计双击
-            tabLastClickPane_ = -1;
-        } else if (pi >= 0) {
-            // 分页栏空白区域：双击新建分页（Q-Dir 是单击，这里按需求用双击；加号按钮仍是单击）。
-            // 用手工双击检测而非 WM_LBUTTONDBLCLK：comctl32 的 tab 控件类没注册
-            // CS_DBLCLKS，双击永远送不进来。判定参数与系统一致：
-            // GetDoubleClickTime() 时限 + SM_CXDOUBLECLK/SM_CYDOUBLECLK 判定矩形。
-            // 不在这里直接 AddRightTab：那会在 tab 控件自己的窗口过程里
-            // TCM_INSERTITEM + Layout(对它 SetWindowPos)，重入 comctl32 内部状态
-            // 会把它点崩（COMCTL32 c000041d），丢给主窗口消息循环处理。
-            DWORD now = GetTickCount();
-            int cx = GetSystemMetrics(SM_CXDOUBLECLK) / 2 + 1;   // 系统判定矩形半宽
-            int cy = GetSystemMetrics(SM_CYDOUBLECLK) / 2 + 1;
-            if (pi == tabLastClickPane_ &&
-                now - tabLastClickTime_ <= GetDoubleClickTime() &&
-                abs(GET_X_LPARAM(lp) - tabLastClickX_) <= cx &&
-                abs(GET_Y_LPARAM(lp) - tabLastClickY_) <= cy) {
-                tabLastClickTime_ = 0;      // 消费掉，三击不再触发
-                if (!PostMessageW(hwnd_, WM_APP_ADD_TAB, static_cast<WPARAM>(pi), 0))
-                    WriteAppLog(L"ADD_TAB post failed after blank-area double-click");
-                return 0;
-            }
-            tabLastClickTime_ = now;
-            tabLastClickX_ = GET_X_LPARAM(lp);
-            tabLastClickY_ = GET_Y_LPARAM(lp);
-            tabLastClickPane_ = pi;
         }
         break;
     }
@@ -3031,6 +3015,9 @@ void MainWindow::UpdateNewTabButtons()
 {
     for (size_t i = 0; i < panes_.size(); ++i) {
         Pane& p = panes_[i];
+        auto clearBlankHitArea = [&]() {
+            if (p.host) p.host->SetTabBlankHitArea(RECT{});
+        };
 
         // 右上角“Q”（列表实现切换）+“▾”（外部工具）：贴本窗格 tab 条的最右端
         int toolsLeft = -1;
@@ -3056,12 +3043,21 @@ void MainWindow::UpdateNewTabButtons()
             }
         }
 
-        if (p.btnNewTab == nullptr || p.tab == nullptr) continue;
+        if (p.btnNewTab == nullptr || p.tab == nullptr) {
+            clearBlankHitArea();
+            continue;
+        }
         int cnt = (int)SendMessageW(p.tab, TCM_GETITEMCOUNT, 0, 0);
-        if (cnt <= 0) { ShowWindow(p.btnNewTab, SW_HIDE); continue; }
+        if (cnt <= 0) {
+            ShowWindow(p.btnNewTab, SW_HIDE);
+            clearBlankHitArea();
+            continue;
+        }
         RECT rl{};
         if (!SendMessageW(p.tab, TCM_GETITEMRECT, cnt - 1, reinterpret_cast<LPARAM>(&rl))) {
-            ShowWindow(p.btnNewTab, SW_HIDE); continue;
+            ShowWindow(p.btnNewTab, SW_HIDE);
+            clearBlankHitArea();
+            continue;
         }
         // tab 客户区坐标 -> 主窗口坐标（不手写边框偏移）
         POINT tl{ rl.left, rl.top }, br{ rl.right, rl.bottom };
@@ -3073,12 +3069,30 @@ void MainWindow::UpdateNewTabButtons()
         // tab 太多快顶到“▾”按钮时收起“+”（分页栏放不下就别叠上去）
         if (toolsLeft >= 0 && x + 26 > toolsLeft - 2) {
             ShowWindow(p.btnNewTab, SW_HIDE);
+            clearBlankHitArea();
             continue;
         }
         // 不带 SWP_NOZORDER：“+”与 tab 控件是兄弟窗口，被压在下面时重绘会把它擦掉、
         // 点击也会落到 tab 控件上，所以每次摆放都抬到最前。
         SetWindowPos(p.btnNewTab, HWND_TOP, x, y, 26, 22,
                      SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+        RECT tabClient{};
+        if (p.host && GetClientRect(p.tab, &tabClient) && toolsLeft > x + 26) {
+            POINT area[2] = { { x + 26, 0 }, { toolsLeft, 0 } };
+            MapWindowPoints(hwnd_, p.tab, &area[0], 1);
+            MapWindowPoints(hwnd_, p.tab, &area[1], 1);
+            area[0].y = tabClient.top;
+            area[1].y = tabClient.bottom;
+            MapWindowPoints(p.tab, p.host->Handle(), &area[0], 1);
+            MapWindowPoints(p.tab, p.host->Handle(), &area[1], 1);
+            const RECT blankArea{
+                area[0].x, area[0].y, area[1].x, area[1].y
+            };
+            p.host->SetTabBlankHitArea(blankArea);
+        } else {
+            clearBlankHitArea();
+        }
     }
 }
 
@@ -3931,10 +3945,23 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         pendingMovePane_ = -1;
         return 0;
 
-    case WM_APP_ADD_TAB:        // 双击分页栏空白（延后到这里真正新建，见 PaneTabHandler）
-        if (static_cast<size_t>(wp) < panes_.size())
-            AddRightTab(true, static_cast<size_t>(wp));
+    case WM_APP_PANE_TAB_BLANK_DBLCLK: {
+        HWND tab = reinterpret_cast<HWND>(wp);
+        int pane = PaneOfTab(tab);
+        if (pane >= 0) {
+            size_t before = panes_[pane].tabs.size();
+            WriteAppLog((L"TAB_ADD_HANDLE pane=" + std::to_wstring(pane) +
+                         L" before=" + std::to_wstring(before)).c_str());
+            AddRightTab(true, static_cast<size_t>(pane));
+            WriteAppLog((L"TAB_ADD_DONE pane=" + std::to_wstring(pane) +
+                         L" after=" + std::to_wstring(
+                             static_cast<size_t>(pane) < panes_.size()
+                                 ? panes_[pane].tabs.size() : 0)).c_str());
+        } else {
+            WriteAppLog(L"TAB_ADD_INVALID tab window no longer belongs to a pane");
+        }
         return 0;
+    }
 
     case WM_APP_REORDER_TAB:    // 同窗格内拖动分页（延后到这里真正重排，见 PaneTabHandler）
         if (pendingReorderPane_ < panes_.size())
