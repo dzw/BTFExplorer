@@ -246,6 +246,12 @@ private:
     int  pendingReorderSlot_ = -1;
     size_t pendingReorderPane_ = SIZE_MAX; // 待重排的窗格（延后到主窗口消息循环执行）
 
+    // 分页栏空白双击手工检测（tab 控件类没有 CS_DBLCLKS，收不到 WM_LBUTTONDBLCLK）
+    DWORD tabLastClickTime_ = 0;        // 上次左键按下的 tick
+    int   tabLastClickX_ = 0;           // 上次左键按下的坐标（tab 控件客户区）
+    int   tabLastClickY_ = 0;
+    int   tabLastClickPane_ = -1;       // 上次按下的窗格（跨窗格不算双击）
+
     DirWatcher watcher_;                  // 外部目录变化监视（所有分页目录 + 已展开树节点）
     size_t pendingSelectPane_ = SIZE_MAX; // 延后激活的窗格（避免在 comctl 控件自身过程里重入）
     size_t pendingSelectTab_ = SIZE_MAX;  // 延后激活的分页下标（同上）

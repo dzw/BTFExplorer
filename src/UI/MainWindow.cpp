@@ -2883,22 +2883,32 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
             pendingReorderPane_ = SIZE_MAX;
             pendingReorderSlot_ = -1;
             SetCapture(h);
-        }
-        break;
-    }
-    case WM_LBUTTONDBLCLK: {
-        // 分页栏空白区域：双击新建分页（Q-Dir 是单击，这里按需求用双击；加号按钮仍是单击）。
-        // 不在这里直接 AddRightTab：那会在 tab 控件自己的窗口过程里
-        // TCM_INSERTITEM + Layout(对它 SetWindowPos)，重入 comctl32 内部状态
-        // 会把它点崩（COMCTL32 c000041d），丢给主窗口消息循环处理。
-        TCHITTESTINFO ht{};
-        ht.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        int idx = (int)SendMessageW(h, TCM_HITTEST, 0, reinterpret_cast<LPARAM>(&ht));
-        int pi = PaneOfTab(h);
-        if (idx < 0 && pi >= 0) {
-            if (!PostMessageW(hwnd_, WM_APP_ADD_TAB, static_cast<WPARAM>(pi), 0))
-                WriteAppLog(L"ADD_TAB post failed after blank-area double-click");
-            return 0;
+            tabLastClickTime_ = 0;          // 点在分页头上：重新计双击
+            tabLastClickPane_ = -1;
+        } else if (pi >= 0) {
+            // 分页栏空白区域：双击新建分页（Q-Dir 是单击，这里按需求用双击；加号按钮仍是单击）。
+            // 用手工双击检测而非 WM_LBUTTONDBLCLK：comctl32 的 tab 控件类没注册
+            // CS_DBLCLKS，双击永远送不进来。判定参数与系统一致：
+            // GetDoubleClickTime() 时限 + SM_CXDOUBLECLK/SM_CYDOUBLECLK 判定矩形。
+            // 不在这里直接 AddRightTab：那会在 tab 控件自己的窗口过程里
+            // TCM_INSERTITEM + Layout(对它 SetWindowPos)，重入 comctl32 内部状态
+            // 会把它点崩（COMCTL32 c000041d），丢给主窗口消息循环处理。
+            DWORD now = GetTickCount();
+            int cx = GetSystemMetrics(SM_CXDOUBLECLK) / 2 + 1;   // 系统判定矩形半宽
+            int cy = GetSystemMetrics(SM_CYDOUBLECLK) / 2 + 1;
+            if (pi == tabLastClickPane_ &&
+                now - tabLastClickTime_ <= GetDoubleClickTime() &&
+                abs(GET_X_LPARAM(lp) - tabLastClickX_) <= cx &&
+                abs(GET_Y_LPARAM(lp) - tabLastClickY_) <= cy) {
+                tabLastClickTime_ = 0;      // 消费掉，三击不再触发
+                if (!PostMessageW(hwnd_, WM_APP_ADD_TAB, static_cast<WPARAM>(pi), 0))
+                    WriteAppLog(L"ADD_TAB post failed after blank-area double-click");
+                return 0;
+            }
+            tabLastClickTime_ = now;
+            tabLastClickX_ = GET_X_LPARAM(lp);
+            tabLastClickY_ = GET_Y_LPARAM(lp);
+            tabLastClickPane_ = pi;
         }
         break;
     }
