@@ -7,18 +7,20 @@
 #include <windowsx.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <mmsystem.h>   // PlaySoundW / SND_* / MessageBeep
 #include <cstdio>
 #include <algorithm>
 #include <vector>
 
 #pragma comment(lib, "Comctl32.lib")
 #pragma comment(lib, "Shlwapi.lib")
+#pragma comment(lib, "Winmm.lib")
 
 static constexpr int WM_APP_PAGELOADED = WM_APP + 1;
 static constexpr UINT WM_APP_WIN_E = WM_APP + 2;   // Win+E 被拦截后激活本窗口
 static constexpr int WM_APP_CLOSE_TAB = WM_APP + 3; // 中键点击分页 -> 延后到主窗口关闭
 static constexpr int WM_APP_MOVE_TAB  = WM_APP + 4; // 拖拽分页 -> 延后到主窗口移动
-static constexpr int WM_APP_ADD_TAB   = WM_APP + 6; // 单击空白新建分页 -> 延后到主窗口添加（+5 是托盘回调）
+static constexpr int WM_APP_ADD_TAB   = WM_APP + 6; // 双击空白新建分页 -> 延后到主窗口添加（+5 是托盘回调）
 static constexpr int WM_APP_TREE_NEWTAB = WM_APP + 7;
 static constexpr int WM_APP_SELECT_PANE = WM_APP + 8;  // 延后激活窗格（重入 comctl32 会崩）
 static constexpr int WM_APP_SELECT_TAB  = WM_APP + 9;  // 延后激活分页（同上）
@@ -48,6 +50,7 @@ static constexpr UINT EN_ADDR_RETURN = 0x1000;
 // （命中区比留白宽，好抓；不改变布局）
 static constexpr int kSplitGap = 3;
 static constexpr int kSplitHit = 6;
+static constexpr int kPreviewHalf = 8;   // 拖动预览浮窗半宽（中间 kSplitGap 才是可见线）
 
 static LRESULT CALLBACK AddressProc(HWND h, UINT m, WPARAM wp, LPARAM lp); // 前向声明
 static LRESULT CALLBACK PaneTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp); // 分页拖拽 tab 子类化
@@ -293,6 +296,7 @@ void MainWindow::OpenSettings()
     if (data.paneCount < 1) data.paneCount = 1;
     if (data.paneCount > 4) data.paneCount = 4;
     data.triLayout = triLayout_;
+    data.navSound = navSound_;
     if (!settings::GetAutoStart(data.autoStart)) return;
     const bool prevAutoStart = data.autoStart;
 
@@ -305,6 +309,7 @@ void MainWindow::OpenSettings()
         }
         if (d.autoStart != prevAutoStart)
             settings::SetAutoStart(d.autoStart);
+        navSound_ = d.navSound;
         if (d.pagination != paginationEnabled_) {
             paginationEnabled_ = d.pagination;
             CurTab().curPage = 0;
@@ -799,6 +804,7 @@ void MainWindow::SaveSession()
     // 设置界面里的开关也要记住，重启后继续生效
     putLine(L"grid=" + std::to_wstring(showGridLines_ ? 1 : 0));
     putLine(L"pagination=" + std::to_wstring(paginationEnabled_ ? 1 : 0));
+    putLine(L"navsound=" + std::to_wstring(navSound_ ? 1 : 0));
     putLine(L"pageSize=" + std::to_wstring(pageSize_));
     // 记录窗口位置/尺寸。
     // 非最大化/最小化时改用 GetWindowRect 取“真实屏幕矩形”，这样能正确捕获
@@ -960,6 +966,10 @@ bool MainWindow::RestoreSession()
             }
             if (w.rfind(L"pagination=", 0) == 0) {
                 paginationEnabled_ = (_wtoi(w.c_str() + 11) != 0);
+                continue;
+            }
+            if (w.rfind(L"navsound=", 0) == 0) {
+                navSound_ = (_wtoi(w.c_str() + 9) != 0);
                 continue;
             }
             if (w.rfind(L"pageSize=", 0) == 0) {
@@ -1551,10 +1561,65 @@ static std::wstring NormalizePath(const std::wstring& in)
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// 导航音：只在某个窗格真的换了目录时响一声。语义对齐 Q-Dir（反编译 decompile/
+// 455021.c：触发点在“目录装进本窗格视图”之后，受 audio_click 开关和每窗格静音
+// 标志约束）——所以切分页、刷新、启动恢复都不该响，而树点击/双击文件夹/前进后
+// 退该响。音色优先用系统的“浏览文件夹”事件音，系统没配时退回 MessageBeep 短音。
+// ---------------------------------------------------------------------------
+static std::wstring SystemNavigatingSound()
+{
+    // 每个事件音的 wav 路径放在 .Current/.Modified/.Default 这些**子键**的默认值里，
+    // 不是 Navigating 下的同名值（按值名查会得到 ERROR_FILE_NOT_FOUND）。
+    static const wchar_t* kSubKeys[] = { L".Current", L".Modified", L".Default" };
+    for (const wchar_t* sub : kSubKeys) {
+        std::wstring full = L"AppEvents\\Schemes\\Apps\\Explorer\\Navigating\\";
+        full += sub;
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, full.c_str(), 0, KEY_READ, &key) != ERROR_SUCCESS)
+            continue;
+        wchar_t raw[MAX_PATH * 2]{};
+        DWORD cb = sizeof(raw), type = 0;
+        LSTATUS st = RegQueryValueExW(key, nullptr, nullptr, &type,
+                                      reinterpret_cast<LPBYTE>(raw), &cb);
+        RegCloseKey(key);
+        if (st != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ) || !raw[0])
+            continue;
+        wchar_t expanded[MAX_PATH * 2]{};
+        DWORD n = ExpandEnvironmentStringsW(raw, expanded, static_cast<DWORD>(MAX_PATH * 2));
+        return (n > 0 && n < MAX_PATH * 2) ? expanded : raw;
+    }
+    return {};
+}
+
+void MainWindow::PlayNavSound()
+{
+    // restoreInProgress_ = 启动恢复会话期间的换目录，同 Q-Dir 的静音标志
+    if (!navSound_ || navSoundMute_ || restoreInProgress_) return;
+    std::wstring wav = SystemNavigatingSound();
+    if (!wav.empty()) {
+        if (PlaySoundW(wav.c_str(), nullptr, SND_ASYNC | SND_FILENAME)) {
+            WriteAppLog((L"NAVSOUND playsound " + wav).c_str());
+            return;
+        }
+        WriteAppLog((L"NAVSOUND playsound FAILED " + wav).c_str());
+    }
+    MessageBeep(static_cast<UINT>(-1));
+    WriteAppLog(L"NAVSOUND messagebeep (no system navigating sound)");
+}
+
+// 程序化换目录（地址栏提交这类不算“用户浏览”的路径）临时静音
+struct NavMuteGuard {
+    bool* p;
+    explicit NavMuteGuard(bool* on) : p(on) { *p = true; }
+    ~NavMuteGuard() { *p = false; }
+};
+
 void MainWindow::Navigate(const std::wstring& rawPath, bool addHistory)
 {
     std::wstring path = NormalizePath(rawPath);
     TabState& t = CurTab();
+    const bool dirChanged = (t.dir != path);
     t.dir = path;
     t.curPage = 0;
     t.pageItems.clear();
@@ -1579,6 +1644,7 @@ void MainWindow::Navigate(const std::wstring& rawPath, bool addHistory)
     UpdateRightTabLabels();
     UpdateWatcher();
     SyncShellView(activePane_);   // 窗格处于 shell 视图模式时让视图跟着换目录
+    if (dirChanged) PlayNavSound();   // 换目录确认音（Q-Dir 同款语义）
 }
 
 // 目录树 / 收藏 的跳转入口。
@@ -2817,13 +2883,21 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
             pendingReorderPane_ = SIZE_MAX;
             pendingReorderSlot_ = -1;
             SetCapture(h);
-        } else if (pi >= 0) {
-            // 分页栏空白区域：单击新建分页（Q-Dir 就是这么点的）。
-            // 不在这里直接 AddRightTab：那会在 tab 控件自己的窗口过程里
-            // TCM_INSERTITEM + Layout(对它 SetWindowPos)，重入 comctl32 内部状态
-            // 会把它点崩（COMCTL32 c000041d），丢给主窗口消息循环处理。
+        }
+        break;
+    }
+    case WM_LBUTTONDBLCLK: {
+        // 分页栏空白区域：双击新建分页（Q-Dir 是单击，这里按需求用双击；加号按钮仍是单击）。
+        // 不在这里直接 AddRightTab：那会在 tab 控件自己的窗口过程里
+        // TCM_INSERTITEM + Layout(对它 SetWindowPos)，重入 comctl32 内部状态
+        // 会把它点崩（COMCTL32 c000041d），丢给主窗口消息循环处理。
+        TCHITTESTINFO ht{};
+        ht.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        int idx = (int)SendMessageW(h, TCM_HITTEST, 0, reinterpret_cast<LPARAM>(&ht));
+        int pi = PaneOfTab(h);
+        if (idx < 0 && pi >= 0) {
             if (!PostMessageW(hwnd_, WM_APP_ADD_TAB, static_cast<WPARAM>(pi), 0))
-                WriteAppLog(L"ADD_TAB post failed after blank-area click");
+                WriteAppLog(L"ADD_TAB post failed after blank-area double-click");
             return 0;
         }
         break;
@@ -3200,6 +3274,81 @@ void MainWindow::RunPaneTool(size_t paneIdx, const std::wstring& name,
     }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+}
+
+// ---------------------------------------------------------------------------
+// 目录树分隔条的拖动预览
+// ---------------------------------------------------------------------------
+
+// 预览线窗口：整块用 COLOR_WINDOW 填底并设为 transparent color key，只留中间
+// 一条竖线可见。必须是独立的浮窗：拖动时预览位置压在侧栏/窗格这些子窗口上面，
+// 画在主窗口 DC 上会被子窗口盖住。
+static LRESULT CALLBACK SplitPreviewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
+{
+    if (m == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc{};
+        GetClientRect(h, &rc);
+        FillRect(dc, &rc, GetSysColorBrush(COLOR_WINDOW));
+        int mid = rc.right / 2;
+        RECT bar{ mid - kSplitGap / 2, rc.top, mid + kSplitGap / 2 + 1, rc.bottom };
+        FillRect(dc, &bar, GetSysColorBrush(COLOR_BTNFACE));
+        DrawEdge(dc, &bar, BDR_SUNKENOUTER, EDGE_SUNKEN);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+
+// 侧栏宽度的合法区间：最窄 150，右侧至少留 260
+int MainWindow::ClampedSideWidth(int x) const
+{
+    RECT rc{};
+    GetClientRect(hwnd_, &rc);
+    int maxW = rc.right - 260;
+    if (maxW < 150) maxW = 150;
+    return (x < 150) ? 150 : (x > maxW ? maxW : x);
+}
+
+void MainWindow::ShowSplitPreview(int x)
+{
+    if (!splitPreview_) {
+        static ATOM cls = 0;
+        HINSTANCE hInst = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd_, GWLP_HINSTANCE));
+        const wchar_t* PREVIEW_CLASS = L"PESplitPreview";
+        if (!cls) {
+            WNDCLASSW wc = {};
+            wc.lpfnWndProc = &SplitPreviewProc;
+            wc.hInstance = hInst;
+            wc.lpszClassName = PREVIEW_CLASS;
+            cls = RegisterClassW(&wc);
+            if (!cls && GetLastError() == ERROR_CLASS_ALREADY_EXISTS) cls = 1;
+        }
+        if (!cls) return;
+        splitPreview_ = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            PREVIEW_CLASS, nullptr, WS_POPUP, 0, 0, kPreviewHalf * 2, kPreviewHalf * 2,
+            hwnd_, nullptr, hInst, nullptr);
+        if (!splitPreview_) return;
+        SetLayeredWindowAttributes(splitPreview_, GetSysColor(COLOR_WINDOW), 0, LWA_COLORKEY);
+    }
+    splitPreviewX_ = x;
+    // 客户区 -> 屏幕：直接加窗口矩形原点会把标题栏/菜单栏算漏
+    POINT tl{ x - kPreviewHalf, splitTop_ };
+    ClientToScreen(hwnd_, &tl);
+    int h = (splitBot_ > splitTop_ ? splitBot_ - splitTop_ : 1);
+    SetWindowPos(splitPreview_, HWND_TOPMOST, tl.x, tl.y, kPreviewHalf * 2, h,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+void MainWindow::CloseSplitPreview()
+{
+    if (splitPreview_) {
+        DestroyWindow(splitPreview_);
+        splitPreview_ = nullptr;
+    }
+    splitPreviewX_ = -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -3692,10 +3841,12 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         case IDC_TM_OTHERS: CloseOtherTabs(menuTab_); return 0;
         case IDC_TM_RIGHT:  CloseRightTabs(menuTab_); return 0;
         case IDC_TM_LOCK:   ToggleTabLock(menuTab_); return 0;
-        // Alt+数字（加速键 → 这里，见 main.cpp）：
+        // Alt+数字（加速键 → 这里，见 main.cpp；2/4/6/8 主键盘行与小键盘行都绑）：
         //   Alt+1~3 窗格数量；
-        //   2 窗格：Alt+4/6 = 左右并排，Alt+2/8 = 上下排列；
-        //   3 窗格：Alt+4 = 1 左 + 2 右（上下排），Alt+6 = 2 左（上下排）+ 1 右。
+        //   2 窗格：Alt+4/6（含小键盘）= 左右并排，Alt+2/8（含小键盘）= 上下排列；
+        //   3 窗格：Alt+4 = 1 大窗格在左 + 2 小窗格在右（上下排），
+        //            Alt+6 = 2 小窗格在左（上下排）+ 1 大窗格在右，
+        //            Alt+小键盘8 = 品字形（1 上 2 下），Alt+小键盘2 = 倒品字形（2 上 1 下）。
         //   四窗格（田字）由设置对话框选。
         case IDC_LAYOUT1: SetPaneCount(1); return 0;
         case IDC_LAYOUT2:
@@ -3711,8 +3862,13 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         case IDC_LAYOUT8:
             if (panes_.size() == 2) SetTwoPaneVert(1);
             return 0;
-        case IDC_TRI_PINTOP:  SetTriLayout(0); return 0; // 品字形：1 上 2 下
-        case IDC_TRI_PINDOWN: SetTriLayout(1); return 0; // 倒品字形：2 上 1 下
+        // 小键盘 8/2：两窗格时按“上下排列”处理，三窗格时才是品字/倒品字
+        case IDC_TRI_PINTOP:
+            if (panes_.size() == 2) SetTwoPaneVert(1); else SetTriLayout(0);
+            return 0;
+        case IDC_TRI_PINDOWN:
+            if (panes_.size() == 2) SetTwoPaneVert(1); else SetTriLayout(1);
+            return 0;
         case IDC_REFRESH: PostMessageW(hwnd_, WM_APP_NAV, IDC_REFRESH, 0); return 0;   // 刷新=真正重新枚举目录（延后执行）
         case IDC_MENU_FILTERS:
             shell::OpenContextMenuFilterSettings(hwnd_);
@@ -3741,6 +3897,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                 if (buf[0] && buf != CurTab().dir) {
                     // 锁定只挡关闭与地址变化：激活的是锁定分页时，改走侧栏同款逻辑，
                     // 在同一窗格里新开一个分页打开新地址，不动锁定分页本身
+                    NavMuteGuard mute(&navSoundMute_);   // Q-Dir：地址栏提交不响导航音
                     if (CurTab().locked) NavigateFromSidebar(buf);
                     else Navigate(buf);
                 }
@@ -3764,7 +3921,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         pendingMovePane_ = -1;
         return 0;
 
-    case WM_APP_ADD_TAB:        // 单击分页栏空白（延后到这里真正新建，见 PaneTabHandler）
+    case WM_APP_ADD_TAB:        // 双击分页栏空白（延后到这里真正新建，见 PaneTabHandler）
         if (static_cast<size_t>(wp) < panes_.size())
             AddRightTab(true, static_cast<size_t>(wp));
         return 0;
@@ -4005,6 +4162,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             draggingSplitter_ = true;
             SetCapture(hwnd_);
             SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
+            ShowSplitPreview(ClampedSideWidth(x));   // 按下就给出位置提示，不等第一次移动
             return 0;
         }
         break;
@@ -4065,15 +4223,23 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         if (draggingSplitter_) {
-            int x = static_cast<int>(GET_X_LPARAM(lp));
-            RECT rc; GetClientRect(hwnd_, &rc);
-            int maxW = rc.right - 260;                 // 右侧至少留 260px
-            int nw = (x < 150) ? 150 : (x > maxW ? maxW : x);
-            if (nw != sideWidth_) { sideWidth_ = nw; Layout(); }
+            // 拖动过程中只移动预览线，不重排（Q-Dir 的做法，见 WM_LBUTTONUP）
+            ShowSplitPreview(ClampedSideWidth(static_cast<int>(GET_X_LPARAM(lp))));
             return 0;
         }
         break;
     case WM_LBUTTONUP:
+        // 目录树分隔条在这里收尾：先清标志，免得 ReleaseCapture 触发的
+        // WM_CAPTURECHANGED 又按“取消”处理一遍
+        if (draggingSplitter_) {
+            draggingSplitter_ = false;
+            int nw = splitPreviewX_ >= 0 ? splitPreviewX_
+                                         : ClampedSideWidth(static_cast<int>(GET_X_LPARAM(lp)));
+            ReleaseCapture();
+            CloseSplitPreview();
+            if (nw != sideWidth_) { sideWidth_ = nw; Layout(); }
+            return 0;
+        }
         if (colSplitDragging_) {
             colSplitDragging_ = false;
             ReleaseCapture();
@@ -4090,9 +4256,17 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             ReleaseCapture();
             return 0;
         }
+        break;
+    case WM_CAPTURECHANGED:
+        // 拖动途中被别的窗口抢走捕获（例如弹出菜单/切到别的程序）：
+        // 按当前预览位置收尾，别把预览线留在屏幕上。
         if (draggingSplitter_) {
             draggingSplitter_ = false;
-            ReleaseCapture();
+            if (splitPreviewX_ >= 0 && splitPreviewX_ != sideWidth_) {
+                sideWidth_ = splitPreviewX_;
+                Layout();
+            }
+            CloseSplitPreview();
             return 0;
         }
         break;

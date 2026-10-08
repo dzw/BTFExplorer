@@ -109,6 +109,10 @@ private:
     // UI 构建
     void BuildChildren();
     void Layout();
+    // 目录树分隔条拖动预览：拖动过程中只移动一条浮在上面的竖线，松手才改宽度
+    void ShowSplitPreview(int x);   // 主窗口客户区 x（已钳位）
+    void CloseSplitPreview();       // 销毁预览窗口
+    int ClampedSideWidth(int x) const;
     void CreateSidePanel();          // 左侧 Tab 容器：目录树 / 收藏
     void SwitchSideTab(int index);   // 切换 tab 显示
     void SyncTreeToCurrentTab(bool showErrors = true);
@@ -200,6 +204,8 @@ private:
     bool draggingSplitter_ = false;
     int splitTop_ = 36;            // 分隔条可拖动的水平范围
     int splitBot_ = 0;
+    HWND splitPreview_ = nullptr;  // 拖动中的预览线窗口（见 ShowSplitPreview）
+    int splitPreviewX_ = -1;       // 预览线当前位置（主窗口客户区 x）
 
     // ---- 多窗格 / 多分页状态 ----
     std::vector<TabState> tabs_;        // 全部分页（按 pane 字段归属窗格）
@@ -226,8 +232,6 @@ private:
     int  savedPaneCount_ = 1;           // favorites.txt 的 panes= 恢复值
     bool startupLayoutApplied_ = false; // 启动恢复只做一次
     size_t pendingCloseTab_ = SIZE_MAX; // 中键点击待关闭的分页（延后到下一次消息循环）
-    size_t pendingAddTabPane_ = SIZE_MAX; // 双击空白待新建分页的窗格（延后处理，避免在
-                                          // tab 控件自己的窗口过程里 TCM_INSERTITEM/重排）
     size_t pendingMoveTab_ = SIZE_MAX;  // 拖拽待移动的分页
     int    pendingMovePane_ = -1;       // 拖拽目标窗格
     size_t menuTab_ = SIZE_MAX;         // 右键菜单作用的分页
@@ -303,4 +307,9 @@ private:
     int sortCol_ = 0;      // 排序列（全局记住）
     bool sortAsc_ = true;
     bool showGridLines_ = true;  // 文件列表是否画网格线（设置界面可关）
+    // 导航音：窗格真正换目录时响一声（Q-Dir 的 audio_click）。程序化换目录
+    // （启动恢复、地址栏提交、刷新）期间由 navSoundMute_ 静音。
+    bool navSound_ = true;
+    bool navSoundMute_ = false;
+    void PlayNavSound();
 };

@@ -16,6 +16,7 @@ enum {
     IDC_OPT_TRI_TOP = 1045, IDC_OPT_TRI_DOWN = 1046,
     IDC_OPT_PAGING = 1047, IDC_OPT_STARTUP = 1048,
     IDC_OPT_APPLY = 1049,   // “应用”按钮（即时生效，对话框不关闭）
+    IDC_OPT_NAVSOUND = 1050,
 };
 
 constexpr wchar_t kDlgClass[] = L"PagedExplorerSettingsBox";
@@ -23,7 +24,7 @@ constexpr wchar_t kRunKey[]    = L"Software\\Microsoft\\Windows\\CurrentVersion\
 constexpr wchar_t kRunValue[]  = L"PagedExplorer";
 
 // 对话框尺寸（高度要盖住非客户区：标题栏 + 边框约占 30px）
-constexpr int kDlgW = 404, kDlgH = 330;
+constexpr int kDlgW = 404, kDlgH = 356;
 
 // 模态期间共享的状态（同一时刻只有一个设置对话框）
 struct State {
@@ -71,6 +72,7 @@ void ReadControls(HWND h)
     g.data.paneCount  = RadioChecked(h, IDC_OPT_PANES1, 4) + 1;
     g.data.triLayout  = RadioChecked(h, IDC_OPT_TRI_TOP, 2);
     g.data.autoStart  = (Button_GetCheck(GetDlgItem(h, IDC_OPT_STARTUP)) == BST_CHECKED);
+    g.data.navSound   = (Button_GetCheck(GetDlgItem(h, IDC_OPT_NAVSOUND)) == BST_CHECKED);
 }
 
 LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
@@ -246,9 +248,14 @@ bool Show(HWND owner, HFONT font, SettingsData& data,
     SetCheck(dlg, IDC_OPT_TRI_TOP, g.data.triLayout == 0);
     SetCheck(dlg, IDC_OPT_TRI_DOWN, g.data.triLayout != 0);
 
+    // ---- 声音 ----
+    lab(L"声音", 20, 204, 200);
+    HWND cNav = chk(L"窗格换目录时播放导航音（系统“浏览文件夹”音效）", IDC_OPT_NAVSOUND, 34, 226);
+    Button_SetCheck(cNav, g.data.navSound ? BST_CHECKED : BST_UNCHECKED);
+
     // ---- 启动 ----
-    lab(L"启动", 20, 206, 200);
-    HWND cStart = chk(L"Windows 启动时运行本应用", IDC_OPT_STARTUP, 34, 228);
+    lab(L"启动", 20, 256, 200);
+    HWND cStart = chk(L"Windows 启动时运行本应用", IDC_OPT_STARTUP, 34, 278);
     Button_SetCheck(cStart, g.data.autoStart ? BST_CHECKED : BST_UNCHECKED);
 
     // 按钮贴客户区底部：以前用 kDlgH-40 定位，没扣掉标题栏/边框高度，

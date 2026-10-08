@@ -21,6 +21,7 @@ struct SettingsData {
     int  paneCount  = 1;      // 窗格数量 1~4
     int  triLayout  = 1;      // 三窗格排列：0=品字形(1上2下) 1=倒品字形(2上1下)
     bool autoStart  = false;  // 开机自启动
+    bool navSound   = true;   // 窗格换目录时播放导航音
 };
 
 namespace settings {
