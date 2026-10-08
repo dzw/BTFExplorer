@@ -224,7 +224,10 @@ private:
     size_t menuTab_ = SIZE_MAX;         // 右键菜单作用的分页
     bool tabDragActive_ = false;        // 分页拖拽进行中
     int  tabDragPane_ = -1;             // 拖拽源窗格
-    int  tabDragIndex_ = -1;            // 拖拽源窗格内的 tab 序号
+    int  tabDragIndex_ = -1;            // 拖拽源窗格内的 tab 序号（重排后随之更新）
+    // 同窗格内拖动实时重排：鼠标当前所在的目标槽位（-1=未变化）
+    int  pendingReorderSlot_ = -1;
+    size_t pendingReorderPane_ = SIZE_MAX; // 待重排的窗格（延后到主窗口消息循环执行）
     DWORD lastBlankClickTime_ = 0;      // 分页栏空白区单击时间（双击检测用）
     POINT lastBlankClickPt_ = {0, 0};   // 分页栏空白区单击位置（双击检测用）
 
@@ -266,6 +269,8 @@ private:
     // force=true 时忽略锁定（中键关闭是用户对该分页的明确操作）
     void CloseRightTab(size_t index, bool force = false);
     void MoveTabToPane(size_t tabIndex, size_t paneIdx); // 分页拖拽移动
+    void ReorderTabInPane(size_t paneIdx, int toSlot);   // 拖动中实时重排被拖的分页
+    std::wstring PaneTabLabel(size_t paneIdx, int slot) const; // 分页头显示文本
     void UpdateRightTabLabels();
     void UpdateNewTabButtons(); // 每个窗格的“+”按钮贴在其最后一个分页头右侧
     void ShowPaneToolsMenu(size_t paneIdx); // 窗格右上角“▾”：外部工具下拉菜单（可配置）

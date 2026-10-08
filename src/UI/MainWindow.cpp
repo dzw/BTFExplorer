@@ -28,6 +28,7 @@ static constexpr int WM_APP_DIR_CHANGED  = WM_APP + 12;
 static constexpr int WM_APP_OPEN_PATH   = WM_APP + 13; // 延后打开列表双击的目录（锁定分页则新开分页）
 static constexpr int WM_APP_NAV         = WM_APP + 14; // 延后工具栏导航（后退/前进/上级/刷新） // 外部目录变化（DirWatcher 投递） // 延后弹出分页头右键菜单 // 延后翻页（同上） // 目录树中键 -> 延后到主窗口新开分页
 static constexpr int WM_APP_TREE_NAV    = WM_APP + 15; // 目录树选中变化 -> 延后导航（shell 树控件消息链外执行）
+static constexpr int WM_APP_REORDER_TAB = WM_APP + 18; // 同窗格内拖动分页 -> 延后重排（不在 tab 控件过程里改条目）
 
 // 当前焦点窗格顶部分页栏的整行底色（淡粉绿）：涂在分页头之间的空隙上，
 // 分页头本身保持系统外观（见 PaneTabHandler 的 WM_PAINT）
@@ -535,6 +536,8 @@ void MainWindow::RemovePane(size_t idx)
         tabDragActive_ = false;    // 拖拽源/目标没了，别再引用旧下标
         tabDragPane_ = -1;
         tabDragIndex_ = -1;
+        pendingReorderPane_ = SIZE_MAX;
+        pendingReorderSlot_ = -1;
     }
     if (panes_[idx].list) RevokeDragDrop(panes_[idx].list);
     DestroyWindow(panes_[idx].tab);
@@ -733,12 +736,24 @@ void MainWindow::SaveSession()
         fwrite(buf.data(), 1, buf.size(), f);
     };
 
+    // 按“窗格内的槽位顺序”写分页：tabs_ 是创建顺序，直接按它写会把拖动重排
+    // 的结果丢掉（重启后分页又回到原来的左右次序）。
+    // sel= 记的是分页在 tabs_ 里的下标，而恢复时按本文件的写出顺序重建，
+    // 所以要先算出“当前分页在写出名次里排第几”。
+    int selRank = -1, rank = 0;
+    for (size_t pi = 0; pi < panes_.size(); ++pi)
+        for (size_t k = 0; k < panes_[pi].tabs.size(); ++k) {
+            if (panes_[pi].tabs[k] == activeTab_) selRank = rank;
+            ++rank;
+        }
+    if (selRank < 0) selRank = (int)activeTab_;
+
     putLine(L"sort=" + std::to_wstring(sortCol_) + L"," + std::to_wstring(sortAsc_ ? 1 : 0));
     putLine(L"panes=" + std::to_wstring(panes_.size()));
     putLine(L"tri=" + std::to_wstring(triLayout_));
     putLine(L"asym=" + std::to_wstring(asymMode_));
     putLine(L"col=" + std::to_wstring(colSplitPermille_));
-    putLine(L"sel=" + std::to_wstring(activeTab_));
+    putLine(L"sel=" + std::to_wstring(selRank));
     putLine(L"sideWidth=" + std::to_wstring(sideWidth_));
     // 设置界面里的开关也要记住，重启后继续生效
     putLine(L"grid=" + std::to_wstring(showGridLines_ ? 1 : 0));
@@ -781,20 +796,23 @@ void MainWindow::SaveSession()
     }
     putLine(L"widths=" + widths);
 
-    for (size_t i = 0; i < tabs_.size(); ++i) {
-        const TabState& t = tabs_[i];
-        putLine(L"[tab]");
-        putLine(L"pane=" + std::to_wstring(t.pane));
-        putLine(L"locked=" + std::to_wstring(t.locked ? 1 : 0));
-        // 文件列表实现属于分页（0=自绘虚拟列表 1=shell 视图），不是窗格
-        putLine(L"listmode=" + std::to_wstring(t.listMode));
-        putLine(L"hist=" + std::to_wstring(t.histPos));
-        std::wstring hist = t.history.empty() ? t.dir : t.history[0];
-        for (size_t k = 1; k < t.history.size(); ++k) {
-            hist += L"|";
-            hist += t.history[k];
+    for (size_t pi = 0; pi < panes_.size(); ++pi) {
+        for (size_t k = 0; k < panes_[pi].tabs.size(); ++k) {
+            size_t i = panes_[pi].tabs[k];
+            const TabState& t = tabs_[i];
+            putLine(L"[tab]");
+            putLine(L"pane=" + std::to_wstring(t.pane));
+            putLine(L"locked=" + std::to_wstring(t.locked ? 1 : 0));
+            // 文件列表实现属于分页（0=自绘虚拟列表 1=shell 视图），不是窗格
+            putLine(L"listmode=" + std::to_wstring(t.listMode));
+            putLine(L"hist=" + std::to_wstring(t.histPos));
+            std::wstring hist = t.history.empty() ? t.dir : t.history[0];
+            for (size_t m = 1; m < t.history.size(); ++m) {
+                hist += L"|";
+                hist += t.history[m];
+            }
+            putLine(L"history=" + hist);
         }
-        putLine(L"history=" + hist);
     }
     fclose(f);
 }
@@ -1182,6 +1200,63 @@ void MainWindow::MoveTabToPane(size_t tabIndex, size_t paneIdx)
     SelectRightTab(tabIndex);
     Layout();
     UpdateWatcher();
+}
+
+// 分页头显示文本（目录名末段，锁定加前缀）——重排时插入表头用
+std::wstring MainWindow::PaneTabLabel(size_t paneIdx, int slot) const
+{
+    if (paneIdx >= panes_.size()) return {};
+    const Pane& p = panes_[paneIdx];
+    if (slot < 0 || (size_t)slot >= p.tabs.size()) return {};
+    std::wstring name = tabs_[p.tabs[slot]].dir;
+    size_t s = name.find_last_of(L'\\');
+    if (s != std::wstring::npos && s + 1 < name.size()) name = name.substr(s + 1);
+    else if (name.size() >= 2 && name[1] == L':') name = name.substr(0, 2);
+    if (name.empty()) name = L"新建";
+    if (tabs_[p.tabs[slot]].locked) name = L"[锁] " + name;
+    return name;
+}
+
+// 拖动分页时把被拖的分页移到鼠标当前所在的槽位（跟随鼠标实时重排）。
+// 只在主窗口消息循环里调用（不在 tab 控件过程内），避免删插条目重入 comctl32。
+void MainWindow::ReorderTabInPane(size_t paneIdx, int toSlot)
+{
+    if (paneIdx >= panes_.size()) return;
+    Pane& p = panes_[paneIdx];
+    int fromSlot = tabDragIndex_;
+    pendingReorderSlot_ = -1;
+    pendingReorderPane_ = SIZE_MAX;
+    if (fromSlot < 0 || toSlot < 0 || (size_t)fromSlot >= p.tabs.size()) return;
+    if (fromSlot == toSlot) return;
+
+    size_t tabIndex = p.tabs[fromSlot];
+    // 标准列表移动：先摘掉 fromSlot，再插到 toSlot。因为 fromSlot<toSlot 时摘掉会
+    // 让后面的下标左移一格，插入位直接用 toSlot 即落在鼠标所在的那一格。
+    p.tabs.erase(p.tabs.begin() + fromSlot);
+    p.tabs.insert(p.tabs.begin() + toSlot, tabIndex);
+    int insertAt = toSlot;
+
+    // tab 控件同步：删旧头、在目标位插新头
+    SendMessageW(p.tab, TCM_DELETEITEM, fromSlot, 0);
+    TCITEMW ti{};
+    ti.mask = TCIF_TEXT;
+    std::wstring name = PaneTabLabel(paneIdx, insertAt);
+    ti.pszText = const_cast<LPWSTR>(name.c_str());
+    SendMessageW(p.tab, TCM_INSERTITEMW, insertAt, reinterpret_cast<LPARAM>(&ti));
+
+    // 被拖的分页始终是当前显示的那一页：鼠标走到哪一页头就停在哪
+    p.active = (size_t)insertAt;
+    SendMessageW(p.tab, TCM_SETCURSEL, p.active, 0);
+    tabDragIndex_ = insertAt;   // 下次 WM_MOUSEMOVE 以新位置为基准
+    if (paneIdx == activePane_) {
+        activeTab_ = tabIndex;
+        SetWindowTextW(address_, tabs_[tabIndex].dir.c_str());
+        RefreshPaneList(paneIdx);
+        SyncShellView(paneIdx);
+    }
+    UpdateRightTabLabels();
+    Layout();
+    SaveSession();   // 分页顺序是会话状态，拖完即落盘
 }
 
 void MainWindow::UpdateRightTabLabels()
@@ -2661,6 +2736,8 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
             tabDragActive_ = true;
             tabDragPane_ = pi;
             tabDragIndex_ = idx;
+            pendingReorderPane_ = SIZE_MAX;
+            pendingReorderSlot_ = -1;
             SetCapture(h);
         } else if (pi >= 0) {
             // 分页栏空白区域：双击新建分页（不依赖 CS_DBLCLKS，自己测时间差）。
@@ -2683,25 +2760,54 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
         if (tabDragActive_ && (wp & MK_LBUTTON) &&
             tabDragPane_ >= 0 && tabDragPane_ < (int)panes_.size()) {
             POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-            ClientToScreen(h, &pt);
-            ScreenToClient(hwnd_, &pt);
+            POINT ctlPt = pt;                  // 本来就是 tab 控件的客户区坐标
+            ScreenToClient(hwnd_, &pt);        // 主窗口客户区坐标（窗格矩形用它判断）
             // 落在其它窗格区域 -> 移动分页（整块矩形判定：上下排也能分清）
+            int dstPane = -1;
             for (size_t i = 0; i < panes_.size() && i < paneRects_.size(); ++i) {
                 if ((int)i == tabDragPane_) continue;
-                if (PtInRect(&paneRects_[i], pt)) {
-                    size_t tabIndex = SIZE_MAX;
-                    if (tabDragIndex_ >= 0 && (size_t)tabDragIndex_ < panes_[tabDragPane_].tabs.size())
-                        tabIndex = panes_[tabDragPane_].tabs[tabDragIndex_];
-                    tabDragActive_ = false; // 拖拽状态先收尾
-                    if (GetCapture() == h) ReleaseCapture();
-                    if (tabIndex != SIZE_MAX) {
-                        // 移动可能连带销毁这个 tab（源窗格只有这一个分页），
-                        // 不能在 tab 自己的窗口过程中 DestroyWindow，延后到主窗口处理
-                        pendingMoveTab_ = tabIndex;
-                        pendingMovePane_ = (int)i;
-                        PostMessageW(hwnd_, WM_APP_MOVE_TAB, 0, 0);
-                    }
-                    return 0;
+                if (PtInRect(&paneRects_[i], pt)) { dstPane = (int)i; break; }
+            }
+            if (dstPane >= 0) {
+                size_t tabIndex = SIZE_MAX;
+                if (tabDragIndex_ >= 0 && (size_t)tabDragIndex_ < panes_[tabDragPane_].tabs.size())
+                    tabIndex = panes_[tabDragPane_].tabs[tabDragIndex_];
+                tabDragActive_ = false; // 拖拽状态先收尾
+                if (GetCapture() == h) ReleaseCapture();
+                tabDragIndex_ = -1;
+                pendingReorderPane_ = SIZE_MAX;
+                pendingReorderSlot_ = -1;
+                if (tabIndex != SIZE_MAX) {
+                    // 移动可能连带销毁这个 tab（源窗格只有这一个分页），
+                    // 不能在 tab 自己的窗口过程中 DestroyWindow，延后到主窗口处理
+                    pendingMoveTab_ = tabIndex;
+                    pendingMovePane_ = dstPane;
+                    PostMessageW(hwnd_, WM_APP_MOVE_TAB, 0, 0);
+                }
+                return 0;
+            }
+            // 仍在本窗格的分页栏内 -> 实时重排：鼠标越过哪个分页头，被拖的分页就
+            // 挪到那个槽位，标题栏跟着鼠标走。删插条目不能在 tab 控件自己的窗口
+            // 过程里做（重入 comctl32 曾致崩溃），只记录目标槽位并延后到主窗口。
+            //
+            // 判据用“鼠标越过被拖分页头的左/右边界”，一步只挪一格：
+            // 若改成“鼠标落在哪个分页头上”，往左拖时邻居会被挤到光标下，
+            // 立刻又被判定为新目标，来回弹，看起来就像拖不动。
+            if (tabDragIndex_ >= 0) {
+                int cnt = (int)SendMessageW(h, TCM_GETITEMCOUNT, 0, 0);
+                RECT self{};
+                int slot = tabDragIndex_;
+                if (SendMessageW(h, TCM_GETITEMRECT, (WPARAM)tabDragIndex_,
+                                 reinterpret_cast<LPARAM>(&self)) &&
+                    ctlPt.y >= self.top - 6 && ctlPt.y <= self.bottom + 6) {
+                    if (ctlPt.x > self.right && tabDragIndex_ + 1 < cnt) slot = tabDragIndex_ + 1;
+                    else if (ctlPt.x < self.left && tabDragIndex_ > 0) slot = tabDragIndex_ - 1;
+                }
+                if (slot != tabDragIndex_ && pendingReorderPane_ == SIZE_MAX) {
+                    pendingReorderPane_ = (size_t)tabDragPane_;
+                    pendingReorderSlot_ = slot;
+                    PostMessageW(hwnd_, WM_APP_REORDER_TAB, 0, 0);
+                    return 0;   // 已交给主窗口重排，这次移动不必再给默认过程做 hover
                 }
             }
         }
@@ -2711,6 +2817,10 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
         if (tabDragActive_) {
             tabDragActive_ = false;
             if (GetCapture() == h) ReleaseCapture();
+            // 重排是在拖动过程中实时完成的（见 WM_MOUSEMOVE）。若最后一次重排还
+            // 排在消息队列里，就得留着 tabDragIndex_，让那条消息还能定位被拖的分页。
+            if (pendingReorderPane_ == SIZE_MAX) tabDragIndex_ = -1;
+            return 0;   // 吞掉松手：落点已由重排决定，别再按“单击”改选中
         }
         break;
     }
@@ -3402,6 +3512,8 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             }
         }
         else if (nm->code == TCN_SELCHANGE && PaneOfTab(nm->hwndFrom) >= 0) {
+            // 拖动分页进行中：头位置是重排造成的，不是用户点了别的分页，别切页
+            if (tabDragActive_) break;
             // 某个窗格的 tab 头点击：切换该窗格的当前分页
             int tipi = PaneOfTab(nm->hwndFrom);
             size_t inPane = (size_t)SendMessageW(panes_[tipi].tab, TCM_GETCURSEL, 0, 0);
@@ -3558,6 +3670,15 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
     case WM_APP_ADD_TAB:        // 双击分页栏空白（延后到这里真正新建，见 PaneTabHandler）
         if (static_cast<size_t>(wp) < panes_.size())
             AddRightTab(true, static_cast<size_t>(wp));
+        return 0;
+
+    case WM_APP_REORDER_TAB:    // 同窗格内拖动分页（延后到这里真正重排，见 PaneTabHandler）
+        if (pendingReorderPane_ < panes_.size())
+            ReorderTabInPane(pendingReorderPane_, pendingReorderSlot_);
+        pendingReorderPane_ = SIZE_MAX;
+        pendingReorderSlot_ = -1;
+        // 松手比这条消息先到的情况：这条消息已经消费完拖拽，状态可以清空了
+        if (!tabDragActive_) tabDragIndex_ = -1;
         return 0;
 
     case WM_APP_TREE_NEWTAB: {  // 目录树中键（延后到这里真正新建，见 CreateSidePanel）
