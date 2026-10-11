@@ -28,6 +28,7 @@ enum {
     IDC_TRI_PINTOP = 1024, IDC_TRI_PINDOWN = 1025,
     IDC_MENU_FILTERS = 1026,
     IDC_TREE_SYNC = 1027,
+    IDC_TREEHOST = 1029,   // 目录树宿主容器（Q-Dir 同款：Dialog 包住 NamespaceTreeControl）
     IDC_SETTINGS = 1028,   // 工具栏“设置”按钮（对话框控件 ID 见 SettingsDialog.cpp）
     // 分页标题右键菜单：关闭 / 关闭其他 / 关闭右边 / 锁定
     IDC_TM_LOCK = 1030, IDC_TM_CLOSE = 1031, IDC_TM_OTHERS = 1032, IDC_TM_RIGHT = 1033,
@@ -116,6 +117,9 @@ private:
     void CreateSidePanel();          // 左侧 Tab 容器：目录树 / 收藏
     void SwitchSideTab(int index);   // 切换 tab 显示
     void SyncTreeToCurrentTab(bool showErrors = true);
+    // 列表导航后的树同步去抖（Q-Dir 同款）：连续导航只同步最后一次
+    void ScheduleTreeSync();   // 重置 100ms 定时器
+    void OnTreeSyncTimer();    // 定时器到期：真正执行 SyncTreeToCurrentTab
     void CreatePane(Pane& p);        // 创建一个窗格（tab 容器 + 虚拟列表）
     void Navigate(const std::wstring& path, bool addHistory = true);
     void NavigateFromSidebar(const std::wstring& path); // 侧栏跳转：分页被锁定时另开新分页
@@ -264,6 +268,8 @@ private:
     int  AllocPaneTag();                // 分配未被占用的窗格编号（避免控件 ID 重复）
     void RemovePane(size_t idx);        // 销毁窗格并修正 TabState.pane 下标
     int  PaneOfList(HWND h) const;      // 列表 hwnd -> 窗格下标，-1 表示不是窗格列表
+    int  PaneOfShellView(const ShellFolderView* view) const; // shell 视图 -> 窗格下标
+    void ShellViewContextMenu(size_t pi, POINT screenPt); // shell 视图内右键菜单（同自绘列表那套）
     int  PaneOfTab(HWND h) const;       // Tab 容器 hwnd -> 窗格下标
     TabState& PaneActiveTab(size_t pi); // 指定窗格当前显示的分页
     TabState& RenderedTab(size_t pi);   // 指定窗格“列表里那几行”所属的分页
@@ -303,6 +309,8 @@ private:
     // 分页栏整条隐藏，状态栏显示“未分页”）
     static constexpr size_t kUnlimitedPageSize = 1000000000;
     bool paginationEnabled_ = true;   // 分页开关（设置界面可关）
+    // Layout 本轮是否有控件几何真变了：没变就跳过末尾的全窗口重绘（防导航闪屏）
+    bool geometryChanged_ = false;
     size_t EffectivePageSize() const { return paginationEnabled_ ? pageSize_ : kUnlimitedPageSize; }
     int sortCol_ = 0;      // 排序列（全局记住）
     bool sortAsc_ = true;

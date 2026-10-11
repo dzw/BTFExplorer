@@ -31,6 +31,11 @@ static constexpr int WM_APP_NAV         = WM_APP + 14; // 延后工具栏导航�
 static constexpr int WM_APP_TREE_NAV    = WM_APP + 15; // 目录树选中变化 -> 延后导航（shell 树控件消息链外执行）
 static constexpr int WM_APP_REORDER_TAB = WM_APP + 18; // 同窗格内拖动分页 -> 延后重排（不在 tab 控件过程里改条目）
 
+// 列表导航 -> 目录树同步的去抖定时器（Q-Dir 同款 100ms）：
+// 连续导航（快速双击进多层目录、连续点树/地址栏）只同步最后一次
+static constexpr UINT_PTR kTreeSyncTimerId = 2001;
+static constexpr UINT kTreeSyncDelayMs = 100;
+
 // 当前焦点窗格顶部分页栏的整行底色（淡粉绿）：涂在分页头之间的空隙上，
 // 分页头本身保持系统外观（见 PaneTabHandler 的 WM_PAINT）
 static constexpr COLORREF kActiveTabStripColor = RGB(213, 234, 223);
@@ -60,6 +65,14 @@ enum { COL_NAME = 0, COL_TYPE, COL_SIZE, COL_MTIME };
 
 static constexpr int WM_APP_TOGGLE_VIEWMODE = WM_APP + 16; // 延后切换窗格列表实现
 static constexpr int WM_APP_SHELL_NAV = WM_APP + 17;       // shell 视图内激活文件夹 -> 当前分页视图内切换目录（不新建分页）
+static constexpr int WM_APP_SHELL_CTXMENU = WM_APP + 20;   // shell 视图内右键 -> 延后弹本程序的菜单
+static constexpr int WM_APP_SHELL_RENAME  = WM_APP + 21;   // shell 视图内按 F2 -> 延后开重命名对话框
+
+// shell 视图右键请求：视图指针 + 屏幕坐标（堆上随消息传递，处理完即删）
+struct ShellCtxRequest {
+    ShellFolderView* view;
+    POINT pt;
+};
 
 class FileDropTarget final : public IDropTarget {
 public:
@@ -462,6 +475,19 @@ void MainWindow::SwitchSideTab(int index)
 void MainWindow::SyncTreeToCurrentTab(bool showErrors)
 {
     directoryTree_.SyncToPath(CurTab().dir, showErrors);
+}
+
+// 列表导航后的树同步不立即执行：重置 100ms 去抖定时器，连续导航只同步
+// 最后一次（Q-Dir sub_434D7D 的 KillTimer+SetTimer 同款做法）
+void MainWindow::ScheduleTreeSync()
+{
+    SetTimer(hwnd_, kTreeSyncTimerId, kTreeSyncDelayMs, nullptr);
+}
+
+void MainWindow::OnTreeSyncTimer()
+{
+    KillTimer(hwnd_, kTreeSyncTimerId);
+    SyncTreeToCurrentTab(false);
 }
 
 // 把当前开关状态套用到所有窗格列表（切换网格线时用）
@@ -1621,9 +1647,10 @@ void MainWindow::Navigate(const std::wstring& rawPath, bool addHistory)
     const bool dirChanged = (t.dir != path);
     t.dir = path;
     t.curPage = 0;
-    t.pageItems.clear();
-    t.shownPage = SIZE_MAX;   // 换目录：显示页号作废，重载走清空等待路径
-    t.pageStale = false;
+    // 换目录不清空列表：保留旧内容显示并标记过期（Q-Dir/资源管理器做法），
+    // 后台加载完成后 OnPageLoaded 整体换入——清空会闪一下空白。
+    t.shownPage = SIZE_MAX;   // 显示页号作废
+    t.pageStale = true;
     SetWindowTextW(address_, path.c_str());
 
     if (addHistory) {
@@ -1643,6 +1670,7 @@ void MainWindow::Navigate(const std::wstring& rawPath, bool addHistory)
     UpdateRightTabLabels();
     UpdateWatcher();
     SyncShellView(activePane_);   // 窗格处于 shell 视图模式时让视图跟着换目录
+    ScheduleTreeSync();           // 树同步去抖 100ms：连续导航只同步最后一次
     if (dirChanged) PlayNavSound();   // 换目录确认音（Q-Dir 同款语义）
 }
 
@@ -1694,6 +1722,9 @@ void MainWindow::RefreshPaneList(size_t paneIdx)
             SwapInPage(paneIdx, t, list, std::move(fresh));
         } else if (!tabChanged && t.pageStale && t.shownPage == t.curPage && !t.pageItems.empty()) {
             // 同一分页的外部重载进行中：保留旧内容，加载完成后整体换入
+        } else if (!tabChanged && t.pageStale && !t.pageItems.empty()) {
+            // 同一分页导航换目录进行中（Navigate 置 pageStale，shownPage 作废）：
+            // 同样保留旧内容显示，加载完成后整体换入——清空会闪一下空白。
         } else if (tabChanged && !t.pageItems.empty()) {
             // 切到本分页、它还留着上一次的行（可能已过期）：先原样换回本分页的内容，
             // 后台加载完成后由 OnPageLoaded 整体换入。切分页不再清空列表，就不闪那下空白。
@@ -1913,6 +1944,18 @@ bool MainWindow::EnsureTabShellView(size_t paneIdx, TabState& t)
                          reinterpret_cast<LPARAM>(text.c_str()));
     };
     t.shellView = std::move(sv);
+    // 视图内右键 -> 延后到主循环弹本程序的菜单：shell 的原生菜单没有过滤配置，
+    // 也没有“复制名称/全路径”“添加到收藏”“在 Explorer 中打开”这些自定义项，
+    // 两种列表实现因此才有同一套右键菜单。
+    t.shellView->onContextMenu = [this, view = t.shellView.get()](POINT screenPt) {
+        PostMessageW(hwnd_, WM_APP_SHELL_CTXMENU, 0,
+                     reinterpret_cast<LPARAM>(new ShellCtxRequest{view, screenPt}));
+    };
+    // F2 同理：视图自己的就地改名在本站点不可用，交回主窗口弹重命名对话框
+    //（与自绘列表完全一致）， WPARAM 带视图指针以便认出发起的是哪个窗格
+    t.shellView->onRenameKey = [this, view = t.shellView.get()]() {
+        PostMessageW(hwnd_, WM_APP_SHELL_RENAME, reinterpret_cast<WPARAM>(view), 0);
+    };
     // 视图宿主登记给容器摆放（它与自绘列表重叠，显隐由 listMode 决定）
     panes_[paneIdx].host->AddContent(t.shellView->Host());
     if (!t.dir.empty() && !t.shellView->Navigate(t.dir)) {
@@ -2062,6 +2105,29 @@ void MainWindow::ListKeyCommand(HWND list, int cmd)
     }
 }
 
+// “复制全路径”菜单项（两种列表实现共用）：内容随选区变化——
+//   空白处 → 当前目录全路径；单选 → 该项的全路径；
+//   多选 → 全部全路径（每行一条）。sel 由调用方收敛成“本次右键针对的那几项”。
+static void BuildCopyMenuItem(const std::wstring& dir, const std::vector<std::wstring>& sel,
+                              const std::wstring& path,
+                              std::wstring& label, std::wstring& text)
+{
+    label.clear();
+    text.clear();
+    if (path.empty()) {
+        label = L"复制当前目录全路径(&A)";
+        text = NormalizePath(dir);
+    } else {
+        label = sel.size() > 1
+                    ? L"复制全路径(&P)（" + std::to_wstring(sel.size()) + L" 项）"
+                    : L"复制全路径(&P)";
+        for (size_t i = 0; i < sel.size(); ++i) {
+            if (i) text += L"\r\n";
+            text += sel[i];
+        }
+    }
+}
+
 void MainWindow::ListContextMenu(HWND list, const POINT& screenPt, bool keyboard)
 {
     int pi = PaneOfList(list);
@@ -2084,13 +2150,34 @@ void MainWindow::ListContextMenu(HWND list, const POINT& screenPt, bool keyboard
             ListView_SetItemState(list, -1, 0, LVIS_SELECTED);
         }
     }
+    // “复制名称 / 复制全路径”菜单项：选区来自本窗格的当前分页
+    //（自绘列表取列表选中项，shell 视图取其内部列表的选中项）
+    std::wstring copyLabel, copyText;
+    {
+        std::vector<std::wstring> sel;
+        TabState& pt = PaneActiveTab((size_t)pi);
+        if (pt.listMode == 1 && pt.shellView) {
+            sel = pt.shellView->SelectedPaths();
+        } else {
+            for (int i = -1;;) {
+                i = ListView_GetNextItem(list, i, LVNI_SELECTED);
+                if (i < 0) break;
+                std::wstring p = PaneItemPath((size_t)pi, i);
+                if (!p.empty()) sel.push_back(std::move(p));
+            }
+        }
+        if (!path.empty() && std::find(sel.begin(), sel.end(), path) == sel.end())
+            sel = { path };
+        BuildCopyMenuItem(pt.dir, sel, path, copyLabel, copyText);
+    }
     bool addFavorite = false;
     std::wstring createdFolderPath;
     bool renameSelected = false;
     if (shell::ShowContextMenu(hwnd_, path, PaneActiveTab((size_t)pi).dir,
                               const_cast<POINT&>(screenPt),
                               L"添加当前目录到收藏", addFavorite, &createdFolderPath,
-                              &renameSelected, L"在 Explorer 中打开(&X)")) {
+                              &renameSelected, L"在 Explorer 中打开(&X)",
+                              copyLabel, copyText)) {
         WriteAppLog((L"CONTEXT_MENU command completed: pane=" +
                      std::to_wstring(pi) + L", selectedPath=" +
                      (path.empty() ? L"(background)" : path) +
@@ -2106,6 +2193,67 @@ void MainWindow::ListContextMenu(HWND list, const POINT& screenPt, bool keyboard
     }
     if (renameSelected && !path.empty()) {
         WriteAppLog((L"CONTEXT_MENU rename selected: " + path).c_str());
+        RenamePath(path);
+    }
+    if (addFavorite) OnAddFavorite();
+}
+
+// shell 视图（Q 视图）内的右键：走与自绘列表同一套 shell::ShowContextMenu，
+// 区别只在选区/命中项要从视图内部取（那份列表是 shell 自己的，不经过分页模型）。
+int MainWindow::PaneOfShellView(const ShellFolderView* view) const
+{
+    if (!view) return -1;
+    for (size_t p = 0; p < panes_.size(); ++p)
+        for (size_t k = 0; k < panes_[p].tabs.size(); ++k)
+            if (tabs_[panes_[p].tabs[k]].shellView.get() == view) return (int)p;
+    return -1;
+}
+
+void MainWindow::ShellViewContextMenu(size_t pi, POINT screenPt)
+{
+    if (pi >= panes_.size()) return;
+    TabState& t = PaneActiveTab(pi);
+    if (t.listMode != 1 || !t.shellView) return;
+    if (pi != activePane_) PostSelectPane(pi);
+
+    bool onItem = false;
+    std::wstring hit = t.shellView->ItemPathAt(screenPt, &onItem);
+    std::vector<std::wstring> sel = t.shellView->SelectedPaths();
+    // 空白处 -> 背景菜单（不针对任何条目）；条目但取不到路径（虚拟位置）->
+    // 用选区兜底，shell 在右键时已把命中项选中
+    std::wstring path;
+    if (onItem) path = !hit.empty() ? hit : (sel.size() == 1 ? sel.front() : std::wstring{});
+    if (path.empty())
+        sel.clear();
+    else if (std::find(sel.begin(), sel.end(), path) == sel.end())
+        sel = { path };
+
+    std::wstring copyLabel, copyText;
+    BuildCopyMenuItem(t.dir, sel, path, copyLabel, copyText);
+
+    bool addFavorite = false;
+    std::wstring createdFolderPath;
+    bool renameSelected = false;
+    // 重命名走的是对话框（RenamePath），与列表实现无关，所以两种视图都用
+    // 本程序的“重命名(&M)”（shell 原生的就地改名在本站点不可用）
+    if (shell::ShowContextMenu(hwnd_, path, t.dir, const_cast<POINT&>(screenPt),
+                               L"添加当前目录到收藏", addFavorite, &createdFolderPath,
+                               &renameSelected, L"在 Explorer 中打开(&X)",
+                               copyLabel, copyText)) {
+        WriteAppLog((L"CONTEXT_MENU command completed (shell view): pane=" +
+                     std::to_wstring(pi) + L", selectedPath=" +
+                     (path.empty() ? L"(background)" : path) + L", createdFolder=" +
+                     (createdFolderPath.empty() ? L"(none)" : createdFolderPath)).c_str());
+        if (!createdFolderPath.empty())
+            RenamePath(createdFolderPath);
+        RefreshListFromDisk();   // 隐藏的分页数据同步跟上（视图自己会刷新显示）
+    } else {
+        WriteAppLog((L"CONTEXT_MENU command not invoked (shell view): pane=" +
+                     std::to_wstring(pi) + L", selectedPath=" +
+                     (path.empty() ? L"(background)" : path)).c_str());
+    }
+    if (renameSelected && !path.empty()) {
+        WriteAppLog((L"CONTEXT_MENU rename selected (shell view): " + path).c_str());
         RenamePath(path);
     }
     if (addFavorite) OnAddFavorite();
@@ -3388,8 +3536,16 @@ void MainWindow::Layout()
     // 鼠标移动都会让几十个控件各自同步重绘一次，中间态全被看见 -> 整个界面闪动。
     // 现在只挪不画（SWP_NOREDRAW），全部摆好后由末尾一次 RedrawWindow 统一刷新，
     // 和资源管理器的做法一致：只呈现最终状态。
+    geometryChanged_ = false;   // 本轮若有控件位置/尺寸真变了，置 true
     auto place = [&](HWND h, int x, int yy, int w, int hh) {
         if (h == nullptr) return;
+        RECT r{}; GetWindowRect(h, &r);
+        POINT org{ r.left, r.top };
+        ScreenToClient(hwnd_, &org);
+        // 几何没变的控件不发 SetWindowPos（多余的消息也会惊动控件内部状态）
+        if (org.x == x && org.y == yy && r.right - r.left == w && r.bottom - r.top == hh)
+            return;
+        geometryChanged_ = true;
         SetWindowPos(h, nullptr, x, yy, w, hh,
                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
     };
@@ -3580,9 +3736,15 @@ void MainWindow::Layout()
     // 状态栏自动布局
     SendMessageW(status_, WM_SIZE, 0, MAKELPARAM(W, H));
 
-    // 所有子控件都已就位，统一重绘一次（只呈现最终状态，避免中间态闪动）
-    RedrawWindow(hwnd_, nullptr, nullptr,
-                 RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    // 所有子控件都已就位，统一重绘一次（只呈现最终状态，避免中间态闪动）。
+    // 但“几何没变”的调用（如导航后 SyncShellView 的例行重摆）不做全量重绘：
+    // RDW_ERASE|RDW_ALLCHILDREN 会擦亮整窗，点目录树导航一下就闪一次。
+    // 拖分隔条/改窗口尺寸等几何真正变化的调用才有必要呈现最终状态。
+    if (geometryChanged_) {
+        RedrawWindow(hwnd_, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+        geometryChanged_ = false;
+    }
 }
 
 LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
@@ -3598,6 +3760,10 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
     }
 
     switch (msg) {
+    case WM_TIMER:
+        if (wp == kTreeSyncTimerId) { OnTreeSyncTimer(); return 0; }
+        break;
+
     case WM_SYSCOMMAND:
         if ((wp & 0xFFF0) == SC_CLOSE) {
             WriteAppLog(L"WM_SYSCOMMAND SC_CLOSE received");
@@ -4008,6 +4174,33 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
     case WM_APP_TOGGLE_VIEWMODE: // “Q”按钮：延后切换窗格的文件列表实现
         ToggleListMode(static_cast<size_t>(wp));
         return 0;
+
+    case WM_APP_SHELL_CTXMENU: {  // shell 视图内右键（延后弹菜单，见 EnsureTabShellView）
+        auto* req = reinterpret_cast<ShellCtxRequest*>(lp);
+        if (req) {
+            int pi = PaneOfShellView(req->view);   // 视图已随分页关闭销毁 -> 丢弃
+            if (pi >= 0) ShellViewContextMenu(static_cast<size_t>(pi), req->pt);
+            delete req;
+        }
+        return 0;
+    }
+
+    case WM_APP_SHELL_RENAME: {   // shell 视图内 F2（延后到主循环，见 EnsureTabShellView）
+        int pi = PaneOfShellView(reinterpret_cast<ShellFolderView*>(wp));
+        if (pi < 0) return 0;                      // 视图已随分页关闭销毁
+        if (static_cast<size_t>(pi) != activePane_) PostSelectPane((size_t)pi);
+        TabState& t = PaneActiveTab((size_t)pi);
+        std::vector<std::wstring> sel =
+            t.shellView ? t.shellView->SelectedPaths() : std::vector<std::wstring>{};
+        if (sel.empty()) {
+            WriteAppLog(L"RENAME request ignored (shell view): no selected item");
+            return 0;
+        }
+        WriteAppLog((L"RENAME requested from shell view: pane=" + std::to_wstring(pi) +
+                     L", path=" + sel.front()).c_str());
+        RenamePath(sel.front());   // 与自绘列表同一个重命名对话框
+        return 0;
+    }
 
     case WM_APP_SELECT_PANE:    // 延后激活窗格（真正的切换在控件消息链之外执行）
         if (pendingSelectPane_ < panes_.size()) {

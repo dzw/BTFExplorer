@@ -17,6 +17,26 @@ static constexpr UINT CMD_LAST  = 0x7FFF;
 static constexpr UINT CMD_CUSTOM = CMD_LAST + 1;
 static constexpr UINT CMD_RENAME = CMD_LAST + 2;
 static constexpr UINT CMD_EXPLORER = CMD_LAST + 3; // 在 Explorer 中打开
+static constexpr UINT CMD_COPYTEXT = CMD_LAST + 4; // 复制名称 / 复制全路径
+
+// 纯文本进剪贴板（CF_UNICODETEXT）：记事本、资源管理器地址栏、IDE 都能直接粘
+static void CopyPlainText(HWND hwnd, const std::wstring& text)
+{
+    if (text.empty() || !OpenClipboard(hwnd)) return;
+    if (EmptyClipboard()) {
+        size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+        if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+            if (auto* dst = static_cast<wchar_t*>(GlobalLock(h))) {
+                wmemcpy(dst, text.c_str(), text.size() + 1);
+                GlobalUnlock(h);
+                if (!SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
+            } else {
+                GlobalFree(h);
+            }
+        }
+    }
+    CloseClipboard();
+}
 
 static const std::vector<std::wstring>& DefaultHiddenNames()
 {
@@ -211,7 +231,8 @@ static bool IsOpenAction(const std::wstring& text)
             normalized.find(L"打开") != std::wstring::npos);
 }
 
-static bool GroupOpenActions(HMENU menu)
+// openPos：成功后回传“Open”组在菜单里的位置，供调用方把自定义项插在它下面
+static bool GroupOpenActions(HMENU menu, UINT* openPos = nullptr)
 {
     struct Entry {
         MENUITEMINFOW info{};
@@ -287,6 +308,7 @@ static bool GroupOpenActions(HMENU menu)
         DestroyMenu(submenu);
         return false;
     }
+    if (openPos) *openPos = moved.front().position;
     return true;
 }
 
@@ -422,7 +444,8 @@ static LRESULT CALLBACK ContextMenuSubclassProc(HWND hwnd, UINT msg, WPARAM wp,
 bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& menuDir,
                      POINT ptScreen, const std::wstring& customItem,
                      bool& customItemSelected, std::wstring* createdFolderPath,
-                     bool* renameSelected, const std::wstring& openInExplorerItem)
+                     bool* renameSelected, const std::wstring& openInExplorerItem,
+                     const std::wstring& copyItemLabel, const std::wstring& copyItemText)
 {
     customItemSelected = false;
     if (createdFolderPath) createdFolderPath->clear();
@@ -472,7 +495,20 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
         std::vector<std::wstring> hiddenNames;
         LoadHiddenNames(hwnd, hiddenNames);
         FilterProviderItems(menu, hiddenNames);
-        GroupOpenActions(menu);
+        UINT openPos = 0;
+        bool hasOpenGroup = GroupOpenActions(menu, &openPos);
+        // 复制项紧跟在“Open”组下面；没有 Open 组（少数背景菜单）时落到末尾
+        if (!copyItemLabel.empty()) {
+            UINT pos = hasOpenGroup ? openPos + 1
+                                    : static_cast<UINT>(GetMenuItemCount(menu));
+            if (!InsertMenuW(menu, pos, MF_BYPOSITION | MF_STRING, CMD_COPYTEXT,
+                             copyItemLabel.c_str()))
+                WriteAppLog((L"CONTEXT_MENU failed to insert copy item: error=" +
+                             std::to_wstring(GetLastError())).c_str());
+            else
+                WriteAppLog((L"CONTEXT_MENU copy item at=" + std::to_wstring(pos) +
+                             L", label=" + copyItemLabel).c_str());
+        }
         if (!path.empty() && renameSelected) {
             RemoveRenameItems(menu);
             BOOL appended = AppendMenuW(menu, MF_STRING, CMD_RENAME, L"重命名(&M)");
@@ -517,6 +553,13 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
             RemoveWindowSubclass(hwnd, ContextMenuSubclassProc, subclassId);
         if (cmd == CMD_CUSTOM) {
             customItemSelected = true;
+        } else if (cmd == CMD_COPYTEXT) {
+            CopyPlainText(hwnd, copyItemText);
+            std::wstring flat = copyItemText;
+            for (wchar_t& ch : flat)
+                if (ch == L'\r' || ch == L'\n') ch = L'|';
+            WriteAppLog((L"CONTEXT_MENU copy text: label=" + copyItemLabel +
+                         L", clipboard=" + flat).c_str());
         } else if (cmd == CMD_EXPLORER) {
             // 在真实资源管理器中打开：文件 -> /select 定位并选中；文件夹/背景 -> 直接打开目录
             std::wstring target = path.empty()

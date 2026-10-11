@@ -217,12 +217,19 @@ void DirectoryTree::SyncToPath(const std::wstring& rawPath, bool showErrors)
 
     // 逐级展开祖先（最外层先展开）。默认非异步模式下展开是同步的，
     // 展开后子项才在树里存在，最后才能选中目标并滚到可见。
+    // 已展开的祖先跳过：重复 SetItemState(EXPANDED) 会惊动控件重摆可见
+    // 区域（文件列表导航回同步树时整棵树闪一下）。
     auto expandPrefix = [&](const std::wstring& prefix) {
         UniquePIDL anc = shell::PIDLFromPath(prefix.c_str());
         if (!anc) return;
         ComPtr<IShellItem> ancItem;
-        if (SUCCEEDED(SHCreateItemFromIDList(PidlOf(anc), IID_PPV_ARGS(&ancItem))) && ancItem)
+        if (SUCCEEDED(SHCreateItemFromIDList(PidlOf(anc), IID_PPV_ARGS(&ancItem))) && ancItem) {
+            NSTCITEMSTATE st = NSTCIS_EXPANDED;
+            if (SUCCEEDED(ctl_->GetItemState(ancItem.Get(), NSTCIS_EXPANDED, &st)) &&
+                (st & NSTCIS_EXPANDED))
+                return;
             ctl_->SetItemState(ancItem.Get(), NSTCIS_EXPANDED, NSTCIS_EXPANDED);
+        }
     };
 
     // 根前缀："F:\" 或 UNC "\\server\share"；其下逐段补齐展开，目标本身不展开
@@ -254,12 +261,12 @@ void DirectoryTree::SyncToPath(const std::wstring& rawPath, bool showErrors)
     ComPtr<IShellItem> item;
     if (SUCCEEDED(SHCreateItemFromIDList(PidlOf(pidl), IID_PPV_ARGS(&item))) && item) {
         // 目标已是选中项：控件不会再发事件，不能记待消费数（残留会误吞
-        // 下一次真实用户选中）；否则先记数再选中，异步回来的事件按数吞掉
+        // 下一次真实用户选中）；此时也不需要滚动（树已经在正确位置，
+        // 再 EnsureItemVisible 会触发无谓重绘）。否则先记数再选中。
         std::wstring cur = SelectedPath();
-        if (_wcsicmp(cur.c_str(), target.c_str()) != 0) {
-            ++pendingSelects_[target];
-            ctl_->SetItemState(item.Get(), NSTCIS_SELECTED, NSTCIS_SELECTED);
-        }
+        if (_wcsicmp(cur.c_str(), target.c_str()) == 0) return;
+        ++pendingSelects_[target];
+        ctl_->SetItemState(item.Get(), NSTCIS_SELECTED, NSTCIS_SELECTED);
         ctl_->EnsureItemVisible(item.Get());
     }
 }

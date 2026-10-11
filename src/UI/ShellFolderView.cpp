@@ -1,10 +1,29 @@
 #include "ShellFolderView.h"
 #include <shlwapi.h>
 #include <commctrl.h>
+#include <windowsx.h>
+#include <cwchar>
 
 namespace {
 
 const wchar_t kHostClass[] = L"PEShellHostView";   // 每个窗格一个宿主窗口
+
+// SetWindowSubclass 的标识：本类在同一窗口上只装这一种子类化（右键/改名按键拦截）
+constexpr UINT_PTR kCtxSubclassId = 1;
+// 内部列表可能是视图创建之后才建出来的、也会被 shell 重建：靠宿主窗口定时器盯着补装
+constexpr UINT_PTR kCtxRetryTimer = 0x4352;
+
+// 递归找视图内部的 SysListView32（shell 的右键菜单实际在这个窗口上处理）
+HWND FindInnerListView(HWND parent)
+{
+    for (HWND c = GetWindow(parent, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT)) {
+        wchar_t cls[64]{};
+        if (GetClassNameW(c, cls, 64) > 0 && _wcsicmp(cls, L"SysListView32") == 0)
+            return c;
+        if (HWND deeper = FindInnerListView(c)) return deeper;
+    }
+    return nullptr;
+}
 
 } // namespace
 
@@ -48,6 +67,12 @@ LRESULT ShellFolderView::HostProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (msg == WM_SIZE && view_)
         MoveWindow(view_, 0, 0, LOWORD(lp), HIWORD(lp), TRUE);
+    if (msg == WM_TIMER && wp == kCtxRetryTimer) {
+        // 内部 SysListView32 由 shell 异步创建/重建（换目录、切视图模式）：
+        // 子类化随旧窗口一起消失，句柄一变就补装，否则该窗口的 F2 收不到
+        if (InnerListView() != ctxList_) InstallContextMenuSubclass();
+        return 0;
+    }
     return DefWindowProcW(h, msg, wp, lp);
 }
 
@@ -89,6 +114,10 @@ bool ShellFolderView::Navigate(const std::wstring& dir)
     dir_ = dir;
     dirPidl_ = std::move(pidl);
     InstallViewSubclass();           // 拦下视图内文件夹激活，改为站内导航（见 ViewProc）
+    // 拦下视图内右键/按键，改弹本程序菜单、站内改名（见 CtxProcStatic）；
+    // 内部列表可能还没建出来、或之后被 shell 重建，靠宿主定时器盯着补装，否则 F2 收不到
+    InstallContextMenuSubclass();
+    if (host_) SetTimer(host_, kCtxRetryTimer, 250, nullptr);
     // 以“无焦点激活”挂上浏览器：视图才会向状态栏发条目数等消息
     viewObj_->UIActivate(SVUIA_ACTIVATE_NOFOCUS);
     return true;
@@ -128,6 +157,120 @@ LRESULT ShellFolderView::ViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     return CallWindowProcW(origViewProc_, h, msg, wp, lp);
 }
 
+// --- 视图内右键 / F2：拦下 shell 自己的处理，改走本程序的菜单与重命名对话框 ---
+
+HWND ShellFolderView::InnerListView() const
+{
+    return view_ ? FindInnerListView(view_) : nullptr;
+}
+
+LRESULT CALLBACK ShellFolderView::CtxProcStatic(HWND h, UINT msg, WPARAM wp, LPARAM lp,
+                                                UINT_PTR, DWORD_PTR ref)
+{
+    auto* self = reinterpret_cast<ShellFolderView*>(ref);
+    if (!self) return DefSubclassProc(h, msg, wp, lp);
+    if (msg == WM_CONTEXTMENU && self->TakeContextMenu(lp))
+        return 0;   // 吞掉：不让 shell 弹它的原生菜单（没有本程序的自定义项）
+    if (msg == WM_KEYDOWN && wp == VK_F2 && self->TakeRenameKey())
+        return 0;   // 吞掉：shell 的就地改名在本站点走不通，改用主窗口的重命名对话框
+    return DefSubclassProc(h, msg, wp, lp);
+}
+
+bool ShellFolderView::TakeRenameKey()
+{
+    if (!onRenameKey) return false;   // 没接线就交回给 shell
+    onRenameKey();
+    return true;
+}
+
+bool ShellFolderView::TakeContextMenu(LPARAM lp)
+{
+    if (!onContextMenu) return false;         // 没接线就放行原生菜单
+    DWORD now = GetTickCount();
+    // 同一次右键可能先落在内部列表、再转发到视图窗口：只认第一次
+    if (static_cast<DWORD>(now - ctxTick_) < 200) return true;
+    ctxTick_ = now;
+    POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+    if (pt.x < 0 || pt.y < 0) GetCursorPos(&pt);   // 菜单键：lParam 是 (-1,-1)
+    onContextMenu(pt);
+    return true;
+}
+
+bool ShellFolderView::InstallContextMenuSubclass()
+{
+    if (!view_) return false;
+    HWND list = InnerListView();
+    HWND targets[2] = { list, view_ };
+    for (HWND t : targets) {
+        if (!t) continue;
+        bool installed = false;
+        for (HWND e : ctxSubs_) if (e == t) { installed = true; break; }
+        if (installed) continue;
+        if (SetWindowSubclass(t, &ShellFolderView::CtxProcStatic, kCtxSubclassId,
+                              reinterpret_cast<DWORD_PTR>(this)))
+            ctxSubs_.push_back(t);
+    }
+    // 内部列表被重建后，旧句柄上的子类化已随窗口消失：清掉记录，只留还活着的
+    for (size_t i = 0; i < ctxSubs_.size();) {
+        if (ctxSubs_[i] != list && ctxSubs_[i] != view_ && !IsWindow(ctxSubs_[i]))
+            ctxSubs_.erase(ctxSubs_.begin() + i);
+        else
+            ++i;
+    }
+    ctxList_ = list;
+    return list != nullptr;
+}
+
+void ShellFolderView::RemoveContextMenuSubclass()
+{
+    if (host_) KillTimer(host_, kCtxRetryTimer);
+    for (HWND e : ctxSubs_) RemoveWindowSubclass(e, &ShellFolderView::CtxProcStatic, kCtxSubclassId);
+    ctxSubs_.clear();
+    ctxTick_ = 0;
+    ctxList_ = nullptr;
+}
+
+// 光标下的条目路径：内部列表命中测试拿视图索引，再用 IFolderView2 取该条目的
+// IShellItem。虚拟位置（无文件系统路径）返回空，调用方用选中项兜底。
+std::wstring ShellFolderView::ItemPathAt(POINT screenPt, bool* outOnItem) const
+{
+    if (outOnItem) *outOnItem = false;
+    HWND list = InnerListView();
+    if (!list || !viewObj_) return {};
+    POINT client = screenPt;
+    ScreenToClient(list, &client);
+    LVHITTESTINFO hit{};
+    hit.pt = client;
+    int idx = static_cast<int>(SendMessageW(list, LVM_HITTEST, 0,
+                                           reinterpret_cast<LPARAM>(&hit)));
+    if (idx < 0) return {};
+    if (outOnItem) *outOnItem = true;
+
+    ComPtr<IFolderView2> fv2;
+    if (FAILED(viewObj_->QueryInterface(IID_PPV_ARGS(&fv2))) || !fv2) return {};
+    // 先按 IUnknown 取回条目对象再判定它到底是哪种接口：GetItem 对不同 riid 的
+    // 支持程度按 shell 版本而定，直接按猜的接口指针用会踩错虚表
+    ComPtr<IUnknown> obj;
+    if (FAILED(fv2->GetItem(idx, IID_PPV_ARGS(&obj))) || !obj) return {};
+    ComPtr<IShellItem> item;
+    if (FAILED(obj->QueryInterface(IID_PPV_ARGS(&item))) || !item) {
+        ComPtr<IShellItemArray> arr;
+        if (FAILED(obj->QueryInterface(IID_PPV_ARGS(&arr))) || !arr) return {};
+        DWORD count = 0;
+        arr->GetCount(&count);
+        IShellItem* raw = nullptr;
+        if (!count || FAILED(arr->GetItemAt(0, &raw)) || !raw) return {};
+        item.Attach(raw);
+    }
+    PWSTR name = nullptr;
+    std::wstring out;
+    if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &name)) && name) {
+        out = name;
+        CoTaskMemFree(name);
+    }
+    return out;
+}
+
 std::wstring ShellFolderView::ActivatedFolderPath() const
 {
     if (!viewObj_) return {};
@@ -150,6 +293,7 @@ std::wstring ShellFolderView::ActivatedFolderPath() const
 
 void ShellFolderView::Destroy()
 {
+    RemoveContextMenuSubclass();
     if (viewObj_) {
         viewObj_->DestroyViewWindow();
         viewObj_.Release();   // 视图析构时会 Release 本对象（IShellBrowser）
@@ -170,12 +314,16 @@ std::vector<std::wstring> ShellFolderView::SelectedPaths() const
     ComPtr<IEnumIDList> items;
     if (FAILED(fv->Items(SVGIO_SELECTION, IID_PPV_ARGS(&items))) || !items) return out;
     for (;;) {
-        PIDLIST_ABSOLUTE pidl = nullptr;
+        // 这里枚举到的是相对本文件夹的子 pidl，直接当绝对 pidl 用会被按当前目录
+        // 解析出风马牛不相及的路径（必须先和视图目录拼成完整 pidl）
+        PIDLIST_RELATIVE rel = nullptr;
         ULONG fetched = 0;
-        if (items->Next(1, &pidl, &fetched) != S_OK || fetched == 0) break;
+        if (items->Next(1, &rel, &fetched) != S_OK || fetched == 0 || !rel) break;
+        UniquePIDL abs(ILCombine(static_cast<PCIDLIST_ABSOLUTE>(dirPidl_.get()), rel));
+        CoTaskMemFree(rel);
         wchar_t buf[MAX_PATH * 2]{};
-        if (SHGetPathFromIDListW(pidl, buf)) out.push_back(buf);
-        CoTaskMemFree(pidl);
+        if (abs && SHGetPathFromIDListW(static_cast<PCIDLIST_ABSOLUTE>(abs.get()), buf))
+            out.push_back(buf);
     }
     return out;
 }

@@ -9,3 +9,4 @@ build.bat
 /.idea/
 /.codebuddy/*.png
 .codebuddy/*.ps1
+/QDirRef

@@ -35,9 +35,22 @@ public:
     std::function<void(const std::wstring&)> onBrowse;
     // 视图发来的状态栏文本（“N 个对象”等）
     std::function<void(const std::wstring&)> onStatusText;
+    // 视图内右键（鼠标右键/菜单键）：shell 的原生菜单不带本程序的自定义项
+    //（复制名称/全路径、添加到收藏、过滤后的菜单），所以拦下 WM_CONTEXTMENU
+    // 交回调，由主窗口弹同一套菜单。接收方必须延后处理（回调在视图消息链内）。
+    std::function<void(POINT screenPt)> onContextMenu;
+    // 视图内按 F2：shell 的就地改名要走它自己那套浏览器接口（本站点只实现了
+    // IShellBrowser 的最小集，多数取不到编辑框），拦下来交回调，由主窗口用与
+    // 自绘列表相同的重命名对话框处理。接收方同样要延后处理。
+    std::function<void()> onRenameKey;
 
     // 选中项的文件系统路径（虚拟位置跳过）
     std::vector<std::wstring> SelectedPaths() const;
+
+    // 光标（屏幕坐标）所在条目的文件系统路径；空白处返回空。
+    // outOnItem 回填“光标是否落在某个条目上”（取不到路径时也为 true，
+    // 用于区分“点了空白”与“点了条目但条目是虚拟位置”）。
+    std::wstring ItemPathAt(POINT screenPt, bool* outOnItem) const;
 
     // --- IUnknown ---
     IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override;
@@ -73,12 +86,27 @@ private:
     static LRESULT CALLBACK ViewProcStatic(HWND, UINT, WPARAM, LPARAM);
     LRESULT ViewProc(HWND, UINT, WPARAM, LPARAM);
     void InstallViewSubclass();          // 每次 Navigate 新建视图后安装
+
+    // 右键/改名按键拦截：WM_CONTEXTMENU 可能落在视图窗口本身，也可能落在它内部的
+    // SysListView32（shell 在自己的列表上处理菜单），两层都装子类化才不漏。
+    // 谁先收到谁回调，ctxTick_ 记下时刻，200ms 内的同一次右键不再重复弹。
+    static LRESULT CALLBACK CtxProcStatic(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
+    bool TakeContextMenu(LPARAM lp);
+    bool TakeRenameKey();
+    bool InstallContextMenuSubclass();   // 返回内部 SysListView32 是否已挂上
+    void RemoveContextMenuSubclass();
+
+    HWND InnerListView() const;          // 视图内部的 SysListView32（找不到返回空）
+
     std::wstring ActivatedFolderPath() const;  // 当前选中项若是文件夹返回其绝对路径
 
     HWND host_ = nullptr;            // 宿主窗口（窗格 tab 的子窗口，布局定位用）
     HWND view_ = nullptr;            // shell 视图窗口（SHELLDLL_DefView）
     WNDPROC origViewProc_ = nullptr; // 视图窗口原窗口过程（子类化前）
     HWND subclassedOn_ = nullptr;    // 子类化实际装在该 HWND 上；沿用同窗口时不重装
+    std::vector<HWND> ctxSubs_;      // 装了按键/右键子类化的窗口（视图窗口 + 内部列表）
+    DWORD ctxTick_ = 0;              // 最近一次右键拦截的时刻（去重用）
+    HWND ctxList_ = nullptr;         // 已挂拦截的内部列表；shell 重建它后句柄会变
     ComPtr<IShellView> viewObj_;
     std::wstring dir_;
     UniquePIDL dirPidl_;
