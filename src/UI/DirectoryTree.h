@@ -31,11 +31,13 @@ public:
     // showErrors 参数保留以兼容旧调用点；控件覆盖整个命名空间，找不到时静默保持现状。
     void SyncToPath(const std::wstring& path, bool showErrors);
 
-    // 开关展开/折叠图标（三角形），对应 Q-Dir 的“禁止展开图标(三角形)”。
-    // NSTC 由 NSTCS_HASEXPANDOS 控制：创建时按此值决定初始风格，之后用
-    // SetControlStyle 即时增删（不需要重建控件）。
-    void SetExpandButtons(bool show);
-    bool ExpandButtons() const { return expandButtons_; }
+    // 展开/折叠图标的样式，对应 Q-Dir 的“禁止展开图标(三角形)”选项。
+    // 这不是隐藏图标，而是两种图标样式之间切换：
+    //   classic = false → Win7/Vista 风格的三角/箭头（给内层 TreeView 上 "Explorer" 主题）
+    //   classic = true  → 经典 +/- 方框（去掉内层 TreeView 的主题）
+    // 与 Q-Dir 同款做法：对 NSTC 内层的 SysTreeView32 调 SetWindowTheme。
+    void SetClassicExpandIcons(bool classic);
+    bool ClassicExpandIcons() const { return classicExpandIcons_; }
 
 private:
     class EventSink;
@@ -53,8 +55,8 @@ private:
     // 事件到达时匹配即吞掉；目标已选中时不记数（控件此时不发事件，记了会残留）。
     std::map<std::wstring, int> pendingSelects_;
     std::wstring SelectedPath();             // 当前选中项的文件系统路径（无/虚拟则空）
-    // 是否显示展开/折叠图标（三角形）
-    bool expandButtons_ = true;
+    // 展开图标是否为经典 +/- 方框（false = 现代三角/箭头）
+    bool classicExpandIcons_ = false;
     std::function<void(const std::wstring&)> onSelection_;
     std::function<void(const std::wstring&)> onMiddleClick_;
 };

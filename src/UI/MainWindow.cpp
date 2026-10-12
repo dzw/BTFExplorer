@@ -258,7 +258,7 @@ MainWindow* MainWindow::Create(HINSTANCE hInst)
     self->RestoreSession();     // 恢复上次会话（窗格/分页/历史），无会话则默认 1 窗格
     // 会话里恢复的“禁止展开图标(三角形)”要在建树之后再套用一次：
     // 侧栏（含目录树）在 BuildChildren 里就建好了，那时还没读到会话值
-    self->directoryTree_.SetExpandButtons(!self->noExpandIcon_);
+    self->directoryTree_.SetClassicExpandIcons(self->noExpandIcon_);
     self->SyncPagerSizeCombo(); // 会话里恢复的“每页项数”要反映到分页栏下拉框
     ShowWindow(self->hwnd_, self->startupShowCmd_);
     UpdateWindow(self->hwnd_);
@@ -328,7 +328,8 @@ void MainWindow::OpenSettings()
         navSound_ = d.navSound;
         if (d.noExpandIcon != noExpandIcon_) {
             noExpandIcon_ = d.noExpandIcon;
-            directoryTree_.SetExpandButtons(!noExpandIcon_);   // 即时增删三角形
+            // 三角/箭头 ⇄ 经典 +/- 方框，即时切换
+            directoryTree_.SetClassicExpandIcons(noExpandIcon_);
         }
         if (d.pagination != paginationEnabled_) {
             paginationEnabled_ = d.pagination;

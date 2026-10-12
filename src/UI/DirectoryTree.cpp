@@ -2,7 +2,10 @@
 #include "../Shell/ShellUtil.h"
 #include "../Util/AppLog.h"
 #include <shlwapi.h>
+#include <uxtheme.h>          // SetWindowTheme
 #include <vector>
+
+#pragma comment(lib, "UxTheme.lib")
 
 // ---------------------------------------------------------------------------
 // 事件接收器。INameSpaceTreeControlEvents 是 local 控件接口（shell32 进程内直调），
@@ -97,12 +100,11 @@ bool DirectoryTree::Create(HWND parent)
 
     // 资源管理器导航窗格观感：展开钮/连接线/整行选中/常显选中/横向滚动/边框；
     // 关掉标签编辑和拖放（本树只做导航，不做文件操作）。
-    // NSTCS_HASEXPANDOS 就是那对展开/折叠图标（Win7+ 下渲染成三角形），
-    // “禁止展开图标(三角形)”关掉时不带这个风格
-    DWORD style = NSTCS_HASLINES | NSTCS_FULLROWSELECT |
+    // NSTCS_HASEXPANDOS 始终保留（展开图标始终存在），它渲染成三角还是 +/- 方框
+    // 由内层 TreeView 的主题决定，见 SetClassicExpandIcons。
+    DWORD style = NSTCS_HASEXPANDOS | NSTCS_HASLINES | NSTCS_FULLROWSELECT |
                   NSTCS_SHOWSELECTIONALWAYS | NSTCS_HORIZONTALSCROLL | NSTCS_AUTOHSCROLL |
                   NSTCS_TABSTOP | NSTCS_NOEDITLABELS | NSTCS_DISABLEDRAGDROP | NSTCS_BORDER;
-    if (expandButtons_) style |= NSTCS_HASEXPANDOS;
 
     RECT rc = { 0, 0, 0, 0 };
     hr = ctl_->Initialize(parent, &rc, style);
@@ -147,19 +149,36 @@ bool DirectoryTree::Create(HWND parent)
     return true;
 }
 
-void DirectoryTree::SetExpandButtons(bool show)
+// NSTC 内层结构是 NamespaceTreeControl → Static → SysTreeView32，展开图标
+// 就画在那个 SysTreeView32 上。先直查，再查一层子窗口，兼容不同层级
+static HWND InnerTreeView(HWND nstc)
 {
-    if (expandButtons_ == show) return;
-    expandButtons_ = show;
-    if (!ctl_) return;
+    if (HWND t = FindWindowExW(nstc, nullptr, L"SysTreeView32", nullptr)) return t;
+    for (HWND c = FindWindowExW(nstc, nullptr, nullptr, nullptr); c;
+         c = FindWindowExW(nstc, c, nullptr, nullptr)) {
+        if (HWND t = FindWindowExW(c, nullptr, L"SysTreeView32", nullptr)) return t;
+    }
+    return nullptr;
+}
 
-    // 运行时增删 NSTCS_HASEXPANDOS：SetControlStyle(mask, style)，
-    // mask 选中的位被改成 style 里对应的值；不需要重建控件、树的展开状态也保留
-    HRESULT hr = ctl_->SetControlStyle(NSTCS_HASEXPANDOS,
-                                       show ? NSTCS_HASEXPANDOS : 0);
-    if (FAILED(hr))
-        WriteAppLog((L"NSTC SetControlStyle(HASEXPANDOS) failed hr=0x" +
-                     std::to_wstring(static_cast<unsigned long>(hr))).c_str());
+void DirectoryTree::SetClassicExpandIcons(bool classic)
+{
+    if (classicExpandIcons_ == classic) return;
+    classicExpandIcons_ = classic;
+    if (!hwnd_ || !IsWindow(hwnd_)) return;
+
+    HWND tree = InnerTreeView(hwnd_);
+    if (!tree) {
+        WriteAppLog(L"NSTC inner SysTreeView32 not found (SetClassicExpandIcons)");
+        return;
+    }
+    // 与 Q-Dir 同款：给内层 TreeView 换主题即可在两种展开图标间切换——
+    //   空主题      → 经典 +/- 方框
+    //   "Explorer" → Win7/Vista 三角/箭头
+    if (classic)
+        SetWindowTheme(tree, L"", L"");
+    else
+        SetWindowTheme(tree, L"Explorer", nullptr);
 }
 
 DirectoryTree::~DirectoryTree()
