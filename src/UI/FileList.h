@@ -23,6 +23,8 @@ public:
     virtual bool HitRowSplit(HWND list, const POINT& clientPt) = 0;
     // 分隔条上按下：转发到主窗口按主窗口客户区坐标处理
     virtual void RowSplitClick(HWND list, WPARAM wp, const POINT& mainClientPt) = 0;
+    // 列表自身把落在任一分隔条“命中带”内的鼠标事件转发给主窗口（窗格间/树/列/行分隔皆可抓）
+    virtual bool HandleSplitterNearList(HWND list, UINT msg, WPARAM wp, LPARAM lp) = 0;
     // 用户交互到非激活窗格：延后激活（宿主判断是否需要）
     virtual void ActivatePaneDeferred(HWND list) = 0;
     // 慢双击重命名（单击 -> 停顿 -> 再单击同一项）

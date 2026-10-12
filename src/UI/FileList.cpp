@@ -94,6 +94,9 @@ void FileList::SetGridLines(bool show)
 LRESULT FileList::Proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (msg == WM_LBUTTONDOWN || msg == WM_SETCURSOR) {
+        // 落在任一分隔条“命中带”内（含间隙两侧窗格区）：转发给主窗口统一拖动
+        if (delegate_ && delegate_->HandleSplitterNearList(h, msg, wp, lp))
+            return msg == WM_SETCURSOR ? TRUE : 0;
         // 上下两排窗格之间的水平分隔条：命中区比可见留白宽，从列表顶部伸进来
         POINT pt{};
         if (msg == WM_LBUTTONDOWN) {

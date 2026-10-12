@@ -22,6 +22,8 @@ struct SettingsData {
     int  triLayout  = 1;      // 三窗格排列：0=品字形(1上2下) 1=倒品字形(2上1下)
     bool autoStart  = false;  // 开机自启动
     bool navSound   = true;   // 窗格换目录时播放导航音
+    // 目录树：禁止展开图标（三角形）。true = 不画 +/- 三角形（Q-Dir 同名选项）
+    bool noExpandIcon = false;
 };
 
 namespace settings {

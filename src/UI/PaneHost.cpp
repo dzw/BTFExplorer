@@ -33,6 +33,8 @@ struct PaneHost::Impl : public ATL::CWindowImpl<Impl> {
 
     BEGIN_MSG_MAP_EX(Impl)
         MSG_WM_SIZE(OnSize)
+        // 内缩留白(Border)不刷会露出后面的深色，这里统一刷成列表同款底色
+        MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBkgnd)
         // 分页栏/列表的 WM_COMMAND、WM_NOTIFY 原本直接发给主窗口（它们是主窗口的
         // 子窗口）；现在父窗口是容器，得在这里转手，主窗口的处理逻辑不用改。
         MESSAGE_HANDLER(WM_COMMAND, ForwardToParent)
@@ -83,6 +85,18 @@ struct PaneHost::Impl : public ATL::CWindowImpl<Impl> {
     void OnSize(UINT, CSize size)
     {
         PlaceAll(static_cast<int>(size.cx), static_cast<int>(size.cy));
+    }
+
+    // 容器背景统一刷成列表同款底色：内缩留白(kEdgePad)若不刷，会露出后面的深色，
+    // 沿左/右/下围成一圈 U 形边框（顶部被列表头盖住看不见）。
+    LRESULT OnEraseBkgnd(UINT /*msg*/, WPARAM wparam, LPARAM /*lparam*/, BOOL& handled)
+    {
+        HDC dc = reinterpret_cast<HDC>(wparam);
+        RECT rc{};
+        GetClientRect(&rc);
+        FillRect(dc, &rc, GetSysColorBrush(COLOR_WINDOW));
+        handled = TRUE;
+        return 1;
     }
 
     // ATL 的 MESSAGE_HANDLER 会把 bHandled 传进处理函数

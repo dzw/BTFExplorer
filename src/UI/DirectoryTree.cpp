@@ -8,6 +8,13 @@
 // 事件接收器。INameSpaceTreeControlEvents 是 local 控件接口（shell32 进程内直调），
 // 通过 INameSpaceTreeControl::TreeAdvise 挂钩，控件持有本对象的一个引用。
 // 回调收到的都是 IShellItem，比旧自建树的通知干净得多。
+//
+// 关键：名称里带 "Before" / "Changing" 的是**否决点**（OnBeforeExpand、
+// OnBeforeItemDelete、OnBeforeContextMenu、OnItemStateChanging），返回失败码
+// （含 E_NOTIMPL）会被控件当成“取消这次操作”，必须返回 S_OK；
+// 只有纯通知型事件（OnAfterExpand / OnItemAdded …）才返回 E_NOTIMPL。
+// 之前展开按钮点不动就是因为 OnItemStateChanging 回了 E_NOTIMPL——展开本质是
+// 项的 NSTCIS_EXPANDED 状态变更，被自己否决掉了。
 // ---------------------------------------------------------------------------
 class DirectoryTree::EventSink : public INameSpaceTreeControlEvents {
 public:
@@ -34,15 +41,15 @@ public:
         return remaining;
     }
 
-    // INameSpaceTreeControlEvents（方法与 SDK 头文件声明一一对应；未使用的事件
-    // 返回 E_NOTIMPL，控件按“未处理”继续默认行为）
+    // INameSpaceTreeControlEvents（方法与 SDK 头文件声明一一对应）
     IFACEMETHODIMP OnItemClick(IShellItem* psi, NSTCEHITTEST /*hitTest*/,
                                NSTCECLICKTYPE clickType) override {
         if (owner_) owner_->OnItemClick(psi, 0, clickType);
         return S_OK;
     }
     IFACEMETHODIMP OnPropertyItemCommit(IShellItem*) override { return E_NOTIMPL; }
-    IFACEMETHODIMP OnItemStateChanging(IShellItem*, NSTCITEMSTATE, NSTCITEMSTATE) override { return E_NOTIMPL; }
+    // 否决点：必须 S_OK，否则项的展开/选中状态变更会被取消
+    IFACEMETHODIMP OnItemStateChanging(IShellItem*, NSTCITEMSTATE, NSTCITEMSTATE) override { return S_OK; }
     IFACEMETHODIMP OnItemStateChanged(IShellItem*, NSTCITEMSTATE, NSTCITEMSTATE) override { return E_NOTIMPL; }
     IFACEMETHODIMP OnSelectionChanged(IShellItemArray* selection) override {
         if (!owner_) return S_OK;
@@ -54,7 +61,8 @@ public:
         return S_OK;
     }
     IFACEMETHODIMP OnKeyboardInput(UINT, WPARAM, LPARAM) override { return E_NOTIMPL; }
-    IFACEMETHODIMP OnBeforeExpand(IShellItem*) override { return E_NOTIMPL; }
+    // 否决点：必须 S_OK，否则不展开
+    IFACEMETHODIMP OnBeforeExpand(IShellItem*) override { return S_OK; }
     IFACEMETHODIMP OnAfterExpand(IShellItem*) override { return E_NOTIMPL; }
     IFACEMETHODIMP OnBeginLabelEdit(IShellItem*) override { return E_NOTIMPL; }
     IFACEMETHODIMP OnEndLabelEdit(IShellItem*) override { return E_NOTIMPL; }
@@ -88,10 +96,14 @@ bool DirectoryTree::Create(HWND parent)
     }
 
     // 资源管理器导航窗格观感：展开钮/连接线/整行选中/常显选中/横向滚动/边框；
-    // 关掉标签编辑和拖放（本树只做导航，不做文件操作）
-    DWORD style = NSTCS_HASEXPANDOS | NSTCS_HASLINES | NSTCS_FULLROWSELECT |
+    // 关掉标签编辑和拖放（本树只做导航，不做文件操作）。
+    // NSTCS_HASEXPANDOS 就是那对展开/折叠图标（Win7+ 下渲染成三角形），
+    // “禁止展开图标(三角形)”关掉时不带这个风格
+    DWORD style = NSTCS_HASLINES | NSTCS_FULLROWSELECT |
                   NSTCS_SHOWSELECTIONALWAYS | NSTCS_HORIZONTALSCROLL | NSTCS_AUTOHSCROLL |
                   NSTCS_TABSTOP | NSTCS_NOEDITLABELS | NSTCS_DISABLEDRAGDROP | NSTCS_BORDER;
+    if (expandButtons_) style |= NSTCS_HASEXPANDOS;
+
     RECT rc = { 0, 0, 0, 0 };
     hr = ctl_->Initialize(parent, &rc, style);
     if (FAILED(hr)) {
@@ -133,6 +145,21 @@ bool DirectoryTree::Create(HWND parent)
         return false;
     }
     return true;
+}
+
+void DirectoryTree::SetExpandButtons(bool show)
+{
+    if (expandButtons_ == show) return;
+    expandButtons_ = show;
+    if (!ctl_) return;
+
+    // 运行时增删 NSTCS_HASEXPANDOS：SetControlStyle(mask, style)，
+    // mask 选中的位被改成 style 里对应的值；不需要重建控件、树的展开状态也保留
+    HRESULT hr = ctl_->SetControlStyle(NSTCS_HASEXPANDOS,
+                                       show ? NSTCS_HASEXPANDOS : 0);
+    if (FAILED(hr))
+        WriteAppLog((L"NSTC SetControlStyle(HASEXPANDOS) failed hr=0x" +
+                     std::to_wstring(static_cast<unsigned long>(hr))).c_str());
 }
 
 DirectoryTree::~DirectoryTree()

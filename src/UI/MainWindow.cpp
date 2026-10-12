@@ -256,6 +256,9 @@ MainWindow* MainWindow::Create(HINSTANCE hInst)
     self->watcher_.Start(self->hwnd_, WM_APP_DIR_CHANGED); // 外部目录变化监视
     self->EnsureTrayIcon();     // 图标常驻：启动就挂上，窗口显示与否通知区都有
     self->RestoreSession();     // 恢复上次会话（窗格/分页/历史），无会话则默认 1 窗格
+    // 会话里恢复的“禁止展开图标(三角形)”要在建树之后再套用一次：
+    // 侧栏（含目录树）在 BuildChildren 里就建好了，那时还没读到会话值
+    self->directoryTree_.SetExpandButtons(!self->noExpandIcon_);
     self->SyncPagerSizeCombo(); // 会话里恢复的“每页项数”要反映到分页栏下拉框
     ShowWindow(self->hwnd_, self->startupShowCmd_);
     UpdateWindow(self->hwnd_);
@@ -309,6 +312,7 @@ void MainWindow::OpenSettings()
     if (data.paneCount > 4) data.paneCount = 4;
     data.triLayout = triLayout_;
     data.navSound = navSound_;
+    data.noExpandIcon = noExpandIcon_;
     if (!settings::GetAutoStart(data.autoStart)) return;
     const bool prevAutoStart = data.autoStart;
 
@@ -322,6 +326,10 @@ void MainWindow::OpenSettings()
         if (d.autoStart != prevAutoStart)
             settings::SetAutoStart(d.autoStart);
         navSound_ = d.navSound;
+        if (d.noExpandIcon != noExpandIcon_) {
+            noExpandIcon_ = d.noExpandIcon;
+            directoryTree_.SetExpandButtons(!noExpandIcon_);   // 即时增删三角形
+        }
         if (d.pagination != paginationEnabled_) {
             paginationEnabled_ = d.pagination;
             CurTab().curPage = 0;
@@ -429,8 +437,9 @@ void MainWindow::CreateSidePanel()
     addTab(L"收藏", 1);
 
     // 树和收藏列表都是 tab_ 的子窗口，显示由 SwitchSideTab 控制。
-    // 目录树用 shell 自带的命名空间树控件（Q-Dir 同款）：节点/图标/Infotip/
-    // 外部变化后的自动刷新全由 shell 维护，字体随系统主题（不再自设）。
+    // 目录树用 shell 自带的命名空间树控件（CLSID_NamespaceTreeControl，Q-Dir
+    // 同款做法）：节点/图标/Infotip/外部变化后的自动刷新全由 shell 维护，
+    // 本程序只负责设置根（命名空间桌面）与同步选中项。
     if (!directoryTree_.Create(tab_))
         WriteAppLog(L"DirectoryTree create failed: tree disabled");
     // 目录树中键点击：在当前活动窗格新开分页打开该目录。
@@ -830,6 +839,7 @@ void MainWindow::SaveSession()
     putLine(L"grid=" + std::to_wstring(showGridLines_ ? 1 : 0));
     putLine(L"pagination=" + std::to_wstring(paginationEnabled_ ? 1 : 0));
     putLine(L"navsound=" + std::to_wstring(navSound_ ? 1 : 0));
+    putLine(L"noexpandicon=" + std::to_wstring(noExpandIcon_ ? 1 : 0));
     putLine(L"pageSize=" + std::to_wstring(pageSize_));
     // 记录窗口位置/尺寸。
     // 非最大化/最小化时改用 GetWindowRect 取“真实屏幕矩形”，这样能正确捕获
@@ -995,6 +1005,10 @@ bool MainWindow::RestoreSession()
             }
             if (w.rfind(L"navsound=", 0) == 0) {
                 navSound_ = (_wtoi(w.c_str() + 9) != 0);
+                continue;
+            }
+            if (w.rfind(L"noexpandicon=", 0) == 0) {
+                noExpandIcon_ = (_wtoi(w.c_str() + 13) != 0);
                 continue;
             }
             if (w.rfind(L"pageSize=", 0) == 0) {
@@ -2069,6 +2083,61 @@ void MainWindow::RowSplitClick(HWND list, WPARAM wp, const POINT& mainClientPt)
     SendMessageW(hwnd_, WM_LBUTTONDOWN, wp, MAKELPARAM(mainClientPt.x, mainClientPt.y));
 }
 
+// 分隔条命中带：间隙本身（kSplitGap）很窄，但可抓范围向两侧各扩 kSplitHit，
+// 这样即使鼠标落在相邻窗格/树里紧贴间隙的 6px 内也能抓住（tab 头早已如此转发，
+// 这里让列表也转发，列表内容区不再是“抓不到”的死区）。
+bool MainWindow::IsSplitterAt(POINT pt) const
+{
+    if (pt.y < splitTop_ || pt.y > splitBot_) return false;
+    // 上下两排之间的水平分隔条（行分隔）
+    if (rowSplitY_ >= 0 && !paneRects_.empty() &&
+        pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitGap + kSplitHit &&
+        pt.x >= rowSplitX0_ && pt.x <= rowSplitX1_)
+        return true;
+    // 左右两栏之间的竖向分隔（仅不对称布局有）
+    if (colSplitX_ >= 0 &&
+        pt.x >= colSplitX_ - kSplitHit && pt.x <= colSplitX_ + kSplitGap + kSplitHit &&
+        pt.y >= rowSplitTop_ && pt.y <= rowSplitBottom_)
+        return true;
+    // 同排并排窗格间的竖向分隔
+    for (const auto& pr : splitPairs_) {
+        int edge = paneRects_[pr.first].right;
+        if (pt.x >= edge - kSplitHit && pt.x <= edge + kSplitGap + kSplitHit &&
+            pt.y >= paneRects_[pr.first].top && pt.y <= paneRects_[pr.first].bottom)
+            return true;
+    }
+    // 目录树与文件列表之间的竖向分隔
+    return pt.x >= sideWidth_ - kSplitHit && pt.x <= sideWidth_ + kSplitGap + kSplitHit;
+}
+
+void MainWindow::SetSplitterCursor(POINT pt) const
+{
+    SetCursor(LoadCursor(nullptr, IDC_SIZEWE));   // 默认竖分隔（列/树）
+    if (rowSplitY_ >= 0 && !paneRects_.empty() &&
+        pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitGap + kSplitHit &&
+        pt.x >= rowSplitX0_ && pt.x <= rowSplitX1_)
+        SetCursor(LoadCursor(nullptr, IDC_SIZENS)); // 行分隔（上下排）
+}
+
+// 列表（及目录树区下方）把命中带内的鼠标事件转给主窗口，主窗口按主窗口客户区坐标处理。
+bool MainWindow::HandleSplitterNearList(HWND list, UINT msg, WPARAM wp, LPARAM lp)
+{
+    POINT pt{};
+    if (msg == WM_LBUTTONDOWN) {
+        pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        ClientToScreen(list, &pt);
+    } else { // WM_SETCURSOR
+        GetCursorPos(&pt);
+    }
+    ScreenToClient(hwnd_, &pt);
+    if (!IsSplitterAt(pt)) return false;
+    if (msg == WM_LBUTTONDOWN)
+        SendMessageW(hwnd_, WM_LBUTTONDOWN, wp, MAKELPARAM(pt.x, pt.y));
+    else
+        SetSplitterCursor(pt);
+    return true;
+}
+
 void MainWindow::ActivatePaneDeferred(HWND list)
 {
     int pi = PaneOfList(list);
@@ -2932,28 +3001,6 @@ static LRESULT CALLBACK PaneTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC orig)
 {
     // Hit zones overlap pane tabs; forward those mouse events because the parent won't receive them.
-    auto isSplitterHit = [&](POINT pt) {
-        ClientToScreen(h, &pt);
-        ScreenToClient(hwnd_, &pt);
-        if (pt.y < splitTop_ || pt.y > splitBot_) return false;
-        // 上下两排之间的水平分隔条（行分隔）：限定在 rowSplitX0_~rowSplitX1_ 之间
-        if (rowSplitY_ >= 0 && !paneRects_.empty() &&
-            pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitHit &&
-            pt.x >= rowSplitX0_ && pt.x <= rowSplitX1_)
-            return true;
-        // 左右两栏之间的竖向分隔条（列分隔，仅不对称布局有）
-        if (colSplitX_ >= 0 &&
-            pt.x >= colSplitX_ - kSplitHit && pt.x <= colSplitX_ + kSplitHit &&
-            pt.y >= rowSplitTop_ && pt.y <= rowSplitBottom_)
-            return true;
-        for (const auto& pr : splitPairs_) {
-            int edge = paneRects_[pr.first].right;
-            if (pt.x >= edge && pt.x <= edge + kSplitHit &&
-                pt.y >= paneRects_[pr.first].top && pt.y <= paneRects_[pr.first].bottom)
-                return true;
-        }
-        return pt.x >= sideWidth_ && pt.x <= sideWidth_ + kSplitHit;
-    };
     auto isTabItemAt = [&](POINT pt) {
         int count = static_cast<int>(SendMessageW(h, TCM_GETITEMCOUNT, 0, 0));
         for (int i = 0; i < count; ++i) {
@@ -2967,25 +3014,18 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
     };
     if (m == WM_LBUTTONDOWN) {
         POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        if (isSplitterHit(pt)) {
-            ClientToScreen(h, &pt);
-            ScreenToClient(hwnd_, &pt);
+        ClientToScreen(h, &pt);
+        ScreenToClient(hwnd_, &pt);
+        if (IsSplitterAt(pt)) {
             SendMessageW(hwnd_, WM_LBUTTONDOWN, wp, MAKELPARAM(pt.x, pt.y));
             return 0;
         }
     } else if (m == WM_SETCURSOR) {
         POINT pt{};
         GetCursorPos(&pt);
-        ScreenToClient(h, &pt);
-        if (isSplitterHit(pt)) {
-            SetCursor(LoadCursor(nullptr, IDC_SIZEWE));   // 默认竖分隔（列）
-            ClientToScreen(h, &pt);
-            ScreenToClient(hwnd_, &pt);
-            if (rowSplitY_ >= 0 &&
-                pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitHit &&
-                pt.x >= rowSplitX0_ && pt.x <= rowSplitX1_) {
-                SetCursor(LoadCursor(nullptr, IDC_SIZENS)); // 行分隔（上下排）
-            }
+        ScreenToClient(hwnd_, &pt);
+        if (IsSplitterAt(pt)) {
+            SetSplitterCursor(pt);
             return TRUE;
         }
     }
@@ -4353,33 +4393,33 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    // 分隔条拖动：sideW .. sideW+12 之间是空命中区，鼠标落在此处归主窗口
+    // 分隔条拖动：命中带为“间隙两侧各 kSplitHit”，落在窗格/树区也能抓到，归主窗口处理
     case WM_LBUTTONDOWN: {
         int x = static_cast<int>(GET_X_LPARAM(lp));
         int yy = static_cast<int>(GET_Y_LPARAM(lp));
         // 左右两栏竖向分隔（仅不对称布局有）
         if (colSplitX_ >= 0 && yy >= rowSplitTop_ && yy <= rowSplitBottom_ &&
-            x >= colSplitX_ - kSplitHit && x <= colSplitX_ + kSplitHit) {
+            x >= colSplitX_ - kSplitHit && x <= colSplitX_ + kSplitGap + kSplitHit) {
             colSplitDragging_ = true;
             SetCapture(hwnd_);
             SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
             return 0;
         }
         if (rowSplitY_ >= 0 && !paneRects_.empty() &&
-            yy >= rowSplitY_ - kSplitHit && yy <= rowSplitY_ + kSplitHit &&
+            yy >= rowSplitY_ - kSplitHit && yy <= rowSplitY_ + kSplitGap + kSplitHit &&
             x >= rowSplitX0_ && x <= rowSplitX1_) {
             rowSplitDragging_ = true;
             SetCapture(hwnd_);
             SetCursor(LoadCursor(nullptr, IDC_SIZENS));
             return 0;
         }
-        // 窗格间分隔条命中：splitPairs_ 各对的右缘 .. +12（限该排高度内）
+        // 窗格间分隔条命中：splitPairs_ 各对的边界 ±kSplitHit（限该排高度内）
         if (yy >= splitTop_ && yy <= splitBot_) {
             for (size_t k = 0; k < splitPairs_.size(); ++k) {
                 auto& pr = splitPairs_[k];
                 int edge = paneRects_[pr.first].right;
                 int top = paneRects_[pr.first].top, bot = paneRects_[pr.first].bottom;
-                if (x >= edge && x <= edge + kSplitHit && yy >= top && yy <= bot) {
+                if (x >= edge - kSplitHit && x <= edge + kSplitGap + kSplitHit && yy >= top && yy <= bot) {
                     paneSplitDragging_ = true;
                     paneSplitIndex_ = (int)k;
                     SetCapture(hwnd_);
@@ -4388,7 +4428,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                 }
             }
         }
-        if (x >= sideWidth_ && x <= sideWidth_ + kSplitHit && yy >= splitTop_ && yy <= splitBot_) {
+        if (x >= sideWidth_ - kSplitHit && x <= sideWidth_ + kSplitGap + kSplitHit && yy >= splitTop_ && yy <= splitBot_) {
             draggingSplitter_ = true;
             SetCapture(hwnd_);
             SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
@@ -4503,12 +4543,12 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
     case WM_SETCURSOR: {
         POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd_, &pt);
         if (colSplitX_ >= 0 && pt.y >= rowSplitTop_ && pt.y <= rowSplitBottom_ &&
-            pt.x >= colSplitX_ - kSplitHit && pt.x <= colSplitX_ + kSplitHit) {
+            pt.x >= colSplitX_ - kSplitHit && pt.x <= colSplitX_ + kSplitGap + kSplitHit) {
             SetCursor(LoadCursor(nullptr, IDC_SIZEWE));   // 列分隔（左右两栏）
             return TRUE;
         }
         if (rowSplitY_ >= 0 && !paneRects_.empty() &&
-            pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitHit &&
+            pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitGap + kSplitHit &&
             pt.x >= rowSplitX0_ && pt.x <= rowSplitX1_) {
             SetCursor(LoadCursor(nullptr, IDC_SIZENS));   // 行分隔（上下两排）
             return TRUE;
@@ -4518,14 +4558,14 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             for (size_t k = 0; k < splitPairs_.size(); ++k) {
                 auto& pr = splitPairs_[k];
                 int edge = paneRects_[pr.first].right;
-                if (pt.x >= edge && pt.x <= edge + kSplitHit &&
+                if (pt.x >= edge - kSplitHit && pt.x <= edge + kSplitGap + kSplitHit &&
                     pt.y >= paneRects_[pr.first].top && pt.y <= paneRects_[pr.first].bottom) {
                     SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
                     return TRUE;
                 }
             }
         }
-        if (pt.x >= sideWidth_ && pt.x <= sideWidth_ + kSplitHit &&
+        if (pt.x >= sideWidth_ - kSplitHit && pt.x <= sideWidth_ + kSplitGap + kSplitHit &&
             pt.y >= splitTop_ && pt.y <= splitBot_) {
             SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
             return TRUE;

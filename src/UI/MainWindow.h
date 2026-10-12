@@ -113,6 +113,9 @@ private:
     // 目录树分隔条拖动预览：拖动过程中只移动一条浮在上面的竖线，松手才改宽度
     void ShowSplitPreview(int x);   // 主窗口客户区 x（已钳位）
     void CloseSplitPreview();       // 销毁预览窗口
+    // 分隔条命中测试/光标：命中带为“间隙两侧各 kSplitHit”，让间隙两侧的窗格区也能抓到
+    bool IsSplitterAt(POINT pt) const;
+    void SetSplitterCursor(POINT pt) const;
     int ClampedSideWidth(int x) const;
     void CreateSidePanel();          // 左侧 Tab 容器：目录树 / 收藏
     void SwitchSideTab(int index);   // 切换 tab 显示
@@ -158,6 +161,7 @@ private:
     // FileListDelegate：自绘列表的交互回调（控件侧只管显示与命中，业务在这里）
     bool HitRowSplit(HWND list, const POINT& clientPt) override;
     void RowSplitClick(HWND list, WPARAM wp, const POINT& mainClientPt) override;
+    bool HandleSplitterNearList(HWND list, UINT msg, WPARAM wp, LPARAM lp) override;
     void ActivatePaneDeferred(HWND list) override;
     void SlowRename(HWND list, int item) override;
     void ListKeyCommand(HWND list, int cmd) override;
@@ -319,5 +323,7 @@ private:
     // （启动恢复、地址栏提交、刷新）期间由 navSoundMute_ 静音。
     bool navSound_ = true;
     bool navSoundMute_ = false;
+    // 目录树是否禁止展开图标（三角形），对应设置里的同名选项（Q-Dir 同款）
+    bool noExpandIcon_ = false;
     void PlayNavSound();
 };

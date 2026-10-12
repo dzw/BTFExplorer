@@ -9,8 +9,8 @@
 
 // 左侧目录树：封装 shell 自带的“命名空间树控件”（CLSID_NamespaceTreeControl，
 // Q-Dir 同款做法）。树的节点、图标、Infotip、外部变化后的自动刷新全部由 shell
-// 维护，本类只负责三件事：设置根（命名空间桌面）、把当前目录同步为选中项、
-// 把选中/中键点击转成文件系统路径回调给上层导航。
+// 维护，本类只负责几件事：设置根（命名空间桌面）、把当前目录同步为选中项、
+// 把选中/中键点击转成文件系统路径回调给上层导航、以及开关展开图标（三角形）。
 class DirectoryTree {
 public:
     DirectoryTree() = default;
@@ -31,6 +31,12 @@ public:
     // showErrors 参数保留以兼容旧调用点；控件覆盖整个命名空间，找不到时静默保持现状。
     void SyncToPath(const std::wstring& path, bool showErrors);
 
+    // 开关展开/折叠图标（三角形），对应 Q-Dir 的“禁止展开图标(三角形)”。
+    // NSTC 由 NSTCS_HASEXPANDOS 控制：创建时按此值决定初始风格，之后用
+    // SetControlStyle 即时增删（不需要重建控件）。
+    void SetExpandButtons(bool show);
+    bool ExpandButtons() const { return expandButtons_; }
+
 private:
     class EventSink;
     friend class EventSink;
@@ -47,6 +53,8 @@ private:
     // 事件到达时匹配即吞掉；目标已选中时不记数（控件此时不发事件，记了会残留）。
     std::map<std::wstring, int> pendingSelects_;
     std::wstring SelectedPath();             // 当前选中项的文件系统路径（无/虚拟则空）
+    // 是否显示展开/折叠图标（三角形）
+    bool expandButtons_ = true;
     std::function<void(const std::wstring&)> onSelection_;
     std::function<void(const std::wstring&)> onMiddleClick_;
 };

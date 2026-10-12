@@ -1,5 +1,4 @@
 /PagedExplorer/build
-PagedExplorer/src/UI/MainWindow.h
 .tmpbak
 /build
 build.bat
@@ -10,3 +9,4 @@ build.bat
 /.codebuddy/*.png
 .codebuddy/*.ps1
 /QDirRef
+.dsh-acl-recovery/
