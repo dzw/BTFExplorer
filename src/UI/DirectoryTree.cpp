@@ -1,11 +1,18 @@
 #include "DirectoryTree.h"
 #include "../Shell/ShellUtil.h"
 #include "../Util/AppLog.h"
+#include <commctrl.h>         // TreeView_Get/SetExtendedStyle、TVS_EX_FADEINOUTEXPANDOS
 #include <shlwapi.h>
 #include <uxtheme.h>          // SetWindowTheme
 #include <vector>
 
 #pragma comment(lib, "UxTheme.lib")
+
+// commctrl.h 只在 _WIN32_WINNT >= 0x0600 时声明它；本工程没显式设 _WIN32_WINNT
+// （走 SDK 默认），为防将来改低导致编译不过，这里留个兜底定义（值同 SDK）。
+#ifndef TVS_EX_FADEINOUTEXPANDOS
+#define TVS_EX_FADEINOUTEXPANDOS 0x0040
+#endif
 
 // ---------------------------------------------------------------------------
 // 事件接收器。INameSpaceTreeControlEvents 是 local 控件接口（shell32 进程内直调），
@@ -146,6 +153,9 @@ bool DirectoryTree::Create(HWND parent)
         ctl_.Release();
         return false;
     }
+    // 默认（现代三角）也要套一次：SetClassicExpandIcons 在值没变时会提前返回，
+    // 启动时那次调用（false→false）走不到下面，扩展样式就永远没人设。
+    ApplyExpandIconStyle();
     return true;
 }
 
@@ -165,13 +175,20 @@ void DirectoryTree::SetClassicExpandIcons(bool classic)
 {
     if (classicExpandIcons_ == classic) return;
     classicExpandIcons_ = classic;
+    ApplyExpandIconStyle();
+}
+
+// 把当前 classicExpandIcons_ 套到内层 SysTreeView32 上（建树时和用户切换时都要走）
+void DirectoryTree::ApplyExpandIconStyle()
+{
     if (!hwnd_ || !IsWindow(hwnd_)) return;
 
     HWND tree = InnerTreeView(hwnd_);
     if (!tree) {
-        WriteAppLog(L"NSTC inner SysTreeView32 not found (SetClassicExpandIcons)");
+        WriteAppLog(L"NSTC inner SysTreeView32 not found (ApplyExpandIconStyle)");
         return;
     }
+    const bool classic = classicExpandIcons_;
     // 与 Q-Dir 同款：给内层 TreeView 换主题即可在两种展开图标间切换——
     //   空主题      → 经典 +/- 方框
     //   "Explorer" → Win7/Vista 三角/箭头
@@ -179,6 +196,23 @@ void DirectoryTree::SetClassicExpandIcons(bool classic)
         SetWindowTheme(tree, L"", L"");
     else
         SetWindowTheme(tree, L"Explorer", nullptr);
+
+    // 光换主题不够：现代三角还必须配套 TVS_EX_FADEINOUTEXPANDOS，它同时启用
+    // 淡入淡出动画和与之匹配的命中测试判定。缺了它，单击小三角可能被判成
+    // “点整行”（只选中），要双击才展开。经典 +/- 方框则反过来要清掉它。
+    // （comctl32 v6 已由 main.cpp 的 /manifestdependency 内嵌清单启用，否则
+    //   TVM_SETEXTENDEDSTYLE 会被忽略——下面日志里的 after 能验证是否真的生效）
+    const DWORD_PTR cur  = TreeView_GetExtendedStyle(tree);
+    const DWORD_PTR want = classic ? (cur & ~static_cast<DWORD_PTR>(TVS_EX_FADEINOUTEXPANDOS))
+                                   : (cur |  static_cast<DWORD_PTR>(TVS_EX_FADEINOUTEXPANDOS));
+    const DWORD_PTR prev = static_cast<DWORD_PTR>(
+        TreeView_SetExtendedStyle(tree, want, TVS_EX_FADEINOUTEXPANDOS));
+    const DWORD_PTR after = TreeView_GetExtendedStyle(tree);
+
+    wchar_t buf[160];
+    wsprintfW(buf, L"NSTC expando style classic=%d prev=0x%IX want=0x%IX after=0x%IX",
+              classic ? 1 : 0, prev, want, after);
+    WriteAppLog(buf);
 }
 
 DirectoryTree::~DirectoryTree()

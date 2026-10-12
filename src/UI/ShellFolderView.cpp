@@ -169,6 +169,11 @@ LRESULT CALLBACK ShellFolderView::CtxProcStatic(HWND h, UINT msg, WPARAM wp, LPA
 {
     auto* self = reinterpret_cast<ShellFolderView*>(ref);
     if (!self) return DefSubclassProc(h, msg, wp, lp);
+    // 真正的用户输入 -> 请求把本视图所在窗格设为激活窗格。只通知、不吞消息，
+    // 视图自身的选中/打开行为完全不变（对等于自绘列表的 ActivatePaneDeferred）。
+    if ((msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN ||
+         msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && self->onActivateRequest)
+        self->onActivateRequest();
     if (msg == WM_CONTEXTMENU && self->TakeContextMenu(lp))
         return 0;   // 吞掉：不让 shell 弹它的原生菜单（没有本程序的自定义项）
     if (msg == WM_KEYDOWN && wp == VK_F2 && self->TakeRenameKey())

@@ -40,6 +40,9 @@ public:
     bool ClassicExpandIcons() const { return classicExpandIcons_; }
 
 private:
+    // 按 classicExpandIcons_ 给内层 SysTreeView32 套主题 + 展开图标扩展样式
+    void ApplyExpandIconStyle();
+
     class EventSink;
     friend class EventSink;
     void OnSelectionChanged(IShellItem* psi);

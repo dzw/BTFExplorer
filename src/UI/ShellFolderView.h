@@ -43,6 +43,11 @@ public:
     // IShellBrowser 的最小集，多数取不到编辑框），拦下来交回调，由主窗口用与
     // 自绘列表相同的重命名对话框处理。接收方同样要延后处理。
     std::function<void()> onRenameKey;
+    // 视图内真正的用户输入（鼠标按键 / 键盘）：请求宿主把本视图所在窗格设为
+    // 激活窗格。shell 视图的消息不走自绘列表那条 FileList::Proc，所以点它不会
+    // 像自绘列表那样自动激活，得由这条回调补上（两者对等）。
+    // 接收方必须延后处理：回调发生在 shell 视图自己的消息链内，直接切换会重入。
+    std::function<void()> onActivateRequest;
 
     // 选中项的文件系统路径（虚拟位置跳过）
     std::vector<std::wstring> SelectedPaths() const;

@@ -1971,6 +1971,13 @@ bool MainWindow::EnsureTabShellView(size_t paneIdx, TabState& t)
     t.shellView->onRenameKey = [this, view = t.shellView.get()]() {
         PostMessageW(hwnd_, WM_APP_SHELL_RENAME, reinterpret_cast<WPARAM>(view), 0);
     };
+    // 在视图里点一下/敲一下键盘，也要把所在窗格切为激活窗格：shell 视图的消息
+    // 不走自绘列表那条 FileList::Proc，没有自动激活，这里补上（同样延后执行）。
+    t.shellView->onActivateRequest = [this, view = t.shellView.get()]() {
+        int pi = PaneOfShellView(view);
+        if (pi >= 0 && static_cast<size_t>(pi) != activePane_)
+            PostSelectPane(static_cast<size_t>(pi));
+    };
     // 视图宿主登记给容器摆放（它与自绘列表重叠，显隐由 listMode 决定）
     panes_[paneIdx].host->AddContent(t.shellView->Host());
     if (!t.dir.empty() && !t.shellView->Navigate(t.dir)) {
