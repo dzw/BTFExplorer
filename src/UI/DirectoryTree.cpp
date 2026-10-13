@@ -1,7 +1,8 @@
 #include "DirectoryTree.h"
 #include "../Shell/ShellUtil.h"
 #include "../Util/AppLog.h"
-#include <commctrl.h>         // TreeView_Get/SetExtendedStyle、TVS_EX_FADEINOUTEXPANDOS
+#include <commctrl.h>         // TreeView_*、SetWindowSubclass、TVS_EX_FADEINOUTEXPANDOS
+#include <windowsx.h>         // GET_X_LPARAM / GET_Y_LPARAM
 #include <shlwapi.h>
 #include <uxtheme.h>          // SetWindowTheme
 #include <vector>
@@ -13,6 +14,34 @@
 #ifndef TVS_EX_FADEINOUTEXPANDOS
 #define TVS_EX_FADEINOUTEXPANDOS 0x0040
 #endif
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// 展开钮双击去重（装在控件内层的 SysTreeView32 上）
+//
+// 控件把“单击展开钮”只当成 OnItemClick(hit=ONITEMBUTTON) 通知报给我们，自己
+// 不做展开（实测该单击之后 OnBeforeExpand 完全不触发）；切换动作只在双击的
+// WM_LBUTTONDBLCLK 里由控件内部完成。本类改为在单击时代控件切换一次
+// （DirectoryTree::ToggleExpanded），所以必须把紧随其后的 DBLCLK 挡掉：
+// 否则一次双击 = 我们切换 1 次 + 控件再切换 1 次 = 状态原地不动。
+// ---------------------------------------------------------------------------
+constexpr UINT_PTR kExpandoSubclassId = 0x4558;   // 'EX'
+
+LRESULT CALLBACK ExpandoClickProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
+                                  UINT_PTR uIdSubclass, DWORD_PTR)
+{
+    if (uMsg == WM_NCDESTROY) {
+        RemoveWindowSubclass(hWnd, ExpandoClickProc, uIdSubclass);
+    } else if (uMsg == WM_LBUTTONDBLCLK) {
+        TVHITTESTINFO ht{};
+        ht.pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        if (TreeView_HitTest(hWnd, &ht) && (ht.flags & TVHT_ONITEMBUTTON)) return 0;
+    }
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // 事件接收器。INameSpaceTreeControlEvents 是 local 控件接口（shell32 进程内直调），
@@ -52,9 +81,9 @@ public:
     }
 
     // INameSpaceTreeControlEvents（方法与 SDK 头文件声明一一对应）
-    IFACEMETHODIMP OnItemClick(IShellItem* psi, NSTCEHITTEST /*hitTest*/,
+    IFACEMETHODIMP OnItemClick(IShellItem* psi, NSTCEHITTEST hitTest,
                                NSTCECLICKTYPE clickType) override {
-        if (owner_) owner_->OnItemClick(psi, 0, clickType);
+        if (owner_) owner_->OnItemClick(psi, hitTest, clickType);
         return S_OK;
     }
     IFACEMETHODIMP OnPropertyItemCommit(IShellItem*) override { return E_NOTIMPL; }
@@ -197,22 +226,14 @@ void DirectoryTree::ApplyExpandIconStyle()
     else
         SetWindowTheme(tree, L"Explorer", nullptr);
 
-    // 光换主题不够：现代三角还必须配套 TVS_EX_FADEINOUTEXPANDOS，它同时启用
-    // 淡入淡出动画和与之匹配的命中测试判定。缺了它，单击小三角可能被判成
-    // “点整行”（只选中），要双击才展开。经典 +/- 方框则反过来要清掉它。
-    // （comctl32 v6 已由 main.cpp 的 /manifestdependency 内嵌清单启用，否则
-    //   TVM_SETEXTENDEDSTYLE 会被忽略——下面日志里的 after 能验证是否真的生效）
-    const DWORD_PTR cur  = TreeView_GetExtendedStyle(tree);
-    const DWORD_PTR want = classic ? (cur & ~static_cast<DWORD_PTR>(TVS_EX_FADEINOUTEXPANDOS))
-                                   : (cur |  static_cast<DWORD_PTR>(TVS_EX_FADEINOUTEXPANDOS));
-    const DWORD_PTR prev = static_cast<DWORD_PTR>(
-        TreeView_SetExtendedStyle(tree, want, TVS_EX_FADEINOUTEXPANDOS));
-    const DWORD_PTR after = TreeView_GetExtendedStyle(tree);
+    // 展开图标一律**不**开 TVS_EX_FADEINOUTEXPANDOS：这个位把展开钮做成“鼠标悬停
+    // 才淡入”，不悬停时看不见也点不着。但实测开与不开，单击展开钮控件都不发起展开
+    // （OnBeforeExpand 压根不触发，必须双击才切），所以真正的修复在别处：单击时由
+    // DirectoryTree::ToggleExpanded 代控件切换，并挡掉双击的第二次按下。
+    TreeView_SetExtendedStyle(tree, 0, TVS_EX_FADEINOUTEXPANDOS);
 
-    wchar_t buf[160];
-    wsprintfW(buf, L"NSTC expando style classic=%d prev=0x%IX want=0x%IX after=0x%IX",
-              classic ? 1 : 0, prev, want, after);
-    WriteAppLog(buf);
+    // 挡住展开钮上的 WM_LBUTTONDBLCLK（见 ExpandoClickProc）；同 id 重复安装是幂等的
+    SetWindowSubclass(tree, ExpandoClickProc, kExpandoSubclassId, 0);
 }
 
 DirectoryTree::~DirectoryTree()
@@ -270,13 +291,35 @@ void DirectoryTree::OnSelectionChanged(IShellItem* psi)
     if (onSelection_) onSelection_(path);
 }
 
-void DirectoryTree::OnItemClick(IShellItem* psi, NSTCEHITTEST, NSTCECLICKTYPE clickType)
+void DirectoryTree::ToggleExpanded(IShellItem* psi)
 {
-    if (!psi || !onMiddleClick_) return;
-    if (!ISMBUTTON(clickType) || ISDBLCLICK(clickType)) return;   // 只处理中键单击
+    if (!ctl_ || !psi) return;
+    NSTCITEMSTATE st = NSTCIS_NONE;
+    if (FAILED(ctl_->GetItemState(psi, NSTCIS_EXPANDED, &st))) return;
+    ctl_->SetItemState(psi, (st & NSTCIS_EXPANDED) ? NSTCIS_NONE : NSTCIS_EXPANDED,
+                       NSTCIS_EXPANDED);
+}
+
+void DirectoryTree::OnItemClick(IShellItem* psi, NSTCEHITTEST hitTest, NSTCECLICKTYPE clickType)
+{
+    if (!psi) return;
+
+    if (onMiddleClick_ && ISMBUTTON(clickType) && !ISDBLCLICK(clickType)) {   // 中键单击：新窗格打开
+        std::wstring path = PathOfItem(psi);
+        if (!path.empty()) onMiddleClick_(path);
+        return;
+    }
+
+    // 单击展开钮：控件自己不做这件事（见 ExpandoClickProc 注释），由这里代它切换
+    if (!(hitTest & NSTCEHT_ONITEMBUTTON) || clickType != NSTCECT_LBUTTON) return;
     std::wstring path = PathOfItem(psi);
-    if (path.empty()) return;
-    onMiddleClick_(path);
+    // 双击时两个“抬起”都可能以 LBUTTON 报一次 OnItemClick，第二个必须忽略，
+    // 否则一次双击净结果 = 展开又折叠（DBLCLK 本身已由子类挡掉）
+    const DWORD now = GetTickCount();
+    if (path == lastTogglePath_ && now - lastToggleTick_ < GetDoubleClickTime()) return;
+    lastTogglePath_ = std::move(path);
+    lastToggleTick_ = now;
+    ToggleExpanded(psi);
 }
 
 void DirectoryTree::SyncToPath(const std::wstring& rawPath, bool showErrors)

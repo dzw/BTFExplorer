@@ -47,6 +47,10 @@ private:
     friend class EventSink;
     void OnSelectionChanged(IShellItem* psi);
     void OnItemClick(IShellItem* psi, NSTCEHITTEST hitTest, NSTCECLICKTYPE clickType);
+    // 单击展开钮：控件只把“点在按钮上”报给我们，自己不做展开（实测单击后
+    // OnBeforeExpand 根本不触发，必须双击才走控件内部那条切换路径）。所以这里
+    // 代它切换一次展开状态，单击/双击就都只在按钮上生效一次。
+    void ToggleExpanded(IShellItem* psi);
     static std::wstring PathOfItem(IShellItem* psi);   // 虚拟位置返回空串
 
     HWND hwnd_ = nullptr;                    // 控件窗口（窗口类 "NamespaceTreeControl"）
@@ -62,4 +66,7 @@ private:
     bool classicExpandIcons_ = false;
     std::function<void(const std::wstring&)> onSelection_;
     std::function<void(const std::wstring&)> onMiddleClick_;
+    // 单击展开钮去重：记录上一次切换的项与时刻，双击的第二次报同一项时不再切换
+    std::wstring lastTogglePath_;
+    DWORD lastToggleTick_ = 0;
 };

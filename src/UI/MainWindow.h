@@ -13,6 +13,9 @@
 #include "PaneHost.h"
 #include "ShellFolderView.h"
 
+// 分隔条树的内部实现（WTL 分隔条窗口，见 MainWindow.cpp）
+struct SplitLayout;
+
 // 控件 ID（主窗口与 main.cpp 的加速键 / 单实例逻辑共享）
 enum {
     IDC_ADDRESS = 1001, IDC_TREE = 1002, IDC_LIST = 1003,
@@ -91,6 +94,7 @@ struct Pane {
 class MainWindow : public FileListDelegate {
 public:
     static MainWindow* Create(HINSTANCE hInst);
+    ~MainWindow();
     PageManager& Pages() { return *tabs_[activeTab_].pages; }
     HWND Hwnd() const { return hwnd_; } // main.cpp 单实例/加速键/Win+E 拦截用
     // 打开外部传入的目录或文件（文件则导航到其所在目录）
@@ -98,6 +102,8 @@ public:
 
 private:
     MainWindow() = default;
+    MainWindow(const MainWindow&) = delete;
+    MainWindow& operator=(const MainWindow&) = delete;
 
     friend LRESULT CALLBACK PaneTabProc(HWND, UINT, WPARAM, LPARAM);
     friend class FileDropTarget;
@@ -110,13 +116,13 @@ private:
     // UI 构建
     void BuildChildren();
     void Layout();
-    // 目录树分隔条拖动预览：拖动过程中只移动一条浮在上面的竖线，松手才改宽度
-    void ShowSplitPreview(int x);   // 主窗口客户区 x（已钳位）
-    void CloseSplitPreview();       // 销毁预览窗口
-    // 分隔条命中测试/光标：命中带为“间隙两侧各 kSplitHit”，让间隙两侧的窗格区也能抓到
-    bool IsSplitterAt(POINT pt) const;
-    void SetSplitterCursor(POINT pt) const;
-    int ClampedSideWidth(int x) const;
+    // 分隔条（Q-Dir 同款：WTL 的 WTL_XSplitterWindow 搭成一棵树，拖动/双击复位/
+    // 非实时拖动时的虚线预览条都由分隔条窗口自己负责，主窗口不再做命中测试）
+    void RebuildSplitters(int totalWidth);  // 布局（窗格数/形态）变化后重建分隔条树
+    int  BuildRightTree();                  // 造右侧窗格区的分隔条树，返回根结点下标
+    void DestroySplitWindows(int node);     // 递归销毁分隔条窗口（先子后父）
+    void CaptureSplitState();               // 分隔条当前位置回写进 sideWidth_/width/permille
+    void UpdatePaneRects();                 // 按窗格窗口实际矩形刷新 paneRects_（分页拖拽命中用）
     void CreateSidePanel();          // 左侧 Tab 容器：目录树 / 收藏
     void SwitchSideTab(int index);   // 切换 tab 显示
     void SyncTreeToCurrentTab(bool showErrors = true);
@@ -159,9 +165,6 @@ private:
     void ShowHidePaneShellViews(size_t paneIdx);           // 只显示当前分页的视图，隐藏同窗格其余
 
     // FileListDelegate：自绘列表的交互回调（控件侧只管显示与命中，业务在这里）
-    bool HitRowSplit(HWND list, const POINT& clientPt) override;
-    void RowSplitClick(HWND list, WPARAM wp, const POINT& mainClientPt) override;
-    bool HandleSplitterNearList(HWND list, UINT msg, WPARAM wp, LPARAM lp) override;
     void ActivatePaneDeferred(HWND list) override;
     void SlowRename(HWND list, int item) override;
     void ListKeyCommand(HWND list, int cmd) override;
@@ -204,40 +207,33 @@ private:
     HFONT uiFont_ = nullptr;
 
     // 布局 / 交互
-    int sideWidth_ = 220;          // 左侧面板宽度（可被分隔条拖动改变）
+    int sideWidth_ = 220;          // 左侧面板宽度（分隔条拖动的落点，落盘用）
+    int pendingSideWidth_ = 0;     // 待按像素生效的侧栏宽度（会话恢复值/重建后的旧值）：
+                                   // 分隔条内部按千分比存位置，等到尺寸定了再精确落一次
     int startupShowCmd_ = SW_SHOW;
     bool restoreInProgress_ = false;     // 恢复会话期间抑制 SaveSession，避免递归/重复写盘
     RECT lastSavedWinRect_{};            // 上次落盘的窗口矩形（用于跳过重排时的重复写）
     DWORD lastSaveTick_ = 0;             // 上次落盘时刻（限流，避免拖动时频繁写盘）
-    bool draggingSplitter_ = false;
-    int splitTop_ = 36;            // 分隔条可拖动的水平范围
-    int splitBot_ = 0;
-    HWND splitPreview_ = nullptr;  // 拖动中的预览线窗口（见 ShowSplitPreview）
-    int splitPreviewX_ = -1;       // 预览线当前位置（主窗口客户区 x）
 
     // ---- 多窗格 / 多分页状态 ----
     std::vector<TabState> tabs_;        // 全部分页（按 pane 字段归属窗格）
     std::vector<Pane> panes_;           // 右侧窗格（水平排列）
     size_t activePane_ = 0;             // 激活窗格（树/收藏/命令作用目标）
     size_t activeTab_ = 0;              // 激活窗格内的当前分页（tabs_ 下标）
-    bool paneSplitDragging_ = false;    // 正在拖窗格间分隔条
-    bool rowSplitDragging_ = false;     // 正在拖窗格行之间的水平分隔条
-    int  paneSplitIndex_ = -1;          // 拖动的分隔条（splitPairs_ 下标）
-    std::vector<RECT> paneRects_;                // 各窗格客户区矩形（命中测试/拖拽用）
-    std::vector<std::pair<int,int>> splitPairs_; // 同排并排窗格对（边界可拖）
+    std::vector<RECT> paneRects_;                // 各窗格客户区矩形（分页拖拽命中用）
     int rowSplitPermille_ = 500;        // 上下两排高度比例（千分比）
-    int rowSplitY_ = -1;                // 两排间分隔条的当前 y 坐标
-    int rowSplitTop_ = 0;               // 两排布局可用区域顶部
-    int rowSplitBottom_ = 0;            // 两排布局可用区域底部
     int layoutCount_ = 1;               // 窗格数 1~4（Alt+1~4 切换，= panes_.size()）
     int triLayout_ = 1;                 // 3 窗格形态：0=品字形(1上2下) 1=倒品字形(2上1下)，默认倒品
     int asymMode_ = 0;                  // 不对称 3 窗格：0=关 1=1左2右(上下排) 2=2左(上下排)1右
     int twoVert_ = 0;                   // 2 窗格形态：0=左右并排 1=上下排列
     int colSplitPermille_ = 500;        // 不对称布局里左右两栏宽度比例（千分比，可拖）
-    int colSplitX_ = -1;                // 左右栏竖向分隔条 x 坐标（<0 表示当前布局无）
-    int rowSplitX0_ = 0, rowSplitX1_ = 0; // 上下分隔条可命中的 x 范围（不对称时只限某一栏）
-    bool colSplitDragging_ = false;     // 正在拖左右栏分隔条
     int  savedPaneCount_ = 1;           // favorites.txt 的 panes= 恢复值
+
+    // 分隔条树（Q-Dir 同款 WTL 分隔条窗口）。窗格容器是分隔条的“窗格”，
+    // 因此窗格的位置/尺寸由分隔条窗口自己排，主窗口只摆最外层那条。
+    std::unique_ptr<SplitLayout> splitLayout_;
+    // 上一次建树时的布局指纹（窗格数 + 形态）：变了才重建分隔条树
+    unsigned long long splitSignature_ = ~0ull;
     bool startupLayoutApplied_ = false; // 启动恢复只做一次
     size_t pendingCloseTab_ = SIZE_MAX; // 中键点击待关闭的分页（延后到下一次消息循环）
     size_t pendingMoveTab_ = SIZE_MAX;  // 拖拽待移动的分页

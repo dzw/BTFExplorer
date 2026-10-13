@@ -89,33 +89,11 @@ void FileList::SetGridLines(bool show)
     ListView_SetExtendedListViewStyle(list_, ex);
 }
 
-// 列表自己的消息过程：分隔条命中、慢双击重命名、窗格激活延后、键盘命令、右键菜单。
+// 列表自己的消息过程：慢双击重命名、窗格激活延后、键盘命令、右键菜单。
 // 业务动作全部经 FileListDelegate 交回主窗口。
+// （分隔条现在是独立的窗口，拖动/光标由它自己处理，列表不再转发鼠标事件）
 LRESULT FileList::Proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
-    if (msg == WM_LBUTTONDOWN || msg == WM_SETCURSOR) {
-        // 落在任一分隔条“命中带”内（含间隙两侧窗格区）：转发给主窗口统一拖动
-        if (delegate_ && delegate_->HandleSplitterNearList(h, msg, wp, lp))
-            return msg == WM_SETCURSOR ? TRUE : 0;
-        // 上下两排窗格之间的水平分隔条：命中区比可见留白宽，从列表顶部伸进来
-        POINT pt{};
-        if (msg == WM_LBUTTONDOWN) {
-            pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-            ClientToScreen(h, &pt);
-        } else {
-            GetCursorPos(&pt);
-        }
-        ScreenToClient(GetAncestor(h, GA_ROOT), &pt);
-        if (delegate_ && delegate_->HitRowSplit(h, pt)) {
-            if (msg == WM_LBUTTONDOWN) {
-                delegate_->RowSplitClick(h, wp, pt);
-            } else {
-                SetCursor(LoadCursor(nullptr, IDC_SIZENS));
-            }
-            return msg == WM_SETCURSOR ? TRUE : 0;
-        }
-    }
-
     // 慢双击（资源管理器习惯）：单击选中、停顿一下再单击同一项 -> 重命名。
     // 快速双击走系统双击 -> NM_DBLCLK 打开。
     if (msg == WM_LBUTTONDOWN) {

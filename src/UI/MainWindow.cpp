@@ -16,6 +16,135 @@
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "Winmm.lib")
 
+#include <atlbase.h>
+#include <atltypes.h>  // ATL 的 CPoint/CSize/CRect（WTL 消息映射宏按这些类型拆参数）
+#include <atlwin.h>    // ATL::CWindowImpl —— WTL 10 不再自带窗口实现，直接复用 ATL 的
+#include <atlapp.h>    // WTL 10（自带 atlgdi.h / atlwinx.h）
+#include <atlsplit.h>  // WTL 分隔条 —— 原版 Q-Dir 静态链的就是它：
+                       // QDirRef\globals.txt 0x4BBECC 的窗口类名 "WTL_XSplitterWindow"
+#include <functional>
+
+// ---------------------------------------------------------------------------
+// 分隔条（按原版 Q-Dir 的做法：不自己画“间隙 + 命中测试 + 预览浮窗”，而是把
+// 窗格挂进 WTL 的分隔条窗口，由它们排布窗格并处理拖动）
+//
+// 反编译对照（QDirRef\decompile\43EE18.c 里建 3 条分隔条：树|右区、上下两排、
+// 同排两个窗格）：
+//   - 树|右区：WS_EX_CONTROLPARENT；窗格之间再加 WS_EX_CLIENTEDGE（分隔条画成立体条）
+//   - 在 WTL 默认值之上又改了两条：窗格最小尺寸 m_cxyMin = 7（WTL 默认 0/4）、
+//     带 WS_EX_CLIENTEDGE 时分隔条边宽 m_cxyBarEdge = 3（WTL 默认 4）
+// 拖动/双击复位/“关掉实时拖动”时的半色调预览条（PatBlt PATINVERT）都是 WTL 自带的：
+// 位置比例按 SPLIT_PROPORTIONAL 存（Q-Dir 落盘的 SP0/SP1/SP2/SPT 同款）。
+// ---------------------------------------------------------------------------
+namespace {
+
+// Q-Dir 覆盖的两条分隔条参数（见上）
+constexpr int kMinPaneSize = 7;
+constexpr int kBarEdgeSize = 3;
+
+// 一条分隔条窗口。竖/横只是构造参数 m_bVertical 的差别，窗口类名与 Q-Dir 一致。
+class PaneSplitter : public ATL::CWindowImpl<PaneSplitter>,
+                     public WTL::CSplitterImpl<PaneSplitter>
+{
+public:
+    DECLARE_WND_CLASS_EX2(L"WTL_XSplitterWindow", PaneSplitter, CS_DBLCLKS, COLOR_WINDOW)
+
+    PaneSplitter(bool vertical, bool clientEdge)
+        : WTL::CSplitterImpl<PaneSplitter>(vertical), clientEdge_(clientEdge) {}
+
+    // 与 WTL 的 CSplitterWindowImpl 同款：只管擦背景和跟随尺寸，其余交给 CSplitterImpl
+    BEGIN_MSG_MAP(PaneSplitter)
+        MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBackground)
+        MESSAGE_HANDLER(WM_SIZE, OnSize)
+        CHAIN_MSG_MAP(WTL::CSplitterImpl<PaneSplitter>)
+        FORWARD_NOTIFICATIONS()   // 窗格容器的 WM_COMMAND / WM_NOTIFY 转给主窗口
+    END_MSG_MAP()
+
+    HWND CreateBar(HWND parent)
+    {
+        RECT rc{};   // ATL 的 _U_RECT 绑的是非 const 引用，得给个具名变量
+        return Create(parent, rc, nullptr,
+                      WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+                      clientEdge_ ? (WS_EX_CLIENTEDGE | WS_EX_CONTROLPARENT)
+                                  : WS_EX_CONTROLPARENT);
+    }
+    void DestroyBar() { if (m_hWnd) DestroyWindow(); }
+
+    // 位置按千分比读写：SPLIT_PROPORTIONAL 下窗口缩放时按同一比例伸缩
+    void SetPosPermille(int permille) { m_nProportionalPos = ::MulDiv(permille, m_nPropMax, 1000); }
+    int  GetPosPermille() const { return ::MulDiv(m_nProportionalPos, 1000, m_nPropMax); }
+    int  GetPos() const { return m_xySplitterPos; }
+    void SetPos(int pos) { SetSplitterPos(pos); }
+    void SetPanesNoUpdate(HWND first, HWND second) { SetSplitterPanes(first, second, false); }
+
+    void MoveBar(int x, int y, int w, int h)
+    {
+        if (!m_hWnd) return;
+        ::SetWindowPos(m_hWnd, nullptr, x, y, w, h,
+                       SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+    }
+
+    // CSplitterImpl 通过 pT->GetSystemSettings 静态派发到这里（CSplitterImpl 内部
+    // 调的是它，所以必须是可访问的），这里在 WTL 默认值之上套用 Q-Dir 的两条覆盖
+    void GetSystemSettings(bool bUpdate)
+    {
+        WTL::CSplitterImpl<PaneSplitter>::GetSystemSettings(bUpdate);
+        m_cxyMin = kMinPaneSize;                      // Q-Dir：窗格最小 7px
+        if (clientEdge_) m_cxyBarEdge = kBarEdgeSize; // Q-Dir：带 CLIENTEDGE 时边宽 3
+    }
+
+private:
+    LRESULT OnEraseBackground(UINT, WPARAM, LPARAM, BOOL&) { return 1; } // 分隔条自己画，无需刷背景
+    LRESULT OnSize(UINT, WPARAM wp, LPARAM, BOOL& handled)
+    {
+        if (wp != SIZE_MINIMIZED) SetSplitterRect();
+        handled = FALSE;
+        return 1;
+    }
+
+    bool clientEdge_;
+};
+
+// 右侧窗格区的分隔条树：叶子装一个窗格，内部结点是一条分隔条
+struct SplitNode {
+    bool vertical = true;        // true=左右分隔（竖条）
+    bool clientEdge = false;     // 窗格之间的竖条带 WS_EX_CLIENTEDGE（Q-Dir：立体分隔条）
+    int pane = -1;               // 叶子：panes_ 下标
+    int first = -1, second = -1; // 内部结点：两个子结点下标
+    int permille = 500;          // 分隔条位置（千分比；建树时写回，销毁前回读）
+    std::unique_ptr<PaneSplitter> bar;
+};
+
+} // namespace
+
+// MainWindow 持有的分隔条状态（头文件里只有前向声明，WTL 头不扩散到别处）
+struct SplitLayout {
+    std::unique_ptr<PaneSplitter> tree;   // 目录树 | 右侧窗格区
+    std::vector<SplitNode> nodes;         // 右侧窗格区的分隔条树
+    int root = -1;
+};
+
+// 结点对应的窗口：叶子=窗格容器，内部结点=它自己的分隔条窗口
+static HWND SplitNodeWindow(SplitLayout& L, const std::vector<HWND>& paneHwnds, int node)
+{
+    if (node < 0 || node >= static_cast<int>(L.nodes.size())) return nullptr;
+    SplitNode& nd = L.nodes[static_cast<size_t>(node)];
+    if (nd.pane >= 0)
+        return nd.pane < static_cast<int>(paneHwnds.size())
+             ? paneHwnds[static_cast<size_t>(nd.pane)] : nullptr;
+    return nd.bar ? nd.bar->m_hWnd : nullptr;
+}
+
+// 子树里第一个叶子装的窗格下标（内部结点返回 -1）
+static int PaneUnder(SplitLayout& L, int node)
+{
+    if (node < 0 || node >= static_cast<int>(L.nodes.size())) return -1;
+    SplitNode& nd = L.nodes[static_cast<size_t>(node)];
+    if (nd.pane >= 0) return nd.pane;
+    int a = PaneUnder(L, nd.first);
+    return a >= 0 ? a : PaneUnder(L, nd.second);
+}
+
 static constexpr int WM_APP_PAGELOADED = WM_APP + 1;
 static constexpr UINT WM_APP_WIN_E = WM_APP + 2;   // Win+E 被拦截后激活本窗口
 static constexpr int WM_APP_CLOSE_TAB = WM_APP + 3; // 中键点击分页 -> 延后到主窗口关闭
@@ -49,12 +178,6 @@ static UINT GetTaskbarBroadcastMessage()
 
 // 自定义通知值：Edit 没有 EN_RETURN 常量，回车通知用这个
 static constexpr UINT EN_ADDR_RETURN = 0x1000;
-
-// 分隔条：kSplitGap 是真正留白的视觉宽度，kSplitHit 是鼠标命中区宽度
-// （命中区比留白宽，好抓；不改变布局）
-static constexpr int kSplitGap = 3;
-static constexpr int kSplitHit = 6;
-static constexpr int kPreviewHalf = 8;   // 拖动预览浮窗半宽（中间 kSplitGap 才是可见线）
 
 static LRESULT CALLBACK AddressProc(HWND h, UINT m, WPARAM wp, LPARAM lp); // 前向声明
 static LRESULT CALLBACK PaneTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp); // 分页拖拽 tab 子类化
@@ -414,7 +537,10 @@ void MainWindow::BuildChildren()
     status_ = CreateWindowExW(0, STATUSCLASSNAMEW, L"", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
         0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(99)), hInst, nullptr);
     if (uiFont_) SendMessageW(status_, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+    Layout();   // 首次建树：把侧栏/窗格挂进分隔条（首个窗格在这之前才建好）
 }
+
+MainWindow::~MainWindow() = default;
 
 void MainWindow::CreateSidePanel()
 {
@@ -800,6 +926,8 @@ void MainWindow::ResetAllPanes()
 void MainWindow::SaveSession()
 {
     if (restoreInProgress_) return;   // 恢复会话期间的落盘一律跳过（防递归/重复写）
+    // 分隔条的拖动是分隔条窗口自己做的，落盘前把当前位置回读一次
+    CaptureSplitState();
     std::wstring path = SessionFilePath();
     FILE* f = nullptr;
     if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return;
@@ -1095,6 +1223,7 @@ bool MainWindow::RestoreSession()
     if (maxSideWidth < 150) maxSideWidth = 150;
     sideWidth_ = (savedSideWidth < 150) ? 150 :
                  (savedSideWidth > maxSideWidth ? maxSideWidth : savedSideWidth);
+    pendingSideWidth_ = sideWidth_;   // 等窗口恢复成会话里的尺寸后再按像素精确落位
 
     if (!ok) {
         WriteAppLog(L"RESTORE no tabs in session; using default layout (no window restore)");
@@ -2072,80 +2201,6 @@ void MainWindow::SyncShellView(size_t paneIdx)
 
 // --- FileListDelegate：自绘列表交互回调（控件代码在 FileList.cpp） ---
 
-bool MainWindow::HitRowSplit(HWND list, const POINT& clientPt)
-{
-    if (rowSplitY_ < 0 || paneRects_.empty()) return false;
-    if (clientPt.y < rowSplitY_ - kSplitHit || clientPt.y > rowSplitY_ + kSplitHit)
-        return false;
-    int left = paneRects_.front().left;
-    int right = paneRects_.front().right;
-    for (const RECT& r : paneRects_) {
-        if (r.left < left) left = r.left;
-        if (r.right > right) right = r.right;
-    }
-    return clientPt.x >= left && clientPt.x <= right;
-}
-
-void MainWindow::RowSplitClick(HWND list, WPARAM wp, const POINT& mainClientPt)
-{
-    SendMessageW(hwnd_, WM_LBUTTONDOWN, wp, MAKELPARAM(mainClientPt.x, mainClientPt.y));
-}
-
-// 分隔条命中带：间隙本身（kSplitGap）很窄，但可抓范围向两侧各扩 kSplitHit，
-// 这样即使鼠标落在相邻窗格/树里紧贴间隙的 6px 内也能抓住（tab 头早已如此转发，
-// 这里让列表也转发，列表内容区不再是“抓不到”的死区）。
-bool MainWindow::IsSplitterAt(POINT pt) const
-{
-    if (pt.y < splitTop_ || pt.y > splitBot_) return false;
-    // 上下两排之间的水平分隔条（行分隔）
-    if (rowSplitY_ >= 0 && !paneRects_.empty() &&
-        pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitGap + kSplitHit &&
-        pt.x >= rowSplitX0_ && pt.x <= rowSplitX1_)
-        return true;
-    // 左右两栏之间的竖向分隔（仅不对称布局有）
-    if (colSplitX_ >= 0 &&
-        pt.x >= colSplitX_ - kSplitHit && pt.x <= colSplitX_ + kSplitGap + kSplitHit &&
-        pt.y >= rowSplitTop_ && pt.y <= rowSplitBottom_)
-        return true;
-    // 同排并排窗格间的竖向分隔
-    for (const auto& pr : splitPairs_) {
-        int edge = paneRects_[pr.first].right;
-        if (pt.x >= edge - kSplitHit && pt.x <= edge + kSplitGap + kSplitHit &&
-            pt.y >= paneRects_[pr.first].top && pt.y <= paneRects_[pr.first].bottom)
-            return true;
-    }
-    // 目录树与文件列表之间的竖向分隔
-    return pt.x >= sideWidth_ - kSplitHit && pt.x <= sideWidth_ + kSplitGap + kSplitHit;
-}
-
-void MainWindow::SetSplitterCursor(POINT pt) const
-{
-    SetCursor(LoadCursor(nullptr, IDC_SIZEWE));   // 默认竖分隔（列/树）
-    if (rowSplitY_ >= 0 && !paneRects_.empty() &&
-        pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitGap + kSplitHit &&
-        pt.x >= rowSplitX0_ && pt.x <= rowSplitX1_)
-        SetCursor(LoadCursor(nullptr, IDC_SIZENS)); // 行分隔（上下排）
-}
-
-// 列表（及目录树区下方）把命中带内的鼠标事件转给主窗口，主窗口按主窗口客户区坐标处理。
-bool MainWindow::HandleSplitterNearList(HWND list, UINT msg, WPARAM wp, LPARAM lp)
-{
-    POINT pt{};
-    if (msg == WM_LBUTTONDOWN) {
-        pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        ClientToScreen(list, &pt);
-    } else { // WM_SETCURSOR
-        GetCursorPos(&pt);
-    }
-    ScreenToClient(hwnd_, &pt);
-    if (!IsSplitterAt(pt)) return false;
-    if (msg == WM_LBUTTONDOWN)
-        SendMessageW(hwnd_, WM_LBUTTONDOWN, wp, MAKELPARAM(pt.x, pt.y));
-    else
-        SetSplitterCursor(pt);
-    return true;
-}
-
 void MainWindow::ActivatePaneDeferred(HWND list)
 {
     int pi = PaneOfList(list);
@@ -3020,24 +3075,6 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
         }
         return false;
     };
-    if (m == WM_LBUTTONDOWN) {
-        POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        ClientToScreen(h, &pt);
-        ScreenToClient(hwnd_, &pt);
-        if (IsSplitterAt(pt)) {
-            SendMessageW(hwnd_, WM_LBUTTONDOWN, wp, MAKELPARAM(pt.x, pt.y));
-            return 0;
-        }
-    } else if (m == WM_SETCURSOR) {
-        POINT pt{};
-        GetCursorPos(&pt);
-        ScreenToClient(hwnd_, &pt);
-        if (IsSplitterAt(pt)) {
-            SetSplitterCursor(pt);
-            return TRUE;
-        }
-    }
-
     switch (m) {
     case WM_PAINT: {
         // 当前焦点窗格：分页栏整行底色涂淡粉绿。先让控件按主题画完，
@@ -3497,78 +3534,226 @@ void MainWindow::RunPaneTool(size_t paneIdx, const std::wstring& name,
 }
 
 // ---------------------------------------------------------------------------
-// 目录树分隔条的拖动预览
+// 分隔条树（Q-Dir 同款：窗格挂进 WTL 分隔条窗口，位置/拖动都由分隔条负责）
 // ---------------------------------------------------------------------------
 
-// 预览线窗口：整块用 COLOR_WINDOW 填底并设为 transparent color key，只留中间
-// 一条竖线可见。必须是独立的浮窗：拖动时预览位置压在侧栏/窗格这些子窗口上面，
-// 画在主窗口 DC 上会被子窗口盖住。
-static LRESULT CALLBACK SplitPreviewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
+// 按当前布局造出右侧窗格区的分隔条树，返回根结点下标。
+// 形态与原来手算窗格矩形时一致：1=独占，2=左右/上下，3=品/倒品/不对称，4=田字形。
+int MainWindow::BuildRightTree()
 {
-    if (m == WM_PAINT) {
-        PAINTSTRUCT ps;
-        HDC dc = BeginPaint(h, &ps);
-        RECT rc{};
-        GetClientRect(h, &rc);
-        FillRect(dc, &rc, GetSysColorBrush(COLOR_WINDOW));
-        int mid = rc.right / 2;
-        RECT bar{ mid - kSplitGap / 2, rc.top, mid + kSplitGap / 2 + 1, rc.bottom };
-        FillRect(dc, &bar, GetSysColorBrush(COLOR_BTNFACE));
-        DrawEdge(dc, &bar, BDR_SUNKENOUTER, EDGE_SUNKEN);
-        EndPaint(h, &ps);
-        return 0;
+    SplitLayout& L = *splitLayout_;
+    auto leaf = [&](int pane) {
+        SplitNode n;
+        n.pane = pane;
+        L.nodes.push_back(std::move(n));
+        return static_cast<int>(L.nodes.size()) - 1;
+    };
+    auto split = [&](bool vertical, int a, int b, int permille) {
+        SplitNode n;
+        n.vertical = vertical;
+        n.clientEdge = vertical;      // 窗格之间的竖条带 WS_EX_CLIENTEDGE（Q-Dir：立体条）
+        n.first = a;
+        n.second = b;
+        n.permille = permille;
+        L.nodes.push_back(std::move(n));
+        return static_cast<int>(L.nodes.size()) - 1;
+    };
+    // 同排两个窗格的宽度权重（panes_[].width 只当比例用）-> 千分比
+    auto widthRatio = [&](size_t a, size_t b) {
+        int sum = panes_[a].width + panes_[b].width;
+        if (sum <= 0) return 500;
+        return static_cast<int>(static_cast<long long>(panes_[a].width) * 1000 / sum);
+    };
+
+    const size_t n = panes_.size();
+    if (n == 1) return leaf(0);
+    if (n == 2) {
+        if (twoVert_ == 1)  // 上下两排
+            return split(false, leaf(0), leaf(1), rowSplitPermille_);
+        return split(true, leaf(0), leaf(1), widthRatio(0, 1));
     }
-    return DefWindowProcW(h, m, wp, lp);
+    if (n == 3) {
+        if (asymMode_ == 1)  // 1 左（整高）+ 2 右（上下排）
+            return split(true, leaf(0),
+                         split(false, leaf(1), leaf(2), rowSplitPermille_),
+                         colSplitPermille_);
+        if (asymMode_ == 2)  // 2 左（上下排）+ 1 右（整高）
+            return split(true, split(false, leaf(0), leaf(1), rowSplitPermille_),
+                         leaf(2), colSplitPermille_);
+        if (triLayout_ == 1)  // 倒品字形：2 上 1 下
+            return split(false, split(true, leaf(0), leaf(1), widthRatio(0, 1)),
+                         leaf(2), rowSplitPermille_);
+        return split(false, leaf(0),  // 品字形：1 上 2 下
+                     split(true, leaf(1), leaf(2), widthRatio(1, 2)),
+                     rowSplitPermille_);
+    }
+    // 4（及以上）：田字形
+    return split(false, split(true, leaf(0), leaf(1), widthRatio(0, 1)),
+                 split(true, leaf(2), leaf(3), widthRatio(2, 3)),
+                 rowSplitPermille_);
 }
 
-// 侧栏宽度的合法区间：最窄 150，右侧至少留 260
-int MainWindow::ClampedSideWidth(int x) const
+// 递归销毁分隔条窗口：先子后父（销毁父窗口会连它的子窗口一起没）
+void MainWindow::DestroySplitWindows(int node)
 {
-    RECT rc{};
-    GetClientRect(hwnd_, &rc);
-    int maxW = rc.right - 260;
-    if (maxW < 150) maxW = 150;
-    return (x < 150) ? 150 : (x > maxW ? maxW : x);
+    if (node < 0) return;
+    SplitLayout& L = *splitLayout_;
+    if (node >= static_cast<int>(L.nodes.size())) return;
+    SplitNode& nd = L.nodes[static_cast<size_t>(node)];
+    DestroySplitWindows(nd.first);
+    DestroySplitWindows(nd.second);
+    if (nd.bar) {
+        nd.bar->DestroyBar();
+        nd.bar.reset();
+    }
 }
 
-void MainWindow::ShowSplitPreview(int x)
+// 布局变化后重建整棵树。窗格容器现在是分隔条的窗格（子窗口），销毁旧分隔条会
+// 连它们一起销毁，所以先把容器（和侧栏）摘回主窗口，建完新树再挂回去。
+void MainWindow::RebuildSplitters(int totalWidth)
 {
-    if (!splitPreview_) {
-        static ATOM cls = 0;
-        HINSTANCE hInst = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd_, GWLP_HINSTANCE));
-        const wchar_t* PREVIEW_CLASS = L"PESplitPreview";
-        if (!cls) {
-            WNDCLASSW wc = {};
-            wc.lpfnWndProc = &SplitPreviewProc;
-            wc.hInstance = hInst;
-            wc.lpszClassName = PREVIEW_CLASS;
-            cls = RegisterClassW(&wc);
-            if (!cls && GetLastError() == ERROR_CLASS_ALREADY_EXISTS) cls = 1;
+    if (!splitLayout_) splitLayout_ = std::make_unique<SplitLayout>();
+    SplitLayout& L = *splitLayout_;
+    CaptureSplitState();      // 旧分隔条的位置先回写，别丢
+
+    for (Pane& p : panes_)
+        if (p.host) SetParent(p.host->Handle(), hwnd_);
+    if (tab_) SetParent(tab_, hwnd_);
+
+    DestroySplitWindows(L.root);
+    L.nodes.clear();
+    L.root = -1;
+    if (L.tree) {
+        L.tree->DestroyBar();
+        L.tree.reset();
+    }
+    if (panes_.empty() || tab_ == nullptr) return;   // 还没建窗格（BuildChildren 中途）
+
+    std::vector<HWND> paneHwnds;
+    for (const Pane& p : panes_) paneHwnds.push_back(p.host ? p.host->Handle() : nullptr);
+
+    // 外层：目录树 | 右侧窗格区（右侧整棵树是它的右窗格）
+    L.tree = std::make_unique<PaneSplitter>(true, false);
+    if (!L.tree->CreateBar(hwnd_)) {
+        WriteAppLog(L"Splitter create failed (tree): panes will not be laid out");
+        L.tree.reset();
+        return;
+    }
+
+    L.root = BuildRightTree();
+    // 分隔条窗口自顶向下建：子分隔条是父分隔条的子窗口
+    std::function<void(int, HWND)> create = [&](int node, HWND parent) {
+        if (node < 0 || node >= static_cast<int>(L.nodes.size())) return;
+        SplitNode& nd = L.nodes[static_cast<size_t>(node)];
+        if (nd.pane >= 0) return;
+        nd.bar = std::make_unique<PaneSplitter>(nd.vertical, nd.clientEdge);
+        if (!nd.bar->CreateBar(parent)) {
+            nd.bar.reset();
+            return;
         }
-        if (!cls) return;
-        splitPreview_ = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-            PREVIEW_CLASS, nullptr, WS_POPUP, 0, 0, kPreviewHalf * 2, kPreviewHalf * 2,
-            hwnd_, nullptr, hInst, nullptr);
-        if (!splitPreview_) return;
-        SetLayeredWindowAttributes(splitPreview_, GetSysColor(COLOR_WINDOW), 0, LWA_COLORKEY);
+        create(nd.first, nd.bar->m_hWnd);
+        create(nd.second, nd.bar->m_hWnd);
+    };
+    create(L.root, L.tree->m_hWnd);
+
+    // 窗格容器挂到各自叶子所属的那条分隔条下，并把两个窗格交给它
+    std::function<void(int, HWND)> attach = [&](int node, HWND parent) {
+        if (node < 0 || node >= static_cast<int>(L.nodes.size())) return;
+        SplitNode& nd = L.nodes[static_cast<size_t>(node)];
+        if (nd.pane >= 0) {
+            if (nd.pane < static_cast<int>(paneHwnds.size()) && paneHwnds[static_cast<size_t>(nd.pane)])
+                SetParent(paneHwnds[static_cast<size_t>(nd.pane)], parent);
+            return;
+        }
+        if (!nd.bar) return;
+        attach(nd.first, nd.bar->m_hWnd);
+        attach(nd.second, nd.bar->m_hWnd);
+        HWND a = SplitNodeWindow(L, paneHwnds, nd.first);
+        HWND b = SplitNodeWindow(L, paneHwnds, nd.second);
+        if (a == nullptr || b == nullptr) return;
+        // bUpdate=false：此刻分隔条还是 0 尺寸，等最外层 MoveBar 触发的
+        // WM_SIZE 级联统一排布（SPLIT_PROPORTIONAL 会按这里设好的比例算位置）
+        nd.bar->SetPanesNoUpdate(a, b);
+        nd.bar->SetPosPermille(nd.permille);
+    };
+    attach(L.root, L.tree->m_hWnd);
+
+    HWND right = SplitNodeWindow(L, paneHwnds, L.root);
+    if (right != nullptr) {
+        // 侧栏也是外层分隔条的窗格，必须先挂到它下面：WTL 用分隔条客户区坐标
+        // 摆窗格（atlsplit.h 的 UpdateSplitterLayout 直接 SetWindowPos(rect.left,
+        // rect.top)），父窗口还留在主窗口时这组坐标会被当成主窗口客户区坐标，
+        // 侧栏就整体上移一个工具栏高度、压到工具栏那一行上去。
+        // （上面把这些窗口摘回 hwnd_ 是为了能安全销毁旧分隔条，这里要挂回去）
+        SetParent(tab_, L.tree->m_hWnd);
+        L.tree->SetPanesNoUpdate(tab_, right);
+        int permille = totalWidth > 0
+                     ? static_cast<int>(static_cast<long long>(sideWidth_) * 1000 / totalWidth) : 220;
+        if (permille < 50) permille = 50;    // 侧栏再窄也留一条
+        if (permille > 500) permille = 500;  // 右侧至少占一半
+        L.tree->SetPosPermille(permille);
+        // 千分比只是给首次级联用的近似值：等窗口尺寸定了再按像素精确落一次
+        pendingSideWidth_ = sideWidth_;
     }
-    splitPreviewX_ = x;
-    // 客户区 -> 屏幕：直接加窗口矩形原点会把标题栏/菜单栏算漏
-    POINT tl{ x - kPreviewHalf, splitTop_ };
-    ClientToScreen(hwnd_, &tl);
-    int h = (splitBot_ > splitTop_ ? splitBot_ - splitTop_ : 1);
-    SetWindowPos(splitPreview_, HWND_TOPMOST, tl.x, tl.y, kPreviewHalf * 2, h,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+    // 新建的分隔条排在主窗口子窗口最上层：压到最底，别盖住窗格右上角
+    // 的“+ / Q / ▾”按钮（那些按钮是主窗口的子窗口，靠 Z 序压在分隔条上面）
+    SetWindowPos(L.tree->m_hWnd, HWND_BOTTOM, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
-void MainWindow::CloseSplitPreview()
+// 把分隔条当前位置回写进持久化状态（sideWidth_ / panes_[].width / 千分比）。
+// 拖动是分隔条窗口自己做的，主窗口只在“树要变/要落盘”时才回读一次。
+void MainWindow::CaptureSplitState()
 {
-    if (splitPreview_) {
-        DestroyWindow(splitPreview_);
-        splitPreview_ = nullptr;
+    if (!splitLayout_) return;
+    SplitLayout& L = *splitLayout_;
+    if (L.tree && L.tree->m_hWnd) {
+        int pos = L.tree->GetPos();
+        if (pos > 0) sideWidth_ = pos;
     }
-    splitPreviewX_ = -1;
+    std::function<void(int, bool)> capture = [&](int node, bool isRoot) {
+        if (node < 0 || node >= static_cast<int>(L.nodes.size())) return;
+        SplitNode& nd = L.nodes[static_cast<size_t>(node)];
+        if (nd.bar && nd.bar->m_hWnd) {
+            int permille = nd.bar->GetPosPermille();
+            if (permille > 0) {
+                nd.permille = permille;
+                if (!nd.vertical) {
+                    rowSplitPermille_ = permille;              // 上下两排
+                } else if (isRoot && asymMode_ != 0) {
+                    colSplitPermille_ = permille;              // 不对称布局的左右两栏
+                } else {
+                    int a = PaneUnder(L, nd.first), b = PaneUnder(L, nd.second);
+                    if (a >= 0 && b >= 0 && a < static_cast<int>(panes_.size()) &&
+                        b < static_cast<int>(panes_.size())) {
+                        panes_[static_cast<size_t>(a)].width = permille;
+                        panes_[static_cast<size_t>(b)].width = 1000 - permille;
+                    }
+                }
+            }
+        }
+        capture(nd.first, false);
+        capture(nd.second, false);
+    };
+    capture(L.root, true);
+}
+
+// 窗格位置现在由分隔条排：从窗口实际矩形反推 paneRects_（分页拖拽命中用）
+void MainWindow::UpdatePaneRects()
+{
+    paneRects_.clear();
+    for (const Pane& p : panes_) {
+        RECT r{};
+        if (p.host == nullptr || !GetWindowRect(p.host->Handle(), &r)) {
+            paneRects_.push_back(RECT{});
+            continue;
+        }
+        POINT tl{ r.left, r.top }, br{ r.right, r.bottom };
+        ScreenToClient(hwnd_, &tl);
+        ScreenToClient(hwnd_, &br);
+        paneRects_.push_back(RECT{ tl.x, tl.y, br.x, br.y });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3622,134 +3807,66 @@ void MainWindow::Layout()
     int pagerY = H - statusH - pagerH;
     int listH = pagerY - y;
 
-    // 左侧 Tab 容器：先放 tab，再把内容页放到 tab 显示区内
-    // （目录树与收藏列表是 tab_ 的子窗口，坐标相对 tab_ 客户区）
-    int sideW = sideWidth_;
-    place(tab_, 0, y, sideW, listH);
+    // 目录树 / 窗格区：整块交给分隔条树。
+    // 布局（窗格数或形态）一变就得重建：现在窗格是分隔条的窗格，树形结构随布局变。
+    const unsigned long long sig =
+        (static_cast<unsigned long long>(panes_.size()) << 48) |
+        (static_cast<unsigned long long>(triLayout_) << 40) |
+        (static_cast<unsigned long long>(asymMode_) << 32) |
+        (static_cast<unsigned long long>(twoVert_) << 24);
+    if (sig != splitSignature_) {
+        RebuildSplitters(W);
+        splitSignature_ = sig;
+        geometryChanged_ = true;
+    }
+
+    // 只摆最外层那条分隔条：后面的级联由各条分隔条的 WM_SIZE 自己完成
+    PaneSplitter* treeBar = (splitLayout_ != nullptr) ? splitLayout_->tree.get() : nullptr;
+    if (treeBar != nullptr && treeBar->m_hWnd != nullptr) {
+        treeBar->MoveBar(0, y, W, listH);
+        // 分隔条内部按千分比记位置，而会话里存的是像素宽度。尺寸定了就按像素
+        // 精确落一次并重新登记比例，否则“像素→千分比→像素”每次启动都会缩一点。
+        if (pendingSideWidth_ > 0) {
+            int maxSide = W - 260;
+            if (maxSide < 150) maxSide = 150;
+            int want = pendingSideWidth_;
+            if (want < 150) want = 150;
+            if (want > maxSide) want = maxSide;
+            treeBar->SetPos(want);
+            pendingSideWidth_ = 0;
+            sideWidth_ = treeBar->GetPos();
+            geometryChanged_ = true;
+        }
+    }
+
+    // 侧栏内部（目录树 / 收藏 / 定位按钮）相对侧栏 tab 摆放，
+    // 侧栏自身的宽度/高度由它所属的那条分隔条给出。
+    int sideW = 0, sideH = 0;
+    if (tab_ != nullptr) {
+        RECT tcr{};
+        GetClientRect(tab_, &tcr);
+        sideW = tcr.right - tcr.left;
+        sideH = tcr.bottom - tcr.top;
+    }
+    if (sideW <= 0) sideW = 220;
+    if (sideH <= 0) sideH = listH;
     RECT rt{};
     SendMessageW(tab_, TCM_GETITEMRECT, 0, reinterpret_cast<LPARAM>(&rt));
     int tabH = rt.bottom - rt.top;
     int treeTop = tabH + 6;
-    int innerH = listH - treeTop - 6;
-    int sideContentH = listH - tabH - 12;
+    int innerH = sideH - treeTop - 6;
+    int sideContentH = sideH - tabH - 12;
     place(btnTreeSync_, sideW - 42 - 2, treeTop + 2, 36, 20);
     place(directoryTree_.Handle(), 4, treeTop, sideW - 8, innerH);
     SetWindowPos(btnTreeSync_, HWND_TOP, sideW - 42, treeTop + 2, 36, 20,
                  SWP_NOACTIVATE);
     place(favList_, 4, tabH + 6, sideW - 8, sideContentH);
 
-    // 右侧多窗格网格布局：
-    //   1 个：独占；2 个：左右；3 个：品/倒品（triLayout_）；4 个：田字形
-    //   同排两个窗格的宽度按 Pane::width 比例分配（分隔条可拖）
-    int gx = sideW + kSplitGap;
-    int gw = W - gx;
-    int gh = listH;
-    const int S = kSplitGap; // 分隔条厚度（视觉留白）
-    paneRects_.clear();
-    splitPairs_.clear();
-    rowSplitY_ = -1;
-    colSplitX_ = -1;                 // 默认无左右栏分隔（对称布局）
-    rowSplitX0_ = 0; rowSplitX1_ = 0; // 行分隔可命中的 x 范围（对称布局在分支里铺满）
-    rowSplitTop_ = y;
-    rowSplitBottom_ = y + gh;
-
-    size_t n = panes_.size();
-    std::vector<RECT> rects(n);
-    auto rowW = [&](size_t a, size_t b) { // 同排 a|b 两窗格的分割宽度
-        int wsum = panes_[a].width + panes_[b].width;
-        if (wsum <= 0) wsum = 2;
-        int w = (int)((long long)(gw - S) * panes_[a].width / wsum);
-        if (w < 160) w = 160;
-        if (gw - S - w < 160) w = gw - S - 160;
-        if (w < 160) w = 160;
-        return w;
-    };
-    if (n == 1) {
-        rects[0] = { gx, y, gx + gw, y + gh };
-    } else if (n == 2) {
-        if (twoVert_ == 1) { // 上下两排（Alt+2/8）：横分隔可拖，同 3 窗格的上下排
-            int availableH = gh - S;
-            int halfH = (int)((long long)availableH * rowSplitPermille_ / 1000);
-            if (halfH < 120) halfH = 120;
-            if (availableH - halfH < 120) halfH = availableH - 120;
-            rowSplitY_ = y + halfH;
-            rects[0] = { gx, y, gx + gw, y + halfH };
-            rects[1] = { gx, y + halfH + S, gx + gw, y + gh };
-            rowSplitX0_ = gx; rowSplitX1_ = gx + gw;
-        } else {             // 左右并排（Alt+4/6）：竖分隔可拖
-            int w = rowW(0, 1);
-            rects[0] = { gx, y, gx + w, y + gh };
-            rects[1] = { gx + w + S, y, gx + gw, y + gh };
-            splitPairs_.push_back({ 0, 1 });
-        }
-    } else if (n == 3) {
-        int availableH = gh - S;
-        int halfH = (int)((long long)availableH * rowSplitPermille_ / 1000);
-        if (halfH < 120) halfH = 120;
-        if (availableH - halfH < 120) halfH = availableH - 120;
-        rowSplitY_ = y + halfH;
-        if (asymMode_ == 1) { // 1 左（整高）+ 2 右（上下排）：Alt+4
-            int colW = (int)((long long)(gw - S) * colSplitPermille_ / 1000);
-            if (colW < 160) colW = 160;
-            if (gw - S - colW < 160) colW = gw - S - 160;
-            if (colW < 160) colW = 160;
-            colSplitX_ = gx + colW;
-            rects[0] = { gx, y, gx + colW, y + gh };
-            rects[1] = { gx + colW + S, y, gx + gw, y + halfH };
-            rects[2] = { gx + colW + S, y + halfH + S, gx + gw, y + gh };
-            rowSplitX0_ = gx + colW + S; rowSplitX1_ = gx + gw; // 行分隔只限右栏
-        } else if (asymMode_ == 2) { // 2 左（上下排）+ 1 右（整高）：Alt+6
-            int colW = (int)((long long)(gw - S) * colSplitPermille_ / 1000);
-            if (colW < 160) colW = 160;
-            if (gw - S - colW < 160) colW = gw - S - 160;
-            if (colW < 160) colW = 160;
-            colSplitX_ = gx + colW;
-            rects[0] = { gx, y, gx + colW, y + halfH };
-            rects[1] = { gx, y + halfH + S, gx + colW, y + gh };
-            rects[2] = { gx + colW + S, y, gx + gw, y + gh };
-            rowSplitX0_ = gx; rowSplitX1_ = gx + colW; // 行分隔只限左栏
-        } else if (triLayout_ == 1) { // 倒品字形：2 上 1 下（默认）
-            int w = rowW(0, 1);
-            rects[0] = { gx, y, gx + w, y + halfH };
-            rects[1] = { gx + w + S, y, gx + gw, y + halfH };
-            rects[2] = { gx, y + halfH + S, gx + gw, y + gh };
-            splitPairs_.push_back({ 0, 1 }); // 竖分隔条在上方两窗格之间
-            rowSplitX0_ = gx; rowSplitX1_ = gx + gw;
-        } else {               // 品字形：1 上 2 下
-            int w = rowW(1, 2);
-            rects[0] = { gx, y, gx + gw, y + halfH };
-            rects[1] = { gx, y + halfH + S, gx + w, y + gh };
-            rects[2] = { gx + w + S, y + halfH + S, gx + gw, y + gh };
-            splitPairs_.push_back({ 1, 2 }); // 竖分隔条在下方两窗格之间
-            rowSplitX0_ = gx; rowSplitX1_ = gx + gw;
-        }
-    } else if (n >= 4) { // 4：田字形（n==0 时哪个分支都不走：窗格尚未创建）
-        int availableH = gh - S;
-        int halfH = (int)((long long)availableH * rowSplitPermille_ / 1000);
-        if (halfH < 120) halfH = 120;
-        if (availableH - halfH < 120) halfH = availableH - 120;
-        rowSplitY_ = y + halfH;
-        int wTop = rowW(0, 1);
-        int wBot = rowW(2, 3);
-        rects[0] = { gx, y, gx + wTop, y + halfH };
-        rects[1] = { gx + wTop + S, y, gx + gw, y + halfH };
-        rects[2] = { gx, y + halfH + S, gx + wBot, y + gh };
-        rects[3] = { gx + wBot + S, y + halfH + S, gx + gw, y + gh };
-        splitPairs_.push_back({ 0, 1 });
-        splitPairs_.push_back({ 2, 3 });
-        rowSplitX0_ = gx; rowSplitX1_ = gx + gw;
-    }
-
-    for (size_t i = 0; i < panes_.size(); ++i) {
-        Pane& p = panes_[i];
-        RECT& r = rects[i];
-        int w = r.right - r.left, hh = r.bottom - r.top;
-        HWND host = p.host->Handle();
-        ShowWindow(host, SW_SHOW); // 曾经被隐藏过（切换布局）的窗格要恢复
-        place(host, r.left, r.top, w, hh);
-        paneRects_.push_back(r);
-        // 分页栏/列表/视图宿主的内部切分由容器自己做。尺寸没变时 SetWindowPos
-        // 不会发 WM_SIZE，而新建或迁入的内容窗口还停在 0 尺寸，所以显式催一次。
+    // 窗格的位置/尺寸由分隔条排；这里补一次容器内部重排：尺寸没变时
+    // SetWindowPos 不发 WM_SIZE，新建或迁入的内容窗口会停在 0 尺寸。
+    for (Pane& p : panes_) {
+        if (p.host == nullptr) continue;
+        ShowWindow(p.host->Handle(), SW_SHOW); // 曾经被隐藏过（切换布局）的窗格要恢复
         p.host->Relayout();
         // 容器只管摆宿主窗口，宿主内部的 shell 视图要自己填满新尺寸
         for (size_t ti = 0; ti < p.tabs.size(); ++ti) {
@@ -3758,12 +3875,18 @@ void MainWindow::Layout()
         }
     }
 
+    // 窗格矩形按窗口实际位置刷新（分页拖拽跨窗格判定用）
+    std::vector<RECT> prevPaneRects = paneRects_;
+    UpdatePaneRects();
+    if (prevPaneRects.size() != paneRects_.size()) {
+        geometryChanged_ = true;
+    } else {
+        for (size_t i = 0; i < paneRects_.size(); ++i)
+            if (!EqualRect(&prevPaneRects[i], &paneRects_[i])) { geometryChanged_ = true; break; }
+    }
+
     // 每个窗格的“+”按钮贴在其最后一个分页头右侧（UpdateNewTabButtons 里算）
     UpdateNewTabButtons();
-
-    // 记录分隔条可拖动的水平区间（供命中测试）
-    splitTop_ = y;
-    splitBot_ = pagerY;
 
     // 分页栏：关闭分页开关时整条隐藏
     {
@@ -4399,186 +4522,6 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         if (attached) AttachThreadInput(myTid, fgTid, FALSE);
         if (activePane_ < panes_.size()) SetFocus(CurList());
         return 0;
-    }
-
-    // 分隔条拖动：命中带为“间隙两侧各 kSplitHit”，落在窗格/树区也能抓到，归主窗口处理
-    case WM_LBUTTONDOWN: {
-        int x = static_cast<int>(GET_X_LPARAM(lp));
-        int yy = static_cast<int>(GET_Y_LPARAM(lp));
-        // 左右两栏竖向分隔（仅不对称布局有）
-        if (colSplitX_ >= 0 && yy >= rowSplitTop_ && yy <= rowSplitBottom_ &&
-            x >= colSplitX_ - kSplitHit && x <= colSplitX_ + kSplitGap + kSplitHit) {
-            colSplitDragging_ = true;
-            SetCapture(hwnd_);
-            SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
-            return 0;
-        }
-        if (rowSplitY_ >= 0 && !paneRects_.empty() &&
-            yy >= rowSplitY_ - kSplitHit && yy <= rowSplitY_ + kSplitGap + kSplitHit &&
-            x >= rowSplitX0_ && x <= rowSplitX1_) {
-            rowSplitDragging_ = true;
-            SetCapture(hwnd_);
-            SetCursor(LoadCursor(nullptr, IDC_SIZENS));
-            return 0;
-        }
-        // 窗格间分隔条命中：splitPairs_ 各对的边界 ±kSplitHit（限该排高度内）
-        if (yy >= splitTop_ && yy <= splitBot_) {
-            for (size_t k = 0; k < splitPairs_.size(); ++k) {
-                auto& pr = splitPairs_[k];
-                int edge = paneRects_[pr.first].right;
-                int top = paneRects_[pr.first].top, bot = paneRects_[pr.first].bottom;
-                if (x >= edge - kSplitHit && x <= edge + kSplitGap + kSplitHit && yy >= top && yy <= bot) {
-                    paneSplitDragging_ = true;
-                    paneSplitIndex_ = (int)k;
-                    SetCapture(hwnd_);
-                    SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
-                    return 0;
-                }
-            }
-        }
-        if (x >= sideWidth_ - kSplitHit && x <= sideWidth_ + kSplitGap + kSplitHit && yy >= splitTop_ && yy <= splitBot_) {
-            draggingSplitter_ = true;
-            SetCapture(hwnd_);
-            SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
-            ShowSplitPreview(ClampedSideWidth(x));   // 按下就给出位置提示，不等第一次移动
-            return 0;
-        }
-        break;
-    }
-    case WM_MOUSEMOVE:
-        if (colSplitDragging_) {
-            int minL = paneRects_[0].left, maxR = paneRects_[0].right;
-            for (const RECT& r : paneRects_) {
-                if (r.left < minL) minL = r.left;
-                if (r.right > maxR) maxR = r.right;
-            }
-            int avail = (maxR - minL) - kSplitGap;
-            int x = static_cast<int>(GET_X_LPARAM(lp));
-            int want = x - minL;
-            int minW = 160;
-            if (want < minW) want = minW;
-            if (want > avail - minW) want = avail - minW;
-            if (want < minW) want = minW;
-            int ratio = (int)((long long)want * 1000 / avail);
-            if (ratio != colSplitPermille_) { colSplitPermille_ = ratio; Layout(); }
-            return 0;
-        }
-        if (rowSplitDragging_) {
-            int availableH = rowSplitBottom_ - rowSplitTop_ - kSplitGap;
-            if (availableH >= 240) {
-                int topH = static_cast<int>(GET_Y_LPARAM(lp)) - rowSplitTop_;
-                if (topH < 120) topH = 120;
-                if (topH > availableH - 120) topH = availableH - 120;
-                int ratio = (int)((long long)topH * 1000 / availableH);
-                if (ratio != rowSplitPermille_) {
-                    rowSplitPermille_ = ratio;
-                    Layout();
-                }
-            }
-            return 0;
-        }
-        if (paneSplitDragging_) {
-            // 拖 splitPairs_[k] 分隔条：调整左右两窗格的 width
-            int x = static_cast<int>(GET_X_LPARAM(lp));
-            int k = paneSplitIndex_;
-            if (k >= 0 && k < (int)splitPairs_.size()) {
-                auto& pr = splitPairs_[k];
-                size_t a = pr.first, b = pr.second;
-                int leftEdge = paneRects_[a].left;
-                int want = x - leftEdge;
-                int minW = 160;
-                int availableW = paneRects_[b].right - leftEdge - kSplitGap;
-                int maxW = availableW - minW;
-                if (want < minW) want = minW;
-                if (want > maxW) want = maxW;
-                // Store the actual pixel split as weights so the rendered divider tracks the pointer.
-                if (want != paneRects_[a].right - leftEdge) {
-                    panes_[a].width = want;
-                    panes_[b].width = availableW - want;
-                    Layout();
-                }
-            }
-            return 0;
-        }
-        if (draggingSplitter_) {
-            // 拖动过程中只移动预览线，不重排（Q-Dir 的做法，见 WM_LBUTTONUP）
-            ShowSplitPreview(ClampedSideWidth(static_cast<int>(GET_X_LPARAM(lp))));
-            return 0;
-        }
-        break;
-    case WM_LBUTTONUP:
-        // 目录树分隔条在这里收尾：先清标志，免得 ReleaseCapture 触发的
-        // WM_CAPTURECHANGED 又按“取消”处理一遍
-        if (draggingSplitter_) {
-            draggingSplitter_ = false;
-            int nw = splitPreviewX_ >= 0 ? splitPreviewX_
-                                         : ClampedSideWidth(static_cast<int>(GET_X_LPARAM(lp)));
-            ReleaseCapture();
-            CloseSplitPreview();
-            if (nw != sideWidth_) { sideWidth_ = nw; Layout(); }
-            return 0;
-        }
-        if (colSplitDragging_) {
-            colSplitDragging_ = false;
-            ReleaseCapture();
-            return 0;
-        }
-        if (rowSplitDragging_) {
-            rowSplitDragging_ = false;
-            ReleaseCapture();
-            return 0;
-        }
-        if (paneSplitDragging_) {
-            paneSplitDragging_ = false;
-            paneSplitIndex_ = -1;
-            ReleaseCapture();
-            return 0;
-        }
-        break;
-    case WM_CAPTURECHANGED:
-        // 拖动途中被别的窗口抢走捕获（例如弹出菜单/切到别的程序）：
-        // 按当前预览位置收尾，别把预览线留在屏幕上。
-        if (draggingSplitter_) {
-            draggingSplitter_ = false;
-            if (splitPreviewX_ >= 0 && splitPreviewX_ != sideWidth_) {
-                sideWidth_ = splitPreviewX_;
-                Layout();
-            }
-            CloseSplitPreview();
-            return 0;
-        }
-        break;
-    case WM_SETCURSOR: {
-        POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd_, &pt);
-        if (colSplitX_ >= 0 && pt.y >= rowSplitTop_ && pt.y <= rowSplitBottom_ &&
-            pt.x >= colSplitX_ - kSplitHit && pt.x <= colSplitX_ + kSplitGap + kSplitHit) {
-            SetCursor(LoadCursor(nullptr, IDC_SIZEWE));   // 列分隔（左右两栏）
-            return TRUE;
-        }
-        if (rowSplitY_ >= 0 && !paneRects_.empty() &&
-            pt.y >= rowSplitY_ - kSplitHit && pt.y <= rowSplitY_ + kSplitGap + kSplitHit &&
-            pt.x >= rowSplitX0_ && pt.x <= rowSplitX1_) {
-            SetCursor(LoadCursor(nullptr, IDC_SIZENS));   // 行分隔（上下两排）
-            return TRUE;
-        }
-        // 窗格间分隔条光标
-        if (pt.y >= splitTop_ && pt.y <= splitBot_) {
-            for (size_t k = 0; k < splitPairs_.size(); ++k) {
-                auto& pr = splitPairs_[k];
-                int edge = paneRects_[pr.first].right;
-                if (pt.x >= edge - kSplitHit && pt.x <= edge + kSplitGap + kSplitHit &&
-                    pt.y >= paneRects_[pr.first].top && pt.y <= paneRects_[pr.first].bottom) {
-                    SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
-                    return TRUE;
-                }
-            }
-        }
-        if (pt.x >= sideWidth_ - kSplitHit && pt.x <= sideWidth_ + kSplitGap + kSplitHit &&
-            pt.y >= splitTop_ && pt.y <= splitBot_) {
-            SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
-            return TRUE;
-        }
-        break;  // 其它区域交给 DefWindowProc 设置默认光标
     }
 
     case WM_DESTROY:
