@@ -1,0 +1,43 @@
+// IntelliSense 配置：显式列出 include 路径，不依赖配置提供器。
+//
+// 为什么原来全是红叉：扩展默认走 "msvc" 提供器，它会用 vswhere 找到的“最新” VS
+// 去查询 MSBuild。本机 vswhere -latest 解析到的是 VS18 Community——它有 MSBuild
+// 但没装 VC 工具，而本工程用 v143 工具集（在 VS2022 BuildTools 里），查询直接失败，
+// 于是一条 include 路径都拿不到，atlbase.h / atlsplit.h / windows.h 全报“找不到”。
+// （若装了 CMake Tools 扩展，也可能是它抢走了提供器：本工程 CMake 生成器是
+//   "Visual Studio 17 2022"，没有 compile_commands.json，它同样给不出路径。）
+//
+// 路径与真实构建保持一致，见 PagedExplorer.vcxproj：
+//   - 工具集 v143          -> VS2022 BuildTools 的 MSVC 14.44.35207
+//   - ATL 取本机 VS2019    -> $(AtlMfcDir) 默认值 14.29.30133\atlmfc（vcxproj 第 25 行）
+//   - Windows SDK          -> vcxproj 里写 10.0，本机装的是 10.0.22621.0
+//   - WTL 已入库           -> third_party/wtl/include
+// 升级工具集/SDK 时，只需改下面这三个版本号。
+{
+  "version": 4,
+  "configurations": [
+    {
+      "name": "Win32 x64 (Release)",
+      "compilerPath": "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe",
+      "intelliSenseMode": "windows-msvc-x64",
+      "cppStandard": "c++20",
+      "defines": [
+        "UNICODE",
+        "_UNICODE",
+        "WIN32_LEAN_AND_MEAN",
+        "NOMINMAX",
+        "NDEBUG"
+      ],
+      "includePath": [
+        "${workspaceFolder}/src/**",
+        "${workspaceFolder}/third_party/wtl/include/**",
+        "C:/Program Files (x86)/Microsoft Visual Studio/2019/Community/VC/Tools/MSVC/14.29.30133/atlmfc/include",
+        "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/include",
+        "C:/Program Files (x86)/Windows Kits/10/Include/10.0.22621.0/ucrt",
+        "C:/Program Files (x86)/Windows Kits/10/Include/10.0.22621.0/um",
+        "C:/Program Files (x86)/Windows Kits/10/Include/10.0.22621.0/shared",
+        "C:/Program Files (x86)/Windows Kits/10/Include/10.0.22621.0/winrt"
+      ]
+    }
+  ]
+}

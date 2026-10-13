@@ -52,9 +52,12 @@ public:
     PaneSplitter(bool vertical, bool clientEdge)
         : WTL::CSplitterImpl<PaneSplitter>(vertical), clientEdge_(clientEdge) {}
 
-    // 与 WTL 的 CSplitterWindowImpl 同款：只管擦背景和跟随尺寸，其余交给 CSplitterImpl
+    // 与 WTL 的 CSplitterWindowImpl 同款：擦背景、画分隔条、跟随尺寸，其余交给
+    // CSplitterImpl
     BEGIN_MSG_MAP(PaneSplitter)
         MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBackground)
+        MESSAGE_HANDLER(WM_MOUSEMOVE, OnMouseMove)
+        MESSAGE_HANDLER(WM_CAPTURECHANGED, OnCaptureChanged)
         MESSAGE_HANDLER(WM_SIZE, OnSize)
         CHAIN_MSG_MAP(WTL::CSplitterImpl<PaneSplitter>)
         FORWARD_NOTIFICATIONS()   // 窗格容器的 WM_COMMAND / WM_NOTIFY 转给主窗口
@@ -84,6 +87,10 @@ public:
                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
     }
 
+    // 分隔条位置变化（拖动中/结束）后回调给主窗口。贴在窗格右上角的 +/Q/▾ 按钮
+    // 是主窗口的子窗口，不随分隔条走，得靠这个通知主窗口重摆。
+    std::function<void()> onMoved;
+
     // CSplitterImpl 通过 pT->GetSystemSettings 静态派发到这里（CSplitterImpl 内部
     // 调的是它，所以必须是可访问的），这里在 WTL 默认值之上套用 Q-Dir 的两条覆盖
     void GetSystemSettings(bool bUpdate)
@@ -91,13 +98,58 @@ public:
         WTL::CSplitterImpl<PaneSplitter>::GetSystemSettings(bUpdate);
         m_cxyMin = kMinPaneSize;                      // Q-Dir：窗格最小 7px
         if (clientEdge_) m_cxyBarEdge = kBarEdgeSize; // Q-Dir：带 CLIENTEDGE 时边宽 3
+        // 强制“全窗口拖动”：WTL 默认跟系统 SPI_GETDRAGFULLWINDOWS 走，关着的时候
+        // 它只画半色预览条、窗格等松手才动，而预览条是直接画在目录树上面的。
+        m_bFullDrag = true;
     }
 
 private:
-    LRESULT OnEraseBackground(UINT, WPARAM, LPARAM, BOOL&) { return 1; } // 分隔条自己画，无需刷背景
+    // 拖动中每一步 / 尺寸变化后整块重排重绘。两个残影来源：
+    //  1) SetWindowPos 默认把窗格旧图像一起搬到新位置，拖动时旧内容留在原处；
+    //  2) 侧栏里是 shell 的命名空间树控件，自己不会补齐尺寸变化后新露出的区域。
+    void RepaintSubtree()
+    {
+        if (m_hWnd == nullptr) return;
+        RECT rc{};
+        GetClientRect(&rc);
+        RedrawWindow(&rc, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    }
+
+    LRESULT OnEraseBackground(UINT, WPARAM wp, LPARAM, BOOL&)
+    {
+        // 真的擦背景：只说“已处理”却不画，拖动时露出来的区域会留着上一次的像素。
+        // （窗格有 WS_CLIPCHILDREN 挡住，这里只会擦到分隔条自己那几条）
+        HDC dc = reinterpret_cast<HDC>(wp);
+        RECT rc{};
+        GetClientRect(&rc);
+        FillRect(dc, &rc, GetSysColorBrush(COLOR_3DFACE));
+        return 1;
+    }
+    // 拖动中：先让基类重排窗格，再把整块（含子窗口）重绘一遍。
+    // （不能改 CSplitterImpl::UpdateSplitterLayout——它内部全是基类类型直调，
+    //   派生类的同名函数根本不会被派发到，必须在这里包基类的消息处理函数）
+    LRESULT OnMouseMove(UINT uMsg, WPARAM wp, LPARAM lp, BOOL& handled)
+    {
+        const bool dragging = (::GetCapture() == m_hWnd);   // 悬停时不动，省得白画
+        LRESULT r = WTL::CSplitterImpl<PaneSplitter>::OnMouseMove(uMsg, wp, lp, handled);
+        if (dragging) {
+            RepaintSubtree();
+            if (onMoved) onMoved();   // 窗格已经挪了：通知主窗口把按钮贴回去
+        }
+        return r;
+    }
+    // 松手 / 捕获被抢：补齐最终画面
+    LRESULT OnCaptureChanged(UINT uMsg, WPARAM wp, LPARAM lp, BOOL& handled)
+    {
+        LRESULT r = WTL::CSplitterImpl<PaneSplitter>::OnCaptureChanged(uMsg, wp, lp, handled);
+        RepaintSubtree();
+        if (onMoved) onMoved();
+        return r;
+    }
     LRESULT OnSize(UINT, WPARAM wp, LPARAM, BOOL& handled)
     {
         if (wp != SIZE_MINIMIZED) SetSplitterRect();
+        RepaintSubtree();
         handled = FALSE;
         return 1;
     }
@@ -3677,6 +3729,15 @@ void MainWindow::RebuildSplitters(int totalWidth)
         nd.bar->SetPosPermille(nd.permille);
     };
     attach(L.root, L.tree->m_hWnd);
+
+    // 分隔条一动，主窗口就要把贴在窗格右上角的 +/Q/▾ 按钮重摆回去、并回写位置
+    // （那些按钮是主窗口的子窗口，不随分隔条走；以前只有 SaveSession 才回读位置，
+    //  所以拖完按钮还停在原地，且下次重建树时侧栏宽度会跳回旧值）
+    auto hookBar = [&](std::unique_ptr<PaneSplitter>& bar) {
+        if (bar) bar->onMoved = [this]() { CaptureSplitState(); UpdateNewTabButtons(); };
+    };
+    hookBar(L.tree);
+    for (SplitNode& nd : L.nodes) hookBar(nd.bar);
 
     HWND right = SplitNodeWindow(L, paneHwnds, L.root);
     if (right != nullptr) {
