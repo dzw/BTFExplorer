@@ -116,6 +116,10 @@ private:
     // UI 构建
     void BuildChildren();
     void Layout();
+    // 侧栏内部（目录树 / 收藏 / 定位按钮）相对侧栏 tab 摆放。侧栏自身的宽度/高度
+    // 由分隔条给，而分隔条拖动时 Layout() 不会被调用，所以这段必须能单独跑：
+    // 返回 true = 本轮真的动了某个控件（Layout() 据此决定要不要整窗重绘）。
+    bool LayoutSidebarInner();
     // 分隔条（Q-Dir 同款：WTL 的 WTL_XSplitterWindow 搭成一棵树，拖动/双击复位/
     // 非实时拖动时的虚线预览条都由分隔条窗口自己负责，主窗口不再做命中测试）
     void RebuildSplitters(int totalWidth);  // 布局（窗格数/形态）变化后重建分隔条树

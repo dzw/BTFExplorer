@@ -133,8 +133,10 @@ private:
         const bool dragging = (::GetCapture() == m_hWnd);   // 悬停时不动，省得白画
         LRESULT r = WTL::CSplitterImpl<PaneSplitter>::OnMouseMove(uMsg, wp, lp, handled);
         if (dragging) {
+            // 先让主窗口把跟着分隔条走的东西摆到位（侧栏内部、+ / Q / ▾），
+            // 再整块重绘：顺序反了的话，刚摆好的内容不会出现在这一帧里。
+            if (onMoved) onMoved();
             RepaintSubtree();
-            if (onMoved) onMoved();   // 窗格已经挪了：通知主窗口把按钮贴回去
         }
         return r;
     }
@@ -142,8 +144,8 @@ private:
     LRESULT OnCaptureChanged(UINT uMsg, WPARAM wp, LPARAM lp, BOOL& handled)
     {
         LRESULT r = WTL::CSplitterImpl<PaneSplitter>::OnCaptureChanged(uMsg, wp, lp, handled);
-        RepaintSubtree();
         if (onMoved) onMoved();
+        RepaintSubtree();
         return r;
     }
     LRESULT OnSize(UINT, WPARAM wp, LPARAM, BOOL& handled)
@@ -3730,11 +3732,17 @@ void MainWindow::RebuildSplitters(int totalWidth)
     };
     attach(L.root, L.tree->m_hWnd);
 
-    // 分隔条一动，主窗口就要把贴在窗格右上角的 +/Q/▾ 按钮重摆回去、并回写位置
-    // （那些按钮是主窗口的子窗口，不随分隔条走；以前只有 SaveSession 才回读位置，
-    //  所以拖完按钮还停在原地，且下次重建树时侧栏宽度会跳回旧值）
+    // 分隔条一动，主窗口就要把跟着它走的东西都重摆一遍、并回写位置：
+    //   - 侧栏内部（目录树/收藏/定位按钮）是 tab_ 的子窗口，分隔条只动 tab_ 本身；
+    //   - 贴在窗格右上角的 +/Q/▾ 按钮是主窗口的子窗口，不随分隔条走；
+    //   - CaptureSplitState：以前只有 SaveSession 才回读位置，拖完不落盘，
+    //     下次重建树时侧栏宽度会跳回旧值。
     auto hookBar = [&](std::unique_ptr<PaneSplitter>& bar) {
-        if (bar) bar->onMoved = [this]() { CaptureSplitState(); UpdateNewTabButtons(); };
+        if (bar) bar->onMoved = [this]() {
+            CaptureSplitState();
+            LayoutSidebarInner();
+            UpdateNewTabButtons();
+        };
     };
     hookBar(L.tree);
     for (SplitNode& nd : L.nodes) hookBar(nd.bar);
@@ -3820,6 +3828,51 @@ void MainWindow::UpdatePaneRects()
 // ---------------------------------------------------------------------------
 // 消息处理
 // ---------------------------------------------------------------------------
+// 侧栏内部（目录树 / 收藏 / 定位按钮）相对侧栏 tab 摆放。
+// 侧栏自身的宽度/高度由它所属的那条分隔条给出，而分隔条拖动时主窗口的
+// Layout() 不会被调用——所以这段必须能单独跑：拖动中每条 onMoved 都会来调
+// 一次，否则目录树/收藏列表不跟着拉伸，还停在拖动前的宽度上。
+// 返回 true = 本轮真的动了某个控件（Layout() 据此决定要不要整窗重绘）。
+bool MainWindow::LayoutSidebarInner()
+{
+    if (tab_ == nullptr) return false;
+
+    int sideW = 0, sideH = 0;
+    RECT tcr{};
+    if (GetClientRect(tab_, &tcr)) {
+        sideW = tcr.right - tcr.left;
+        sideH = tcr.bottom - tcr.top;
+    }
+    if (sideW <= 0 || sideH <= 0) return false;   // 还没量到尺寸（建树中途）
+
+    RECT rt{};
+    SendMessageW(tab_, TCM_GETITEMRECT, 0, reinterpret_cast<LPARAM>(&rt));
+    const int tabH = rt.bottom - rt.top;
+    const int treeTop = tabH + 6;
+    const int innerH = sideH - treeTop - 6;
+    const int sideContentH = sideH - tabH - 12;
+
+    // 只挪不画：拖动中由分隔条的 RepaintSubtree 统一重绘，Layout() 里则并入
+    // 末尾那一次 RedrawWindow。
+    bool moved = false;
+    auto place = [&](HWND h, int x, int yy, int w, int hh) {
+        if (h == nullptr) return;
+        RECT r{}; GetWindowRect(h, &r);
+        POINT org{ r.left, r.top };
+        ScreenToClient(tab_, &org);      // 这些都是 tab_ 的子窗口，坐标相对它
+        if (org.x == x && org.y == yy && r.right - r.left == w && r.bottom - r.top == hh)
+            return;
+        moved = true;
+        SetWindowPos(h, nullptr, x, yy, w, hh, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+    };
+    place(btnTreeSync_, sideW - 42, treeTop + 2, 36, 20);
+    place(directoryTree_.Handle(), 4, treeTop, sideW - 8, innerH);
+    place(favList_, 4, tabH + 6, sideW - 8, sideContentH);
+    // “定”要压在目录树上面：与 tab_ 下的其它控件是兄弟窗口，被盖住时点击会落到树上
+    SetWindowPos(btnTreeSync_, HWND_TOP, sideW - 42, treeTop + 2, 36, 20, SWP_NOACTIVATE);
+    return moved;
+}
+
 void MainWindow::Layout()
 {
     RECT rc; GetClientRect(hwnd_, &rc);
@@ -3902,26 +3955,7 @@ void MainWindow::Layout()
 
     // 侧栏内部（目录树 / 收藏 / 定位按钮）相对侧栏 tab 摆放，
     // 侧栏自身的宽度/高度由它所属的那条分隔条给出。
-    int sideW = 0, sideH = 0;
-    if (tab_ != nullptr) {
-        RECT tcr{};
-        GetClientRect(tab_, &tcr);
-        sideW = tcr.right - tcr.left;
-        sideH = tcr.bottom - tcr.top;
-    }
-    if (sideW <= 0) sideW = 220;
-    if (sideH <= 0) sideH = listH;
-    RECT rt{};
-    SendMessageW(tab_, TCM_GETITEMRECT, 0, reinterpret_cast<LPARAM>(&rt));
-    int tabH = rt.bottom - rt.top;
-    int treeTop = tabH + 6;
-    int innerH = sideH - treeTop - 6;
-    int sideContentH = sideH - tabH - 12;
-    place(btnTreeSync_, sideW - 42 - 2, treeTop + 2, 36, 20);
-    place(directoryTree_.Handle(), 4, treeTop, sideW - 8, innerH);
-    SetWindowPos(btnTreeSync_, HWND_TOP, sideW - 42, treeTop + 2, 36, 20,
-                 SWP_NOACTIVATE);
-    place(favList_, 4, tabH + 6, sideW - 8, sideContentH);
+    if (LayoutSidebarInner()) geometryChanged_ = true;
 
     // 窗格的位置/尺寸由分隔条排；这里补一次容器内部重排：尺寸没变时
     // SetWindowPos 不发 WM_SIZE，新建或迁入的内容窗口会停在 0 尺寸。
