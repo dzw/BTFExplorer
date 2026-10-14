@@ -1,4 +1,5 @@
 #include "ShellContextMenu.h"
+#include "ShellFileOps.h"
 #include "ShellUtil.h"
 #include "../Util/AppLog.h"
 #include <shlobj.h>
@@ -18,6 +19,12 @@ static constexpr UINT CMD_CUSTOM = CMD_LAST + 1;
 static constexpr UINT CMD_RENAME = CMD_LAST + 2;
 static constexpr UINT CMD_EXPLORER = CMD_LAST + 3; // 在 Explorer 中打开
 static constexpr UINT CMD_COPYTEXT = CMD_LAST + 4; // 复制名称 / 复制全路径
+// 本程序自己的文件操作项（对齐原版动态追加的菜单块 0x453ED8）
+static constexpr UINT CMD_NEWFOLDER  = CMD_LAST + 5;
+static constexpr UINT CMD_SHORTCUT   = CMD_LAST + 6;
+static constexpr UINT CMD_HARDLINK   = CMD_LAST + 7;
+static constexpr UINT CMD_JUNCTION   = CMD_LAST + 8;
+static constexpr UINT CMD_PROPERTIES = CMD_LAST + 9;
 
 // 纯文本进剪贴板（CF_UNICODETEXT）：记事本、资源管理器地址栏、IDE 都能直接粘
 static void CopyPlainText(HWND hwnd, const std::wstring& text)
@@ -355,7 +362,7 @@ static void RemoveRenameItems(HMENU menu)
     }
 }
 
-static bool IsNewFolderCommand(HMENU menu, UINT command, bool inNewMenu = false)
+bool IsNewFolderCommand(HMENU menu, UINT command, bool inNewMenu = false)
 {
     for (int i = 0; i < GetMenuItemCount(menu); ++i) {
         MENUITEMINFOW item{};
@@ -383,37 +390,6 @@ static bool IsNewFolderCommand(HMENU menu, UINT command, bool inNewMenu = false)
         }
     }
     return false;
-}
-
-static std::wstring CreateFolderForRename(HWND owner, const std::wstring& directory)
-{
-    if (directory.empty()) return {};
-    for (unsigned int suffix = 1; suffix <= 10000; ++suffix) {
-        std::wstring name = L"新建文件夹";
-        if (suffix > 1)
-            name += L" (" + std::to_wstring(suffix) + L")";
-        std::wstring path = directory;
-        if (path.back() != L'\\' && path.back() != L'/')
-            path.push_back(L'\\');
-        path += name;
-        if (CreateDirectoryW(path.c_str(), nullptr)) {
-            WriteAppLog((L"NEW_FOLDER created: " + path).c_str());
-            return path;
-        }
-        DWORD error = GetLastError();
-        if (error != ERROR_ALREADY_EXISTS && error != ERROR_FILE_EXISTS) {
-            WriteAppLog((L"NEW_FOLDER create failed: path=" + path +
-                         L", win32Error=" + std::to_wstring(error)).c_str());
-            std::wstring message = L"无法创建文件夹：\n" + path +
-                L"\n错误码：" + std::to_wstring(error);
-            MessageBoxW(owner, message.c_str(), L"新建文件夹", MB_OK | MB_ICONERROR);
-            return {};
-        }
-    }
-    MessageBoxW(owner, L"无法找到可用的新文件夹名称。",
-                L"新建文件夹", MB_OK | MB_ICONERROR);
-    WriteAppLog((L"NEW_FOLDER failed: no available name in " + directory).c_str());
-    return {};
 }
 
 struct ContextMenuHandler {
@@ -445,11 +421,13 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
                      POINT ptScreen, const std::wstring& customItem,
                      bool& customItemSelected, std::wstring* createdFolderPath,
                      bool* renameSelected, const std::wstring& openInExplorerItem,
-                     const std::wstring& copyItemLabel, const std::wstring& copyItemText)
+                     const std::wstring& copyItemLabel, const std::wstring& copyItemText,
+                     MenuCommands* commands)
 {
     customItemSelected = false;
     if (createdFolderPath) createdFolderPath->clear();
     if (renameSelected) *renameSelected = false;
+    if (commands) *commands = MenuCommands{};
     WriteAppLog((L"CONTEXT_MENU opening: path=" +
                  (path.empty() ? std::wstring(L"(background)") : path) +
                  L", directory=" + menuDir).c_str());
@@ -527,6 +505,19 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
                 AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(menu, MF_STRING, CMD_EXPLORER, openInExplorerItem.c_str());
         }
+        if (commands) {
+            // 原版的自定义操作块（453ED8）：跟在系统项之后，一条分隔线隔开
+            bool onItem = !path.empty();
+            DWORD attr = onItem ? GetFileAttributesW(path.c_str()) : INVALID_FILE_ATTRIBUTES;
+            bool isDir = attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING, CMD_NEWFOLDER, L"新建文件夹(&W)");
+            if (onItem) {
+                AppendMenuW(menu, MF_STRING, CMD_SHORTCUT, L"创建快捷方式(&S)");
+                AppendMenuW(menu, MF_STRING, isDir ? CMD_JUNCTION : CMD_HARDLINK,
+                            isDir ? L"创建 Junction(&J)" : L"创建硬链接(&H)");
+            }
+        }
         ComPtr<IContextMenu3> cm3;
         ComPtr<IContextMenu2> cm2;
         bool hasMenu3 = SUCCEEDED(cm->QueryInterface(
@@ -553,6 +544,14 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
             RemoveWindowSubclass(hwnd, ContextMenuSubclassProc, subclassId);
         if (cmd == CMD_CUSTOM) {
             customItemSelected = true;
+        } else if (commands && cmd == CMD_NEWFOLDER) {
+            commands->newFolderSelected = true;
+        } else if (commands && cmd == CMD_SHORTCUT) {
+            commands->shortcutSelected = true;
+        } else if (commands && cmd == CMD_HARDLINK) {
+            commands->hardLinkSelected = true;
+        } else if (commands && cmd == CMD_JUNCTION) {
+            commands->junctionSelected = true;
         } else if (cmd == CMD_COPYTEXT) {
             CopyPlainText(hwnd, copyItemText);
             std::wstring flat = copyItemText;
@@ -601,7 +600,7 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
                          (newFolderCommand ? L"true" : L"false") +
                          L", directory=" + invokeDir).c_str());
             if (newFolderCommand && createdFolderPath) {
-                *createdFolderPath = CreateFolderForRename(hwnd, invokeDir);
+                *createdFolderPath = shell::CreateNewFolder(hwnd, invokeDir);
                 invoked = !createdFolderPath->empty();
                 WriteAppLog((L"NEW_FOLDER request result: path=" +
                              (createdFolderPath->empty() ? std::wstring(L"(none)") :

@@ -23,6 +23,9 @@ public:
     virtual void ActivatePaneDeferred(HWND list) = 0;
     // 慢双击重命名（单击 -> 停顿 -> 再单击同一项）
     virtual void SlowRename(HWND list, int item) = 0;
+    // 按住左键拖出超过系统拖拽阈值：请求发起拖拽（item = 按下时命中的行）。
+    // 宿主必须延后执行：拖拽循环自己泵消息，不能在列表的消息链里直接进。
+    virtual void StartDrag(HWND list, int item) = 0;
     // 键盘命令（Cmd*）
     virtual void ListKeyCommand(HWND list, int cmd) = 0;
     // 右键菜单（screenPt 屏幕坐标；keyboard=键盘触发的默认位置）
@@ -63,4 +66,8 @@ private:
     // 慢双击重命名状态（本列表自己的单击记录）
     int lastClickItem_ = -1;
     DWORD lastClickTime_ = 0;
+    // 拖出状态：按下时的点 + 行，移动超过阈值即请求拖拽
+    POINT dragStartPt_{};
+    int dragStartItem_ = -1;
+    bool dragPending_ = false;
 };

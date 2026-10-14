@@ -116,6 +116,21 @@ LRESULT FileList::Proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             lastClickItem_ = idx;     // 空白处 idx<0 也记录，会覆盖上一项
             lastClickTime_ = now;
         }
+        // 拖出候选：按在条目上才可能拖（松手/超阈值判定见下面 WM_MOUSEMOVE）
+        dragStartPt_ = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        dragStartItem_ = idx;
+        dragPending_ = idx >= 0;
+    }
+
+    if (msg == WM_LBUTTONUP || msg == WM_CAPTURECHANGED) dragPending_ = false;
+
+    if (msg == WM_MOUSEMOVE && dragPending_ && (wp & MK_LBUTTON)) {
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        if (abs(pt.x - dragStartPt_.x) > GetSystemMetrics(SM_CXDRAG) ||
+            abs(pt.y - dragStartPt_.y) > GetSystemMetrics(SM_CYDRAG)) {
+            dragPending_ = false;      // 一次按下只请求一次
+            delegate_->StartDrag(h, dragStartItem_);
+        }
     }
 
     if (delegate_) {

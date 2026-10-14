@@ -15,6 +15,7 @@
 
 // 分隔条树的内部实现（WTL 分隔条窗口，见 MainWindow.cpp）
 struct SplitLayout;
+namespace shell { struct MenuCommands; }   // 右键菜单自定义项的选中回传（ShellContextMenu.h）
 
 // 控件 ID（主窗口与 main.cpp 的加速键 / 单实例逻辑共享）
 enum {
@@ -36,6 +37,8 @@ enum {
     // 分页标题右键菜单：关闭 / 关闭其他 / 关闭右边 / 锁定
     IDC_TM_LOCK = 1030, IDC_TM_CLOSE = 1031, IDC_TM_OTHERS = 1032, IDC_TM_RIGHT = 1033,
     IDC_LAYOUT6 = 1034, IDC_LAYOUT8 = 1035,   // Alt+6 / Alt+8 排布方向（见 main.cpp 加速键）
+    IDC_NEWFOLDER = 1036,    // Ctrl+Shift+N 新建文件夹
+    IDC_PROPERTIES = 1037,   // Alt+Enter 属性对话框
 };
 
 // 每个右侧分页的独立状态（目录/页码/历史/加载器各自独立）
@@ -171,6 +174,7 @@ private:
     // FileListDelegate：自绘列表的交互回调（控件侧只管显示与命中，业务在这里）
     void ActivatePaneDeferred(HWND list) override;
     void SlowRename(HWND list, int item) override;
+    void StartDrag(HWND list, int item) override;
     void ListKeyCommand(HWND list, int cmd) override;
     void ListContextMenu(HWND list, const POINT& screenPt, bool keyboard) override;
     void ListColumnClicked(HWND list, int col) override;
@@ -193,6 +197,14 @@ private:
     void RenamePath(const std::wstring& path);
     void OnClipboard(bool cut);      // 复制/剪切选中项（CF_HDROP + Preferred DropEffect）
     void OnPaste();                  // 粘贴剪贴板中的文件到当前目录
+    // 常用文件操作（两种列表实现共用，作用在选中项/当前目录上）
+    void OnNewFolder();              // 当前目录建“新建文件夹”，随后进入重命名
+    void CreateLinks(const std::vector<std::wstring>& paths, int kind);
+    // kind: 0=快捷方式(.lnk) 1=硬链接(文件) 2=Junction(目录)
+    void OnProperties();             // 选中项属性，无选中时当前目录属性
+    void StartDragOut(std::vector<std::wstring> paths); // 拖出：SHDoDragDrop
+    void ApplyMenuCommands(const shell::MenuCommands& commands,
+                           const std::vector<std::wstring>& targets); // 右键菜单项分发
     void HideToTray();
     void ShowFromTray();
     void EnsureTrayIcon();      // 图标常驻：确保通知区里有图标（幂等）

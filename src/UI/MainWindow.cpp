@@ -3,6 +3,7 @@
 #include "../Shell/ShellUtil.h"
 #include "../Shell/ShellContextMenu.h"
 #include "../Shell/ShellFileOperation.h"
+#include "../Shell/ShellFileOps.h"
 #include "../Util/AppLog.h"
 #include <windowsx.h>
 #include <shellapi.h>
@@ -244,6 +245,7 @@ static constexpr int WM_APP_TOGGLE_VIEWMODE = WM_APP + 16; // 延后切换窗格
 static constexpr int WM_APP_SHELL_NAV = WM_APP + 17;       // shell 视图内激活文件夹 -> 当前分页视图内切换目录（不新建分页）
 static constexpr int WM_APP_SHELL_CTXMENU = WM_APP + 20;   // shell 视图内右键 -> 延后弹本程序的菜单
 static constexpr int WM_APP_SHELL_RENAME  = WM_APP + 21;   // shell 视图内按 F2 -> 延后开重命名对话框
+static constexpr int WM_APP_FILE_DRAG = WM_APP + 22;       // 列表条目拖出 -> 延后进拖拽循环
 
 // shell 视图右键请求：视图指针 + 屏幕坐标（堆上随消息传递，处理完即删）
 struct ShellCtxRequest {
@@ -372,8 +374,11 @@ private:
     {
         DWORD available = allowed_;
         DWORD preferred = preferred_ & available;
-        DWORD requested = (keys & MK_CONTROL) ? DROPEFFECT_COPY :
-                          (keys & MK_SHIFT) ? DROPEFFECT_MOVE :
+        // Ctrl+Shift = 建链接（资源管理器同款按键语义），优先于单独的 Ctrl/Shift
+        bool linkKeys = (keys & (MK_CONTROL | MK_SHIFT)) == (MK_CONTROL | MK_SHIFT);
+        DWORD requested = linkKeys ? DROPEFFECT_LINK :
+                        (keys & MK_CONTROL) ? DROPEFFECT_COPY :
+                        (keys & MK_SHIFT) ? DROPEFFECT_MOVE :
                           (preferred & DROPEFFECT_MOVE) ? DROPEFFECT_MOVE :
                           (preferred & DROPEFFECT_COPY) ? DROPEFFECT_COPY :
                           (preferred & DROPEFFECT_LINK) ? DROPEFFECT_LINK :
@@ -2271,6 +2276,32 @@ void MainWindow::SlowRename(HWND list, int item)
     RenamePath(path);
 }
 
+// 拖出（自绘列表）：数据对象与拖拽循环都在 shell::DragFilesOut 里，这里只负责把
+// “拖哪几行”定下来。拖拽循环自己泵消息，绝不能在列表的消息链里直接进 ——
+// 统一 PostMessage 延后到主消息循环（与窗格激活/分页切换同款）。
+void MainWindow::StartDrag(HWND list, int item)
+{
+    int pi = PaneOfList(list);
+    if (pi < 0 || item < 0) return;
+    std::vector<std::wstring> paths;
+    // 按下的行已在选区里 -> 整组拖走；否则只拖这一行
+    if (ListView_GetItemState(list, item, LVIS_SELECTED) & LVIS_SELECTED) {
+        for (int i = -1;;) {
+            i = ListView_GetNextItem(list, i, LVNI_SELECTED);
+            if (i < 0) break;
+            std::wstring p = PaneItemPath((size_t)pi, i);
+            if (!p.empty()) paths.push_back(std::move(p));
+        }
+    } else {
+        std::wstring p = PaneItemPath((size_t)pi, item);
+        if (!p.empty()) paths.push_back(std::move(p));
+    }
+    if (paths.empty()) return;
+    if ((size_t)pi != activePane_) PostSelectPane((size_t)pi);
+    PostMessageW(hwnd_, WM_APP_FILE_DRAG, 0,
+                 reinterpret_cast<LPARAM>(new std::vector<std::wstring>(std::move(paths))));
+}
+
 void MainWindow::ListKeyCommand(HWND list, int cmd)
 {
     int pi = PaneOfList(list);
@@ -2339,8 +2370,8 @@ void MainWindow::ListContextMenu(HWND list, const POINT& screenPt, bool keyboard
     // “复制名称 / 复制全路径”菜单项：选区来自本窗格的当前分页
     //（自绘列表取列表选中项，shell 视图取其内部列表的选中项）
     std::wstring copyLabel, copyText;
+    std::vector<std::wstring> sel;
     {
-        std::vector<std::wstring> sel;
         TabState& pt = PaneActiveTab((size_t)pi);
         if (pt.listMode == 1 && pt.shellView) {
             sel = pt.shellView->SelectedPaths();
@@ -2359,11 +2390,12 @@ void MainWindow::ListContextMenu(HWND list, const POINT& screenPt, bool keyboard
     bool addFavorite = false;
     std::wstring createdFolderPath;
     bool renameSelected = false;
+    shell::MenuCommands commands;
     if (shell::ShowContextMenu(hwnd_, path, PaneActiveTab((size_t)pi).dir,
                               const_cast<POINT&>(screenPt),
                               L"添加当前目录到收藏", addFavorite, &createdFolderPath,
                               &renameSelected, L"在 Explorer 中打开(&X)",
-                              copyLabel, copyText)) {
+                              copyLabel, copyText, &commands)) {
         WriteAppLog((L"CONTEXT_MENU command completed: pane=" +
                      std::to_wstring(pi) + L", selectedPath=" +
                      (path.empty() ? L"(background)" : path) +
@@ -2382,6 +2414,17 @@ void MainWindow::ListContextMenu(HWND list, const POINT& screenPt, bool keyboard
         RenamePath(path);
     }
     if (addFavorite) OnAddFavorite();
+    ApplyMenuCommands(commands, sel);
+}
+
+// 右键菜单里本程序操作项的分发：targets = 本次右键针对的那几项（背景时为空）
+void MainWindow::ApplyMenuCommands(const shell::MenuCommands& commands,
+                                   const std::vector<std::wstring>& targets)
+{
+    if (commands.newFolderSelected) OnNewFolder();
+    if (commands.shortcutSelected)  CreateLinks(targets, 0);
+    if (commands.hardLinkSelected)  CreateLinks(targets, 1);
+    if (commands.junctionSelected)  CreateLinks(targets, 2);
 }
 
 // shell 视图（Q 视图）内的右键：走与自绘列表同一套 shell::ShowContextMenu，
@@ -2420,12 +2463,13 @@ void MainWindow::ShellViewContextMenu(size_t pi, POINT screenPt)
     bool addFavorite = false;
     std::wstring createdFolderPath;
     bool renameSelected = false;
+    shell::MenuCommands commands;
     // 重命名走的是对话框（RenamePath），与列表实现无关，所以两种视图都用
     // 本程序的“重命名(&M)”（shell 原生的就地改名在本站点不可用）
     if (shell::ShowContextMenu(hwnd_, path, t.dir, const_cast<POINT&>(screenPt),
                                L"添加当前目录到收藏", addFavorite, &createdFolderPath,
                                &renameSelected, L"在 Explorer 中打开(&X)",
-                               copyLabel, copyText)) {
+                               copyLabel, copyText, &commands)) {
         WriteAppLog((L"CONTEXT_MENU command completed (shell view): pane=" +
                      std::to_wstring(pi) + L", selectedPath=" +
                      (path.empty() ? L"(background)" : path) + L", createdFolder=" +
@@ -2443,6 +2487,7 @@ void MainWindow::ShellViewContextMenu(size_t pi, POINT screenPt)
         RenamePath(path);
     }
     if (addFavorite) OnAddFavorite();
+    ApplyMenuCommands(commands, sel);
 }
 
 void MainWindow::ListColumnClicked(HWND list, int col)
@@ -2794,6 +2839,49 @@ void MainWindow::OnDelete(bool toRecycleBin)
         RefreshListFromDisk();
 }
 
+void MainWindow::OnNewFolder()
+{
+    TabState& t = CurTab();
+    if (t.dir.empty()) return;
+    std::wstring created = shell::CreateNewFolder(hwnd_, t.dir);
+    if (created.empty()) return;
+    RefreshListFromDisk();   // 先让新文件夹出现在列表里，再进重命名
+    RenamePath(created);
+    RefreshListFromDisk();
+}
+
+void MainWindow::CreateLinks(const std::vector<std::wstring>& paths, int kind)
+{
+    if (paths.empty()) return;
+    size_t made = 0;
+    for (const auto& p : paths) {
+        std::wstring created = kind == 0 ? shell::CreateShortcut(hwnd_, p)
+                             : kind == 1 ? shell::CreateFileHardLink(hwnd_, p)
+                                         : shell::CreateJunction(hwnd_, p);
+        if (!created.empty()) ++made;
+    }
+    WriteAppLog((L"LINK command done: kind=" + std::to_wstring(kind) +
+                 L", requested=" + std::to_wstring(paths.size()) +
+                 L", created=" + std::to_wstring(made)).c_str());
+    if (made) RefreshListFromDisk();
+}
+
+void MainWindow::OnProperties()
+{
+    std::wstring path;
+    if (!SelectedPath(path)) path = CurTab().dir;   // 没选中条目 -> 当前目录的属性
+    shell::ShowProperties(hwnd_, path);
+}
+
+void MainWindow::StartDragOut(std::vector<std::wstring> paths)
+{
+    DWORD effect = shell::DragFilesOut(hwnd_, paths);
+    if (effect == DROPEFFECT_NONE) return;
+    WriteAppLog((L"FILEOP drag out finished: effect=" + std::to_wstring(effect) +
+                 L", items=" + std::to_wstring(paths.size())).c_str());
+    RefreshListFromDisk();   // 移出去后源已不在，建链也改了目录内容
+}
+
 // 重命名对话框窗口过程：IDOK/IDCANCEL -> 记录结果并销毁
 static bool g_renameConfirmed = false;
 static std::wstring g_renameText;
@@ -3054,10 +3142,33 @@ DWORD MainWindow::HandleFileDrop(HWND list, const std::vector<std::wstring>& pat
 {
     int paneIndex = PaneOfList(list);
     if (paneIndex < 0 || paths.empty() ||
-        (effect != DROPEFFECT_COPY && effect != DROPEFFECT_MOVE))
+        (effect != DROPEFFECT_COPY && effect != DROPEFFECT_MOVE &&
+         effect != DROPEFFECT_LINK))
         return DROPEFFECT_NONE;
 
     SelectPane(static_cast<size_t>(paneIndex));
+    if (effect == DROPEFFECT_LINK) {
+        // 拖成“链接”：在目标窗格当前目录里给每个源建 .lnk（资源管理器同款语义）
+        std::wstring dir = CurTab().dir;
+        size_t made = 0;
+        for (const auto& p : paths)
+            if (!shell::CreateShortcut(hwnd_, p, dir).empty()) ++made;
+        WriteAppLog((L"FILEOP drop link: made=" + std::to_wstring(made) +
+                     L", of=" + std::to_wstring(paths.size()) + L", in=" + dir).c_str());
+        if (made) RefreshListFromDisk();
+        return made ? DROPEFFECT_LINK : DROPEFFECT_NONE;
+    }
+    // 同目录内“移动”等于什么都没做（原地重命名不是拖拽语义）
+    if (effect == DROPEFFECT_MOVE) {
+        std::wstring dir = CurTab().dir;
+        bool sameDir = !dir.empty() &&
+            std::all_of(paths.begin(), paths.end(), [&](const std::wstring& p) {
+                size_t slash = p.find_last_of(L'\\');
+                return slash != std::wstring::npos &&
+                       _wcsicmp(p.substr(0, slash).c_str(), dir.c_str()) == 0;
+            });
+        if (sameDir) return DROPEFFECT_MOVE;
+    }
     shell::FileOp operation = effect == DROPEFFECT_MOVE
         ? shell::FileOp::Move : shell::FileOp::Copy;
     if (!shell::ExecuteFileOpMulti(hwnd_, operation, paths, CurTab().dir, true)) {
@@ -4326,6 +4437,12 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             if (panes_.size() == 2) SetTwoPaneVert(1); else SetTriLayout(1);
             return 0;
         case IDC_REFRESH: PostMessageW(hwnd_, WM_APP_NAV, IDC_REFRESH, 0); return 0;   // 刷新=真正重新枚举目录（延后执行）
+        case IDC_NEWFOLDER:
+            OnNewFolder();
+            return 0;
+        case IDC_PROPERTIES:
+            OnProperties();
+            return 0;
         case IDC_MENU_FILTERS:
             shell::OpenContextMenuFilterSettings(hwnd_);
             return 0;
@@ -4440,6 +4557,15 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
     case WM_APP_TOGGLE_VIEWMODE: // “Q”按钮：延后切换窗格的文件列表实现
         ToggleListMode(static_cast<size_t>(wp));
         return 0;
+
+    case WM_APP_FILE_DRAG: {     // 列表条目拖出（延后：拖拽循环自己泵消息）
+        auto* paths = reinterpret_cast<std::vector<std::wstring>*>(lp);
+        if (paths) {
+            StartDragOut(std::move(*paths));
+            delete paths;
+        }
+        return 0;
+    }
 
     case WM_APP_SHELL_CTXMENU: {  // shell 视图内右键（延后弹菜单，见 EnsureTabShellView）
         auto* req = reinterpret_cast<ShellCtxRequest*>(lp);

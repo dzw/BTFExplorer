@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <objbase.h>
+#include <ole2.h>
 #include <shellapi.h>
 #include <dbghelp.h>
 #include <cstdio>
@@ -141,6 +142,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
         if (hMutex) CloseHandle(hMutex);
         return 1;
     }
+    // RegisterDragDrop 要求线程做过 OLE 初始化，只 CoInitializeEx 会以
+    // CO_E_NOTINITIALIZED(0x800401E2) 失败，窗格的拖放目标于是全部注册不上
+    OleInitialize(nullptr);
 
     // 加速键：焦点在列表/地址栏等子控件上时也能生效（Alt+消息不会自动转到主窗口）
     //   Alt+方向键导航；Alt+1~8 排布（语义见 MainWindow 的 WM_COMMAND：
@@ -148,7 +152,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
     //   Alt+小键盘4/6 = 三窗格不对称布局（4=1 大左 + 2 小右上下排，6=2 小左 + 1 大右）
     // 小键盘 NumLock 关闭时 8/2/4/6 会被上报成 VK_UP/VK_DOWN/VK_LEFT/VK_RIGHT：
     // 8 与 Alt+Up（上级目录）冲突，保持导航；2 无冲突，额外绑 Alt+Down 兜底
-    ACCEL accel[14] = {};
+    ACCEL accel[16] = {};
     accel[0].fVirt = FVIRTKEY | FALT; accel[0].key = VK_UP;      accel[0].cmd = IDC_UP;
     accel[1].fVirt = FVIRTKEY | FALT; accel[1].key = VK_LEFT;    accel[1].cmd = IDC_BACK;
     accel[2].fVirt = FVIRTKEY | FALT; accel[2].key = VK_RIGHT;   accel[2].cmd = IDC_FORWARD;
@@ -165,7 +169,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
     // 小键盘 4/6：与主键盘行同款命令（不对称布局习惯按小键盘按）
     accel[12].fVirt = FVIRTKEY | FALT; accel[12].key = VK_NUMPAD4; accel[12].cmd = IDC_LAYOUT4;
     accel[13].fVirt = FVIRTKEY | FALT; accel[13].key = VK_NUMPAD6; accel[13].cmd = IDC_LAYOUT6;
-    HACCEL hAccel = CreateAcceleratorTableW(accel, 14);
+    // 常用文件操作：Ctrl+Shift+N 新建文件夹，Alt+Enter 属性（原版 0x47413E 的 Alt+Enter）
+    accel[14].fVirt = FVIRTKEY | FCONTROL | FSHIFT; accel[14].key = 'N'; accel[14].cmd = IDC_NEWFOLDER;
+    accel[15].fVirt = FVIRTKEY | FALT; accel[15].key = VK_RETURN; accel[15].cmd = IDC_PROPERTIES;
+    HACCEL hAccel = CreateAcceleratorTableW(accel, 16);
 
     int ret = 1;
     if (MainWindow* w = MainWindow::Create(hInst)) {
@@ -206,6 +213,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
     }
 
     if (hAccel) DestroyAcceleratorTable(hAccel);
+    OleUninitialize();
     CoUninitialize();
     if (hMutex) CloseHandle(hMutex);
     return ret;

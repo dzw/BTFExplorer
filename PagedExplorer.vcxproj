@@ -40,6 +40,7 @@
     <ClCompile Include="src\Shell\ShellContextMenu.cpp" />
     <ClCompile Include="src\Shell\ShellEnumerator.cpp" />
     <ClCompile Include="src\Shell\ShellFileOperation.cpp" />
+    <ClCompile Include="src\Shell\ShellFileOps.cpp" />
     <ClCompile Include="src\Shell\ShellUtil.cpp" />
     <ClCompile Include="src\Pagination\PageManager.cpp" />
     <ClCompile Include="src\Util\AppLog.cpp" />

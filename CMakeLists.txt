@@ -11,12 +11,16 @@ add_executable(PagedExplorer WIN32
     src/Shell/ShellContextMenu.cpp
     src/Shell/ShellEnumerator.cpp
     src/Shell/ShellFileOperation.cpp
+    src/Shell/ShellFileOps.cpp
     src/Shell/ShellUtil.cpp
     src/Pagination/PageManager.cpp
     src/Util/AppLog.cpp
     src/Util/DirWatcher.cpp
     src/UI/DirectoryTree.cpp
+    src/UI/FileList.cpp
     src/UI/MainWindow.cpp
+    src/UI/PaneHost.cpp
+    src/UI/ShellFolderView.cpp
     src/UI/SettingsDialog.cpp
     src/UI/TrayIcon.cpp
     src/Resources/PagedExplorer.rc
