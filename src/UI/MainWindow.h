@@ -174,6 +174,9 @@ private:
     // FileListDelegate：自绘列表的交互回调（控件侧只管显示与命中，业务在这里）
     void ActivatePaneDeferred(HWND list) override;
     void SlowRename(HWND list, int item) override;
+    void CommitRename(HWND list, int item, const std::wstring& newName) override; // 就地重命名
+    // 就地重命名入口：行上弹编辑框，弹不出来退回对话框（path 仅用于兜底）
+    void StartInlineRename(size_t pi, int item, const std::wstring& path);
     void StartDrag(HWND list, int item) override;
     void ListKeyCommand(HWND list, int cmd) override;
     void ListContextMenu(HWND list, const POINT& screenPt, bool keyboard) override;

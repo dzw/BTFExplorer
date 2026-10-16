@@ -25,6 +25,7 @@ static constexpr UINT CMD_SHORTCUT   = CMD_LAST + 6;
 static constexpr UINT CMD_HARDLINK   = CMD_LAST + 7;
 static constexpr UINT CMD_JUNCTION   = CMD_LAST + 8;
 static constexpr UINT CMD_PROPERTIES = CMD_LAST + 9;
+static constexpr UINT CMD_PASTE      = CMD_LAST + 10; // 剪贴板有文件时出现
 
 // 纯文本进剪贴板（CF_UNICODETEXT）：记事本、资源管理器地址栏、IDE 都能直接粘
 static void CopyPlainText(HWND hwnd, const std::wstring& text)
@@ -511,6 +512,13 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
             DWORD attr = onItem ? GetFileAttributesW(path.c_str()) : INVALID_FILE_ATTRIBUTES;
             bool isDir = attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            // “粘贴”：剪贴板里有文件（CF_HDROP）才出现。
+            // shell 自带的文件夹**背景**菜单本来就带这一项，但上面取的是“文件夹
+            // 自身”的 IContextMenu（CreateViewObject，相当于右键文件夹图标），
+            // 那份菜单里没有粘贴，所以自己补一条：点击走调用方的 OnPaste
+            // （与 Ctrl+V 同路径，本程序/资源管理器复制的文件都能粘）。
+            if (IsClipboardFormatAvailable(CF_HDROP))
+                AppendMenuW(menu, MF_STRING, CMD_PASTE, L"粘贴(&V)");
             AppendMenuW(menu, MF_STRING, CMD_NEWFOLDER, L"新建文件夹(&W)");
             if (onItem) {
                 AppendMenuW(menu, MF_STRING, CMD_SHORTCUT, L"创建快捷方式(&S)");
@@ -546,6 +554,12 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
             customItemSelected = true;
         } else if (commands && cmd == CMD_NEWFOLDER) {
             commands->newFolderSelected = true;
+        } else if (commands && cmd == CMD_PASTE) {
+            // 真正执行在调用方（OnPaste，与 Ctrl+V 同路径）：这里只标记，
+            // 不置 invoked —— 粘贴自己会刷新列表，提前返回 true 会让调用方
+            // 在粘贴还没发生时就多刷一次。
+            commands->pasteSelected = true;
+            WriteAppLog(L"CONTEXT_MENU paste item selected");
         } else if (commands && cmd == CMD_SHORTCUT) {
             commands->shortcutSelected = true;
         } else if (commands && cmd == CMD_HARDLINK) {

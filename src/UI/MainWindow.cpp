@@ -91,6 +91,10 @@ public:
     // 分隔条位置变化（拖动中/结束）后回调给主窗口。贴在窗格右上角的 +/Q/▾ 按钮
     // 是主窗口的子窗口，不随分隔条走，得靠这个通知主窗口重摆。
     std::function<void()> onMoved;
+    // 拖动结束（松手/丢捕获）后回调给主窗口：落盘会话。SaveSession 只在
+    // WM_EXITSIZEMOVE / 托盘 / 退出 / 拖分页等处调用，拖分隔条并不触发，
+    // 不补这一下，侧栏宽度和各分隔条比例拖完就留在内存里，重启丢回旧值。
+    std::function<void()> onDragEnd;
 
     // CSplitterImpl 通过 pT->GetSystemSettings 静态派发到这里（CSplitterImpl 内部
     // 调的是它，所以必须是可访问的），这里在 WTL 默认值之上套用 Q-Dir 的两条覆盖
@@ -147,6 +151,7 @@ private:
         LRESULT r = WTL::CSplitterImpl<PaneSplitter>::OnCaptureChanged(uMsg, wp, lp, handled);
         if (onMoved) onMoved();
         RepaintSubtree();
+        if (onDragEnd) onDragEnd();   // 拖完才落盘（拖动中每步都写盘太吵）
         return r;
     }
     LRESULT OnSize(UINT, WPARAM wp, LPARAM, BOOL& handled)
@@ -246,6 +251,7 @@ static constexpr int WM_APP_SHELL_NAV = WM_APP + 17;       // shell 视图内激
 static constexpr int WM_APP_SHELL_CTXMENU = WM_APP + 20;   // shell 视图内右键 -> 延后弹本程序的菜单
 static constexpr int WM_APP_SHELL_RENAME  = WM_APP + 21;   // shell 视图内按 F2 -> 延后开重命名对话框
 static constexpr int WM_APP_FILE_DRAG = WM_APP + 22;       // 列表条目拖出 -> 延后进拖拽循环
+static constexpr int WM_APP_LIST_CMD  = WM_APP + 23;       // 列表键盘命令 -> 等切窗完成后执行
 
 // shell 视图右键请求：视图指针 + 屏幕坐标（堆上随消息传递，处理完即删）
 struct ShellCtxRequest {
@@ -1021,6 +1027,7 @@ void MainWindow::SaveSession()
     putLine(L"asym=" + std::to_wstring(asymMode_));
     putLine(L"twovert=" + std::to_wstring(twoVert_));
     putLine(L"col=" + std::to_wstring(colSplitPermille_));
+    putLine(L"row=" + std::to_wstring(rowSplitPermille_)); // 上下两排高度比例
     putLine(L"sel=" + std::to_wstring(selRank));
     putLine(L"sideWidth=" + std::to_wstring(sideWidth_));
     // 设置界面里的开关也要记住，重启后继续生效
@@ -1104,6 +1111,7 @@ bool MainWindow::RestoreSession()
                     std::vector<std::wstring> history; };
     int paneCount = 1, tri = 1, sel = 0, sortCol = 0, sortAsc = 1;
     int asym = 0, colSplit = 500;   // 不对称布局：模式 0/1/2 与左右栏比例
+    int rowSplit = 500;             // 上下两排高度比例（千分比）
     int twoVert = 0;                // 2 窗格形态：0=左右 1=上下
     int savedSideWidth = sideWidth_, windowMaximized = 0;
     RECT savedWindowRect{};
@@ -1140,6 +1148,7 @@ bool MainWindow::RestoreSession()
             if (w.rfind(L"asym=", 0) == 0) { swscanf_s(w.c_str() + 5, L"%d", &asym); continue; }
             if (w.rfind(L"twovert=", 0) == 0) { swscanf_s(w.c_str() + 8, L"%d", &twoVert); continue; }
             if (w.rfind(L"col=", 0) == 0) { swscanf_s(w.c_str() + 4, L"%d", &colSplit); continue; }
+            if (w.rfind(L"row=", 0) == 0) { swscanf_s(w.c_str() + 4, L"%d", &rowSplit); continue; }
             if (w.rfind(L"sel=", 0) == 0) { swscanf_s(w.c_str() + 4, L"%d", &sel); continue; }
             if (w.rfind(L"sideWidth=", 0) == 0) {
                 swscanf_s(w.c_str() + 10, L"%d", &savedSideWidth);
@@ -1343,6 +1352,7 @@ bool MainWindow::RestoreSession()
     asymMode_ = (asym >= 1 && asym <= 2) ? asym : 0;
     twoVert_ = twoVert ? 1 : 0;
     if (colSplit >= 100 && colSplit <= 900) colSplitPermille_ = colSplit;
+    if (rowSplit >= 100 && rowSplit <= 900) rowSplitPermille_ = rowSplit;
     savedPaneCount_ = (int)panes_.size();
 
     // 激活上次的分页
@@ -2270,10 +2280,39 @@ void MainWindow::SlowRename(HWND list, int item)
 {
     int pi = PaneOfList(list);
     if (pi < 0) return;
-    std::wstring path = PaneItemPath((size_t)pi, item);
-    if (path.empty()) return;
-    if ((size_t)pi != activePane_) SelectPane((size_t)pi);
-    RenamePath(path);
+    // 慢双击 = 就地重命名（资源管理器同款：行上弹编辑框），不再走对话框
+    StartInlineRename((size_t)pi, item, PaneItemPath((size_t)pi, item));
+}
+
+// 就地重命名入口：自绘列表在行上弹编辑框；弹不出来（或该窗格不是自绘列表）
+// 就退回原来的对话框，保证“重命名”这一下一定有反应。
+void MainWindow::StartInlineRename(size_t pi, int item, const std::wstring& path)
+{
+    if (pi < panes_.size() && panes_[pi].fileList && item >= 0 &&
+        panes_[pi].fileList->BeginRename(item))
+        return;
+    if (!path.empty()) RenamePath(path);
+}
+
+// 就地重命名完成（FileList 编辑框交回）：item 是列表行号，newName 只是新文件名
+void MainWindow::CommitRename(HWND list, int item, const std::wstring& newName)
+{
+    int pi = PaneOfList(list);
+    if (pi < 0) return;
+    const std::wstring oldPath = PaneItemPath((size_t)pi, item);
+    if (oldPath.empty() || newName.empty()) return;      // 取消 / 空名字
+    const std::wstring oldName = oldPath.substr(oldPath.find_last_of(L'\\') + 1);
+    if (newName == oldName) return;                      // 没改
+    WriteAppLog((L"RENAME inline: item=" + std::to_wstring(item) +
+                 L", old=" + oldPath + L", new=" + newName).c_str());
+    if (shell::ExecuteFileOp(hwnd_, shell::FileOp::Rename, oldPath, newName)) {
+        WriteAppLog(L"RENAME inline succeeded");
+        RefreshListFromDisk();
+    } else {
+        WriteAppLog(L"RENAME inline failed");
+        MessageBoxW(hwnd_, L"重命名失败。请确认文件仍存在且目标名称可用。",
+                    L"重命名", MB_OK | MB_ICONERROR);
+    }
 }
 
 // 拖出（自绘列表）：数据对象与拖拽循环都在 shell::DragFilesOut 里，这里只负责把
@@ -2306,18 +2345,34 @@ void MainWindow::ListKeyCommand(HWND list, int cmd)
 {
     int pi = PaneOfList(list);
     if (pi < 0) return;
-    if ((size_t)pi != activePane_) PostSelectPane((size_t)pi);
+    // 复制/粘贴/删除这些命令读的都是“激活窗格”的状态（CurList / CurTab），而
+    // 窗格切换是延后执行的——在列表控件自己的消息过程里同步切会重入 comctl32
+    // （见 ActivatePaneDeferred）。所以目标窗格不是激活窗格时，把命令本身也
+    // 延后：等切窗那消息处理完（激活窗格已就位）再执行，否则 Ctrl+C 会去读
+    // 旧激活窗格的选区，表现为“复制/粘贴没反应”。
+    // （右键菜单不走这条：TrackPopupMenuEx 自己泵消息，切窗在用户点菜单项之前
+    //  就已完成，所以菜单里的复制/粘贴一直是好的。）
+    if ((size_t)pi != activePane_) {
+        PostMessageW(hwnd_, WM_APP_LIST_CMD,
+                     MAKEWPARAM(static_cast<WORD>(pi), static_cast<WORD>(cmd)), 0);
+        return;
+    }
+    WriteAppLog((L"LIST_CMD pane=" + std::to_wstring(pi) +
+                 L" cmd=" + std::to_wstring(cmd)).c_str());
     switch (cmd) {
     case FileList::CmdCopy:            OnClipboard(false); break;
     case FileList::CmdCut:             OnClipboard(true); break;
     case FileList::CmdPaste:           OnPaste(); break;
     case FileList::CmdDelete:          OnDelete(true); break;
     case FileList::CmdDeleteNoRecycle: OnDelete(false); break;
-    case FileList::CmdRename:
+    case FileList::CmdRename: {
+        // F2 = 就地重命名：在选中行上弹编辑框（资源管理器同款）
         WriteAppLog((L"RENAME key message received by list: pane=" +
                      std::to_wstring(pi)).c_str());
-        OnRename();
+        const int sel = ListView_GetNextItem(list, -1, LVNI_SELECTED);
+        if (sel >= 0) StartInlineRename((size_t)pi, sel, PaneItemPath((size_t)pi, sel));
         break;
+    }
     case FileList::CmdEscape:          HideToTray(); break;
     }
 }
@@ -2351,9 +2406,10 @@ void MainWindow::ListContextMenu(HWND list, const POINT& screenPt, bool keyboard
     if (pi < 0) return;
     if ((size_t)pi != activePane_) PostSelectPane((size_t)pi); // 激活延后（防重入）
     std::wstring path;
+    int renameItem = -1;                 // 就地重命名要用的行号（-1 = 空白处/取不到）
     if (keyboard) {
         int sel = ListView_GetNextItem(list, -1, LVNI_SELECTED);
-        if (sel >= 0) path = PaneItemPath((size_t)pi, sel);
+        if (sel >= 0) { path = PaneItemPath((size_t)pi, sel); renameItem = sel; }
     } else {
         POINT clientPt = screenPt;
         ScreenToClient(list, &clientPt);
@@ -2362,6 +2418,7 @@ void MainWindow::ListContextMenu(HWND list, const POINT& screenPt, bool keyboard
         int item = ListView_HitTest(list, &hit);
         if (item >= 0) {
             path = PaneItemPath((size_t)pi, item);
+            renameItem = item;
         } else {
             // 空白处使用文件夹背景菜单，而不是沿用之前残留的选中项。
             ListView_SetItemState(list, -1, 0, LVIS_SELECTED);
@@ -2411,7 +2468,8 @@ void MainWindow::ListContextMenu(HWND list, const POINT& screenPt, bool keyboard
     }
     if (renameSelected && !path.empty()) {
         WriteAppLog((L"CONTEXT_MENU rename selected: " + path).c_str());
-        RenamePath(path);
+        // 自绘列表：就地重命名（行上弹编辑框，资源管理器同款）；弹不出来才退回对话框
+        StartInlineRename((size_t)pi, renameItem, path);
     }
     if (addFavorite) OnAddFavorite();
     ApplyMenuCommands(commands, sel);
@@ -2425,6 +2483,8 @@ void MainWindow::ApplyMenuCommands(const shell::MenuCommands& commands,
     if (commands.shortcutSelected)  CreateLinks(targets, 0);
     if (commands.hardLinkSelected)  CreateLinks(targets, 1);
     if (commands.junctionSelected)  CreateLinks(targets, 2);
+    // 粘贴到当前窗格的目录（OnPaste 内部自己刷新列表）
+    if (commands.pasteSelected)    OnPaste();
 }
 
 // shell 视图（Q 视图）内的右键：走与自绘列表同一套 shell::ShowContextMenu，
@@ -2712,6 +2772,12 @@ bool MainWindow::ReadFavoritesFromDisk(std::vector<std::wstring>& out)
             if (c >= 100 && c <= 900) colSplitPermille_ = c;
             continue;
         }
+        if (w.rfind(L"row=", 0) == 0) {     // 上下两排高度比例（千分比）
+            int r = 500;
+            swscanf_s(w.c_str() + 4, L"%d", &r);
+            if (r >= 100 && r <= 900) rowSplitPermille_ = r;
+            continue;
+        }
         if (w.rfind(L"twovert=", 0) == 0) { // 两窗格形态：0=左右并排 1=上下排列
             int v = 0;
             swscanf_s(w.c_str() + 8, L"%d", &v);
@@ -2772,6 +2838,7 @@ void MainWindow::SaveFavoritesCore(bool allowEmptyFavorites)
     putLine(L"asym=" + std::to_wstring(asymMode_));
     putLine(L"twovert=" + std::to_wstring(twoVert_));
     putLine(L"col=" + std::to_wstring(colSplitPermille_));
+    putLine(L"row=" + std::to_wstring(rowSplitPermille_)); // 上下两排高度比例
     for (const auto& dir : favorites_)
         putLine(dir);
     fclose(f);
@@ -2886,13 +2953,21 @@ void MainWindow::StartDragOut(std::vector<std::wstring> paths)
 static bool g_renameConfirmed = false;
 static std::wstring g_renameText;
 
+// 对话框内编辑框的控制 ID。不能是 1：IDOK 就是 1，编辑框的 EN_SETFOCUS /
+// EN_CHANGE 通知会被误判成“按下确定”（见 RenameDlgProc 的注释）。
+constexpr int kRenameEditId = 1001;
+
 static LRESULT CALLBACK RenameDlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 {
     switch (m) {
     case WM_COMMAND:
-        if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) {
+        // 只认“按钮被点击”（BN_CLICKED）。编辑框有自己的控制 ID，它的
+        // EN_SETFOCUS / EN_CHANGE 通知同样是 WM_COMMAND（LOWORD(wp)=编辑框 ID），
+        // 若不看 HIWORD，编辑框一获得焦点就会被当成“按下确定”，对话框带着
+        // 原文件名当场自杀——重命名从来没成功过就是这个原因。
+        if (HIWORD(wp) == BN_CLICKED && (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL)) {
             wchar_t buf[MAX_PATH] = {};
-            HWND edit = GetDlgItem(h, 1);
+            HWND edit = GetDlgItem(h, kRenameEditId);
             if (edit) GetWindowTextW(edit, buf, MAX_PATH);
             g_renameText = buf;
             g_renameConfirmed = (LOWORD(wp) == IDOK);
@@ -2907,6 +2982,8 @@ static LRESULT CALLBACK RenameDlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     return DefWindowProcW(h, m, wp, lp);
 }
 
+// 重命名激活窗格的当前选中项：就地编辑框（资源管理器同款）；
+// shell 视图没有自绘列表的选中行，自动退回对话框
 void MainWindow::OnRename()
 {
     std::wstring path;
@@ -2915,7 +2992,10 @@ void MainWindow::OnRename()
         return;
     }
     WriteAppLog((L"RENAME requested from active pane: " + path).c_str());
-    RenamePath(path);
+    int item = -1;
+    if (activePane_ < panes_.size() && panes_[activePane_].list)
+        item = ListView_GetNextItem(panes_[activePane_].list, -1, LVNI_SELECTED);
+    StartInlineRename(activePane_, item, path);
 }
 
 void MainWindow::RenamePath(const std::wstring& path)
@@ -2970,7 +3050,7 @@ void MainWindow::RenamePath(const std::wstring& path)
 
     HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, oldName.c_str(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_LEFT,
-        10, 14, 392, 24, dlg, (HMENU)1, hInst, nullptr);
+        10, 14, 392, 24, dlg, reinterpret_cast<HMENU>(kRenameEditId), hInst, nullptr);
     SendMessageW(edit, WM_SETFONT, (WPARAM)uiFont_, TRUE);
     // 选中主名（不含扩展名）
     size_t dot = oldName.find_last_of(L'.');
@@ -3079,8 +3159,14 @@ static void SetFileClipboard(HWND hwnd, const std::vector<std::wstring>& paths, 
 void MainWindow::OnClipboard(bool cut)
 {
     auto paths = SelectedPaths();
+    WriteAppLog((std::wstring(L"CLIPBOARD ") + (cut ? L"cut" : L"copy") +
+                 L": pane=" + std::to_wstring(activePane_) +
+                 L" selected=" + std::to_wstring(paths.size()) +
+                 L" dir=" + CurTab().dir).c_str());
     if (paths.empty()) return;
     SetFileClipboard(hwnd_, paths, cut);
+    WriteAppLog((L"CLIPBOARD set " + std::to_wstring(paths.size()) +
+                 L" item(s), first=" + paths.front()).c_str());
 }
 
 void MainWindow::OnPaste()
@@ -3130,11 +3216,20 @@ void MainWindow::OnPaste()
             srcs.push_back(src);
     }
 
-    if (srcs.empty()) return;
+    if (srcs.empty()) {
+        WriteAppLog(L"PASTE aborted: clipboard has no usable file data");
+        return;
+    }
+    WriteAppLog((L"PASTE " + std::wstring(move ? L"move" : L"copy") + L" " +
+                 std::to_wstring(srcs.size()) + L" item(s) -> " + CurTab().dir).c_str());
     if (shell::ExecuteFileOpMulti(hwnd_,
                                   move ? shell::FileOp::Move : shell::FileOp::Copy,
-                                  srcs, CurTab().dir, true))
+                                  srcs, CurTab().dir, true)) {
+        WriteAppLog(L"PASTE succeeded");
         RefreshListFromDisk();
+    } else {
+        WriteAppLog(L"PASTE failed");
+    }
 }
 
 DWORD MainWindow::HandleFileDrop(HWND list, const std::vector<std::wstring>& paths,
@@ -3849,11 +3944,13 @@ void MainWindow::RebuildSplitters(int totalWidth)
     //   - CaptureSplitState：以前只有 SaveSession 才回读位置，拖完不落盘，
     //     下次重建树时侧栏宽度会跳回旧值。
     auto hookBar = [&](std::unique_ptr<PaneSplitter>& bar) {
-        if (bar) bar->onMoved = [this]() {
+        if (!bar) return;
+        bar->onMoved = [this]() {
             CaptureSplitState();
             LayoutSidebarInner();
             UpdateNewTabButtons();
         };
+        bar->onDragEnd = [this]() { SaveSession(); };   // 拖完即落盘
     };
     hookBar(L.tree);
     for (SplitNode& nd : L.nodes) hookBar(nd.bar);
@@ -4601,6 +4698,18 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             SelectPane(pi);
         } else pendingSelectPane_ = SIZE_MAX;
         return 0;
+
+    case WM_APP_LIST_CMD: {     // 列表键盘命令（延后：等激活窗格切换完成，见 ListKeyCommand）
+        int pi = LOWORD(wp), cmd = HIWORD(wp);
+        if (pi >= 0 && static_cast<size_t>(pi) < panes_.size() &&
+            !panes_[static_cast<size_t>(pi)].tabs.empty()) {
+            // 已经在主消息循环里（不在控件的窗口过程中），同步切窗格是安全的
+            if (static_cast<size_t>(pi) != activePane_)
+                SelectPane(static_cast<size_t>(pi));
+            ListKeyCommand(panes_[static_cast<size_t>(pi)].list, cmd);
+        }
+        return 0;
+    }
 
     case WM_APP_SELECT_TAB:     // 延后激活分页
         if (pendingSelectTab_ < tabs_.size()) {

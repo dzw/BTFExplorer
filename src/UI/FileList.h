@@ -23,6 +23,9 @@ public:
     virtual void ActivatePaneDeferred(HWND list) = 0;
     // 慢双击重命名（单击 -> 停顿 -> 再单击同一项）
     virtual void SlowRename(HWND list, int item) = 0;
+    // 就地重命名完成：newName 是编辑框里的新文件名（空 = 取消或未改）。
+    // 宿主负责真正执行改名并刷新；列表本身不保留编辑框里的文字。
+    virtual void CommitRename(HWND list, int item, const std::wstring& newName) = 0;
     // 按住左键拖出超过系统拖拽阈值：请求发起拖拽（item = 按下时命中的行）。
     // 宿主必须延后执行：拖拽循环自己泵消息，不能在列表的消息链里直接进。
     virtual void StartDrag(HWND list, int item) = 0;
@@ -52,6 +55,11 @@ public:
     // “显示网格线”设置开关
     void SetGridLines(bool show);
 
+    // 就地重命名（资源管理器风格）：在指定行上弹出编辑框，选中主名（不含扩展名）。
+    // 编辑结束由 LVN_ENDLABELEDIT -> CommitRename 交回宿主执行。
+    // 返回是否成功进入编辑状态。
+    bool BeginRename(int item);
+
     // 主窗口收到本列表的 WM_NOTIFY 后调进来；返回 true = 已处理
     bool HandleNotify(NMHDR* nm);
 
@@ -65,6 +73,7 @@ private:
     bool gridLines_ = true;
     // 慢双击重命名状态（本列表自己的单击记录）
     int lastClickItem_ = -1;
+    bool renaming_ = false;   // 就地重命名编辑框存活期间（屏蔽慢双击判定）
     DWORD lastClickTime_ = 0;
     // 拖出状态：按下时的点 + 行，移动超过阈值即请求拖拽
     POINT dragStartPt_{};

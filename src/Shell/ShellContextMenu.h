@@ -13,6 +13,9 @@ struct MenuCommands {
     bool shortcutSelected = false;
     bool hardLinkSelected = false;
     bool junctionSelected = false;
+    // 剪贴板里有文件（CF_HDROP）时菜单里会出现“粘贴”，选中后由调用方执行
+    // （MainWindow::OnPaste，与 Ctrl+V 同一条代码路径）
+    bool pasteSelected = false;
 };
 
 // 在 (hwnd, x, y) 显示资源管理器风格右键菜单。
