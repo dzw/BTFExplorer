@@ -2,6 +2,8 @@
 #include "../FileModel/FileEntry.h"
 #include <shellapi.h>
 #include <shlwapi.h>
+#include <objidl.h>     // IDataObject / FORMATETC / STGMEDIUM
+#include <ole2.h>       // OleGetClipboard / ReleaseStgMedium
 #include <mutex>
 #include <unordered_map>
 #include <cwctype>
@@ -118,6 +120,87 @@ std::wstring CachedTypeNameForEntry(const std::wstring& path, bool isFolder) {
     // 并发下另一线程可能已先插入同 key，emplace 返回已存在的那份即可
     auto it = c.typeByExt.emplace(std::move(key), std::move(name)).first;
     return it->second;
+}
+
+// ---------------------------------------------------------------------------
+// 剪贴板：文件（CF_HDROP）
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// 从 CF_HDROP 的 HGLOBAL 里读出路径列表
+std::vector<std::wstring> PathsFromDrop(HGLOBAL h)
+{
+    std::vector<std::wstring> out;
+    auto* drop = static_cast<HDROP>(GlobalLock(h));
+    if (!drop) return out;
+    const UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+    for (UINT i = 0; i < n; ++i) {
+        const UINT len = DragQueryFileW(drop, i, nullptr, 0);   // 不含结尾 '\0'
+        std::wstring p(len, L'\0');
+        if (DragQueryFileW(drop, i, p.data(), len + 1) > 0)
+            out.push_back(std::move(p));
+    }
+    GlobalUnlock(h);
+    return out;
+}
+
+} // namespace
+
+// 一律走 OLE：OleGetClipboard 会把“裸剪贴板格式”也包成数据对象，所以本程序
+// SetFileClipboard 放的 CF_HDROP 和资源管理器复制的都能读到；反过来只用
+// IsClipboardFormatAvailable(CF_HDROP) 的话，OleSetClipboard 放的 IDataObject
+// （shell 视图自己的复制走这条）会被判成“剪贴板里没有文件”。
+bool ClipboardHasFiles()
+{
+    ComPtr<IDataObject> dto;
+    if (FAILED(OleGetClipboard(&dto)) || !dto)
+        return IsClipboardFormatAvailable(CF_HDROP) != FALSE;   // OLE 不可用时退回裸格式
+    FORMATETC fe{ CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+    return dto->QueryGetData(&fe) == S_OK;
+}
+
+bool GetClipboardFiles(std::vector<std::wstring>& paths, bool& move)
+{
+    paths.clear();
+    move = false;
+    ComPtr<IDataObject> dto;
+    if (SUCCEEDED(OleGetClipboard(&dto)) && dto) {
+        FORMATETC fe{ CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+        STGMEDIUM stg{};
+        if (SUCCEEDED(dto->GetData(&fe, &stg)) && stg.hGlobal) {
+            paths = PathsFromDrop(stg.hGlobal);
+            ReleaseStgMedium(&stg);
+        }
+        const CLIPFORMAT cf =
+            static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT));
+        FORMATETC fe2{ cf, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+        STGMEDIUM stg2{};
+        if (SUCCEEDED(dto->GetData(&fe2, &stg2)) && stg2.hGlobal) {
+            if (auto* effect = static_cast<DWORD*>(GlobalLock(stg2.hGlobal))) {
+                if (*effect & DROPEFFECT_MOVE) move = true;
+                GlobalUnlock(stg2.hGlobal);
+            }
+            ReleaseStgMedium(&stg2);
+        }
+        if (!paths.empty()) return true;
+    }
+    // 兜底：OLE 没拿到就按原来的裸剪贴板读（本程序 SetFileClipboard 放的就是裸格式）
+    if (!IsClipboardFormatAvailable(CF_HDROP)) return false;
+    if (!OpenClipboard(nullptr)) return false;
+    if (HANDLE h = GetClipboardData(CF_HDROP)) {
+        paths = PathsFromDrop(static_cast<HGLOBAL>(h));
+        const UINT pe = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
+        if (HANDLE he = pe ? GetClipboardData(pe) : nullptr) {
+            if (auto* effect = static_cast<DWORD*>(GlobalLock(he))) {
+                if (*effect & DROPEFFECT_MOVE) move = true;
+                GlobalUnlock(he);
+            }
+        }
+    }
+    CloseClipboard();
+    return !paths.empty();
+}
 }
 
 int CachedSysIconIndexForEntry(const std::wstring& path, bool isFolder) {

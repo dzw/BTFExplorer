@@ -50,6 +50,13 @@ public:
     // 接收方必须延后处理：回调发生在 shell 视图自己的消息链内，直接切换会重入。
     std::function<void()> onActivateRequest;
 
+    // 把键盘消息交给视图自己处理（IShellView::TranslateAccelerator）。
+    // 这是浏览器必须做的转发：DefView 的 F2 / Ctrl+C / Ctrl+V / Delete / Ctrl+A
+    // 等都在里面，不转发的话视图里这些键全没反应——而鼠标行为（双击/右键/慢双击）
+    // 完全正常，所以以前只当是“个别按键不好用”。处理掉了返回 true（调用方应跳过
+    // 该消息的分发）。
+    bool TranslateAccelerator(const MSG& msg);
+
     // 触发 shell 视图自己的就地改名：直接给视图的内部列表发 LVM_EDITLABEL，弹出来
     // 的就是 DefView 的 label edit 编辑框——慢双击最终也是这个，改名由 DefView 在
     // LVN_ENDLABELEDIT 里自己完成（与资源管理器一致）。

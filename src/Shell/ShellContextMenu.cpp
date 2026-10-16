@@ -517,8 +517,14 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
             // 自身”的 IContextMenu（CreateViewObject，相当于右键文件夹图标），
             // 那份菜单里没有粘贴，所以自己补一条：点击走调用方的 OnPaste
             // （与 Ctrl+V 同路径，本程序/资源管理器复制的文件都能粘）。
-            if (IsClipboardFormatAvailable(CF_HDROP))
+            // 判定走 shell::ClipboardHasFiles：它认 OleSetClipboard 放的数据对象
+            // （shell 视图自己的复制就是这种），光看 IsClipboardFormatAvailable
+            // (CF_HDROP) 会判成“剪贴板没东西”，表现为菜单里没有粘贴。
+            const bool hasFiles = shell::ClipboardHasFiles();
+            if (hasFiles)
                 AppendMenuW(menu, MF_STRING, CMD_PASTE, L"粘贴(&V)");
+            WriteAppLog((L"CONTEXT_MENU paste item " +
+                         std::wstring(hasFiles ? L"appended" : L"not shown (no files on clipboard)")).c_str());
             AppendMenuW(menu, MF_STRING, CMD_NEWFOLDER, L"新建文件夹(&W)");
             if (onItem) {
                 AppendMenuW(menu, MF_STRING, CMD_SHORTCUT, L"创建快捷方式(&S)");

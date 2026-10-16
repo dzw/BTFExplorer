@@ -168,6 +168,16 @@ HWND ShellFolderView::InnerListView() const
     return view_ ? FindInnerListView(view_) : nullptr;
 }
 
+// 键盘消息转发给视图（浏览器职责）：DefView 把 F2 / Ctrl+C / Ctrl+V / Delete /
+// Ctrl+A 等都做在 IShellView::TranslateAccelerator 里，靠站点转发；不转发这些键
+// 在视图里就都没反应（鼠标路径不依赖它，所以一直正常）。
+bool ShellFolderView::TranslateAccelerator(const MSG& msg)
+{
+    if (!viewObj_) return false;
+    MSG m = msg;   // 接口要可写指针
+    return viewObj_->TranslateAccelerator(&m) == S_OK;
+}
+
 // 触发 shell 视图自己的就地改名：直接给内部列表发 LVM_EDITLABEL。
 // 弹出来的就是 DefView 的 label edit 编辑框，慢双击最终也是这个，改名的提交
 // 由 DefView 自己在 LVN_ENDLABELEDIT 里完成（与资源管理器一致）。

@@ -193,6 +193,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
         MSG msg;
         BOOL messageResult = 0;
         while ((messageResult = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
+            // shell 视图（Q 视图）的 F2 / Ctrl+C / Ctrl+V / Delete 等都在
+            // IShellView::TranslateAccelerator 里，必须由浏览器转发；不转发的话
+            // 视图里这些键全没反应（鼠标行为正常，所以以前没发现）
+            if (w->TranslateShellViewKey(&msg)) continue;
             // 先让加速键处理（Alt+方向键），未命中再正常分发
             if (!TranslateAcceleratorW(w->Hwnd(), hAccel, &msg)) {
                 TranslateMessage(&msg);

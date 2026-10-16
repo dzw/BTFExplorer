@@ -3,6 +3,7 @@
 #include <shlobj.h>
 #include <string>
 #include <memory>
+#include <vector>
 
 struct PIDLDeleter { void operator()(void* p) const { if (p) CoTaskMemFree(p); } };
 using UniquePIDL = std::unique_ptr<void, PIDLDeleter>;
@@ -57,5 +58,15 @@ std::wstring CachedTypeNameForEntry(const std::wstring& path, bool isFolder);
 // 带进程内缓存的图标索引查询：文件按扩展名缓存。图标逐文件而异的类型
 // （exe/lnk/ico 等）与文件夹不做扩展名缓存，仍逐路径查询。
 int CachedSysIconIndexForEntry(const std::wstring& path, bool isFolder);
+
+// 剪贴板里是否有文件（CF_HDROP）。两种来源都认：
+//   - 裸剪贴板格式（本程序 SetFileClipboard、资源管理器复制）；
+//   - OleSetClipboard 放的 IDataObject（shell 视图自己的复制走的就是这个），
+//     它没有对应的裸格式，IsClipboardFormatAvailable(CF_HDROP) 会判成没有。
+bool ClipboardHasFiles();
+
+// 取剪贴板里的文件路径；move = 复制方要的是“剪切”（Preferred DropEffect）。
+// 同样两种来源都能读（走 OLE，OLE 会把裸格式也包成数据对象）。
+bool GetClipboardFiles(std::vector<std::wstring>& paths, bool& move);
 
 } // namespace shell

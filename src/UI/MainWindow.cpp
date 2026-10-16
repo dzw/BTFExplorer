@@ -2499,6 +2499,27 @@ int MainWindow::PaneOfShellView(const ShellFolderView* view) const
     return -1;
 }
 
+// 主消息循环里的键盘转发：把按键交给激活窗格的 shell 视图自己处理
+// （IShellView::TranslateAccelerator）。不转发的话视图里的 F2 / Ctrl+C / Ctrl+V /
+// Delete 全部没反应，表现为“复制了却粘不出来”——因为剪贴板压根没东西。
+// 返回 true = 视图已吃掉该消息，调用方不要再分发。
+bool MainWindow::TranslateShellViewKey(MSG* msg)
+{
+    if (!msg) return false;
+    if (msg->message != WM_KEYDOWN && msg->message != WM_SYSKEYDOWN &&
+        msg->message != WM_KEYUP && msg->message != WM_SYSKEYUP &&
+        msg->message != WM_CHAR && msg->message != WM_SYSCHAR)
+        return false;
+    if (activePane_ >= panes_.size()) return false;
+    const TabState& t = PaneActiveTab(activePane_);
+    if (t.listMode != 1 || !t.shellView) return false;
+    const HWND view = t.shellView->ViewWindow();
+    if (!view) return false;
+    // 焦点必须确实在这个视图里（或其子窗口），否则会抢走地址栏/搜索框的按键
+    if (msg->hwnd != view && !IsChild(view, msg->hwnd)) return false;
+    return t.shellView->TranslateAccelerator(*msg);
+}
+
 void MainWindow::ShellViewContextMenu(size_t pi, POINT screenPt)
 {
     if (pi >= panes_.size()) return;
@@ -3180,33 +3201,10 @@ void MainWindow::OnPaste()
     std::vector<std::wstring> srcs;
     bool move = false;
 
-    if (IsClipboardFormatAvailable(CF_HDROP)) {
-        // 标准文件剪贴板：本程序/资源管理器复制或剪切的内容都走这里
-        if (!OpenClipboard(hwnd_)) return;
-        HANDLE h = GetClipboardData(CF_HDROP);
-        if (h) {
-            auto* drop = static_cast<HDROP>(GlobalLock(h));
-            if (drop) {
-                UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
-                for (UINT i = 0; i < n; ++i) {
-                    UINT len = DragQueryFileW(drop, i, nullptr, 0); // 不含结尾 '\0'
-                    std::wstring p(len, L'\0');
-                    if (DragQueryFileW(drop, i, p.data(), len + 1) > 0)
-                        srcs.push_back(std::move(p));
-                }
-                UINT pe = RegisterClipboardFormatW(L"Preferred DropEffect");
-                HANDLE he = pe ? GetClipboardData(pe) : nullptr;
-                if (he) {
-                    auto* effect = static_cast<DWORD*>(GlobalLock(he));
-                    if (effect) {
-                        if (*effect & DROPEFFECT_MOVE) move = true;
-                        GlobalUnlock(he);
-                    }
-                }
-                GlobalUnlock(h);
-            }
-        }
-        CloseClipboard();
+    // 走 OLE 读：本程序放进去的裸 CF_HDROP、资源管理器复制的、以及 shell 视图
+    // 自己用 OleSetClipboard 放的 IDataObject，都能读到
+    if (shell::GetClipboardFiles(srcs, move)) {
+        // 标准文件剪贴板：本程序/资源管理器/shell 视图复制或剪切的内容都走这里
     } else if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
         // 兼容回退：剪贴板是文本且恰好是一个存在的路径 -> 复制该文件
         if (!OpenClipboard(hwnd_)) return;
