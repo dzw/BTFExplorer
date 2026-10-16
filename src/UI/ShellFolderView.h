@@ -39,15 +39,25 @@ public:
     //（复制名称/全路径、添加到收藏、过滤后的菜单），所以拦下 WM_CONTEXTMENU
     // 交回调，由主窗口弹同一套菜单。接收方必须延后处理（回调在视图消息链内）。
     std::function<void(POINT screenPt)> onContextMenu;
-    // 视图内按 F2：shell 的就地改名要走它自己那套浏览器接口（本站点只实现了
-    // IShellBrowser 的最小集，多数取不到编辑框），拦下来交回调，由主窗口用与
-    // 自绘列表相同的重命名对话框处理。接收方同样要延后处理。
+    // 视图内按 F2：DefView 的键盘改名路径接不上（实测：慢双击能改名，按 F2 不行
+    // —— 它走 IShellView::TranslateAccelerator 的站点转发，本站点没接），所以拦
+    // 下来交回调，由主窗口直接用 LVM_EDITLABEL 弹视图自己的就地改名编辑框
+    //（和慢双击最终弹的是同一个东西）。接收方同样要延后处理。
     std::function<void()> onRenameKey;
     // 视图内真正的用户输入（鼠标按键 / 键盘）：请求宿主把本视图所在窗格设为
     // 激活窗格。shell 视图的消息不走自绘列表那条 FileList::Proc，所以点它不会
     // 像自绘列表那样自动激活，得由这条回调补上（两者对等）。
     // 接收方必须延后处理：回调发生在 shell 视图自己的消息链内，直接切换会重入。
     std::function<void()> onActivateRequest;
+
+    // 触发 shell 视图自己的就地改名：直接给视图的内部列表发 LVM_EDITLABEL，弹出来
+    // 的就是 DefView 的 label edit 编辑框——慢双击最终也是这个，改名由 DefView 在
+    // LVN_ENDLABELEDIT 里自己完成（与资源管理器一致）。
+    // 不走 VK_F2：实测按 F2 / 给列表投 F2 都不生效，DefView 的键盘改名要靠站点的
+    // 快捷键转发（IShellView::TranslateAccelerator），本站点接不上；慢双击是鼠标
+    // 路径所以能用。
+    // 作用于视图当前选中项；编辑框弹出来返回 true。
+    bool StartInlineRename();
 
     // 选中项的文件系统路径（虚拟位置跳过）
     std::vector<std::wstring> SelectedPaths() const;

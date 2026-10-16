@@ -249,7 +249,7 @@ enum { COL_NAME = 0, COL_TYPE, COL_SIZE, COL_MTIME };
 static constexpr int WM_APP_TOGGLE_VIEWMODE = WM_APP + 16; // 延后切换窗格列表实现
 static constexpr int WM_APP_SHELL_NAV = WM_APP + 17;       // shell 视图内激活文件夹 -> 当前分页视图内切换目录（不新建分页）
 static constexpr int WM_APP_SHELL_CTXMENU = WM_APP + 20;   // shell 视图内右键 -> 延后弹本程序的菜单
-static constexpr int WM_APP_SHELL_RENAME  = WM_APP + 21;   // shell 视图内按 F2 -> 延后开重命名对话框
+static constexpr int WM_APP_SHELL_RENAME  = WM_APP + 21;   // shell 视图内 F2 -> 延后就地改名
 static constexpr int WM_APP_FILE_DRAG = WM_APP + 22;       // 列表条目拖出 -> 延后进拖拽循环
 static constexpr int WM_APP_LIST_CMD  = WM_APP + 23;       // 列表键盘命令 -> 等切窗完成后执行
 
@@ -2164,8 +2164,9 @@ bool MainWindow::EnsureTabShellView(size_t paneIdx, TabState& t)
         PostMessageW(hwnd_, WM_APP_SHELL_CTXMENU, 0,
                      reinterpret_cast<LPARAM>(new ShellCtxRequest{view, screenPt}));
     };
-    // F2 同理：视图自己的就地改名在本站点不可用，交回主窗口弹重命名对话框
-    //（与自绘列表完全一致）， WPARAM 带视图指针以便认出发起的是哪个窗格
+    // F2：交给主窗口用 LVM_EDITLABEL 弹视图自己的就地改名编辑框。
+    // （不能放行给 shell：实测按 F2 没反应，DefView 的键盘改名要靠站点转发快捷键，
+    //   本站点没接；慢双击是鼠标路径，所以能用。）
     t.shellView->onRenameKey = [this, view = t.shellView.get()]() {
         PostMessageW(hwnd_, WM_APP_SHELL_RENAME, reinterpret_cast<WPARAM>(view), 0);
     };
@@ -2524,8 +2525,12 @@ void MainWindow::ShellViewContextMenu(size_t pi, POINT screenPt)
     std::wstring createdFolderPath;
     bool renameSelected = false;
     shell::MenuCommands commands;
-    // 重命名走的是对话框（RenamePath），与列表实现无关，所以两种视图都用
-    // 本程序的“重命名(&M)”（shell 原生的就地改名在本站点不可用）
+    // 菜单里仍用本程序自己的“重命名(&M)”（shell 那一份是从 IShellFolder 取的
+    // IContextMenu，它的 rename 动词要经站点回驱视图，不保证成功），但**执行**
+    // 改成触发视图自己的就地改名：StartInlineRename 给内部列表发 LVM_EDITLABEL，
+    // 弹的就是 DefView 的编辑框，与慢双击同一个东西（改名由 DefView 自己提交）。
+    // 不走 VK_F2 —— 实测按 F2 / 投 F2 都不生效（DefView 的键盘改名要靠站点转发
+    // 快捷键，本站点没接）。弹不出来才退回对话框。
     if (shell::ShowContextMenu(hwnd_, path, t.dir, const_cast<POINT&>(screenPt),
                                L"添加当前目录到收藏", addFavorite, &createdFolderPath,
                                &renameSelected, L"在 Explorer 中打开(&X)",
@@ -2544,7 +2549,8 @@ void MainWindow::ShellViewContextMenu(size_t pi, POINT screenPt)
     }
     if (renameSelected && !path.empty()) {
         WriteAppLog((L"CONTEXT_MENU rename selected (shell view): " + path).c_str());
-        RenamePath(path);
+        if (!(t.shellView && t.shellView->StartInlineRename()))
+            RenamePath(path);   // 兜底：视图不可用时才用对话框
     }
     if (addFavorite) OnAddFavorite();
     ApplyMenuCommands(commands, sel);
@@ -4679,15 +4685,16 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         if (pi < 0) return 0;                      // 视图已随分页关闭销毁
         if (static_cast<size_t>(pi) != activePane_) PostSelectPane((size_t)pi);
         TabState& t = PaneActiveTab((size_t)pi);
+        // 就地改名：弹 DefView 自己的编辑框（与慢双击同一个）；弹不出来才退回对话框
+        if (t.shellView && t.shellView->StartInlineRename()) return 0;
         std::vector<std::wstring> sel =
             t.shellView ? t.shellView->SelectedPaths() : std::vector<std::wstring>{};
         if (sel.empty()) {
             WriteAppLog(L"RENAME request ignored (shell view): no selected item");
             return 0;
         }
-        WriteAppLog((L"RENAME requested from shell view: pane=" + std::to_wstring(pi) +
-                     L", path=" + sel.front()).c_str());
-        RenamePath(sel.front());   // 与自绘列表同一个重命名对话框
+        WriteAppLog((L"RENAME fallback to dialog (shell view): " + sel.front()).c_str());
+        RenamePath(sel.front());
         return 0;
     }
 

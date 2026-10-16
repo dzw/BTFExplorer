@@ -1,8 +1,10 @@
 #include "ShellFolderView.h"
+#include "../Util/AppLog.h"
 #include <shlwapi.h>
 #include <commctrl.h>
 #include <windowsx.h>
 #include <cwchar>
+#include <string>
 
 namespace {
 
@@ -157,11 +159,50 @@ LRESULT ShellFolderView::ViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     return CallWindowProcW(origViewProc_, h, msg, wp, lp);
 }
 
-// --- 视图内右键 / F2：拦下 shell 自己的处理，改走本程序的菜单与重命名对话框 ---
+// --- 视图内右键：拦下 shell 自己的菜单，改弹本程序的菜单 ---
+// （改名不再拦：DefView 自己的就地改名在本站点是通的——慢双击能触发就是证据，
+//   之前按 F2 没反应只是因为这里把 F2 吞掉改成了对话框）
 
 HWND ShellFolderView::InnerListView() const
 {
     return view_ ? FindInnerListView(view_) : nullptr;
+}
+
+// 触发 shell 视图自己的就地改名：直接给内部列表发 LVM_EDITLABEL。
+// 弹出来的就是 DefView 的 label edit 编辑框，慢双击最终也是这个，改名的提交
+// 由 DefView 自己在 LVN_ENDLABELEDIT 里完成（与资源管理器一致）。
+// 试过给列表投 VK_F2、也试过把 F2 整条放行给 shell，都不生效——DefView 的键盘
+// 改名走 IShellView::TranslateAccelerator 的站点转发，本站点没接；鼠标路径
+// （慢双击）不依赖它，所以能用。
+bool ShellFolderView::StartInlineRename()
+{
+    HWND list = InnerListView();
+    if (!list) {
+        WriteAppLog(L"SHELL inline rename failed: inner list not found");
+        return false;
+    }
+    const int item = ListView_GetNextItem(list, -1, LVNI_SELECTED);
+    if (item < 0) {
+        WriteAppLog(L"SHELL inline rename failed: no selected item");
+        return false;
+    }
+    HWND edit = ListView_EditLabel(list, item);
+    // 视图可以在 LVN_BEGINLABELEDIT 里否决（那之后编辑框会被立刻销毁），这种情况
+    // 也按失败处理，好让调用方退回对话框
+    if (!edit || !IsWindow(edit)) {
+        WriteAppLog(L"SHELL inline rename failed: edit box not created / rejected by view");
+        return false;
+    }
+    // 选中主名（不含扩展名），与资源管理器一致
+    wchar_t buf[MAX_PATH]{};
+    GetWindowTextW(edit, buf, MAX_PATH);
+    const std::wstring name(buf);
+    const size_t dot = name.find_last_of(L'.');
+    const LPARAM end = (dot != 0 && dot != std::wstring::npos)
+                           ? static_cast<LPARAM>(dot) : static_cast<LPARAM>(-1);
+    SendMessageW(edit, EM_SETSEL, 0, end);
+    WriteAppLog((L"SHELL inline rename: edit box shown, item=" + std::to_wstring(item)).c_str());
+    return true;
 }
 
 LRESULT CALLBACK ShellFolderView::CtxProcStatic(HWND h, UINT msg, WPARAM wp, LPARAM lp,
@@ -177,7 +218,7 @@ LRESULT CALLBACK ShellFolderView::CtxProcStatic(HWND h, UINT msg, WPARAM wp, LPA
     if (msg == WM_CONTEXTMENU && self->TakeContextMenu(lp))
         return 0;   // 吞掉：不让 shell 弹它的原生菜单（没有本程序的自定义项）
     if (msg == WM_KEYDOWN && wp == VK_F2 && self->TakeRenameKey())
-        return 0;   // 吞掉：shell 的就地改名在本站点走不通，改用主窗口的重命名对话框
+        return 0;   // 吞掉：DefView 自己的 F2 在本站点不生效，改用 LVM_EDITLABEL
     return DefSubclassProc(h, msg, wp, lp);
 }
 
