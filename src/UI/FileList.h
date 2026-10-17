@@ -46,7 +46,8 @@ public:
 // 图标挂系统图像列表（跨窗格共享一份），类型名/图标索引带扩展名级缓存。
 class FileList {
 public:
-    enum KeyCmd { CmdCopy, CmdCut, CmdPaste, CmdDelete, CmdDeleteNoRecycle, CmdRename, CmdEscape };
+    enum KeyCmd { CmdCopy, CmdCut, CmdPaste, CmdDelete, CmdDeleteNoRecycle, CmdRename,
+                  CmdEscape, CmdUp };
 
     bool Create(HWND parent, FileListDelegate* delegate, HFONT font, int controlId);
     ~FileList();

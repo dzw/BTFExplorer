@@ -755,6 +755,12 @@ void MainWindow::CreatePane(Pane& p)
         0, 0, 24, 20, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_VIEWMODE_BASE + p.tag)), hInst, nullptr);
     if (uiFont_) SendMessageW(p.btnViewMode, WM_SETFONT, (WPARAM)uiFont_, TRUE);
 
+    // “Q”左边的窗格编号标记（窗格 tag）：布局交流时指认窗格用
+    p.lblPaneTag = CreateWindowExW(0, WC_STATICW, std::to_wstring(p.tag).c_str(),
+        WS_CHILD | WS_VISIBLE | SS_CENTER,
+        0, 0, 14, 20, hwnd_, nullptr, hInst, nullptr);
+    if (uiFont_) SendMessageW(p.lblPaneTag, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+
     // 本窗格右上角的“▾”：外部工具下拉菜单（CMD / PowerShell / VSCode 等，见 tools.txt）
     p.btnTools = CreateWindowExW(0, WC_BUTTONW, L"▾",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
@@ -792,6 +798,7 @@ void MainWindow::RemovePane(size_t idx)
     panes_[idx].list = nullptr;
     if (panes_[idx].btnNewTab) DestroyWindow(panes_[idx].btnNewTab);
     if (panes_[idx].btnViewMode) DestroyWindow(panes_[idx].btnViewMode);
+    if (panes_[idx].lblPaneTag) DestroyWindow(panes_[idx].lblPaneTag);
     if (panes_[idx].btnTools) DestroyWindow(panes_[idx].btnTools);
     panes_.erase(panes_.begin() + idx);   // 该窗格分页的 shell 视图宿主随 TabState 析构销毁
     for (auto& t : tabs_)
@@ -2404,12 +2411,17 @@ void MainWindow::ListKeyCommand(HWND list, int cmd)
         break;
     }
     case FileList::CmdEscape:          HideToTray(); break;
+    case FileList::CmdUp:              // Backspace：与工具栏“上级”同一条路径（延后执行）
+        PostMessageW(hwnd_, WM_APP_NAV, IDC_UP, 0);
+        break;
     }
 }
 
-// “复制全路径”菜单项（两种列表实现共用）：内容随选区变化——
-//   空白处 → 当前目录全路径；单选 → 该项的全路径；
-//   多选 → 全部全路径（每行一条）。sel 由调用方收敛成“本次右键针对的那几项”。
+// “复制文件名/目录名”菜单项（两种列表实现共用）：内容随选区变化——
+//   空白处   → 当前目录全路径；
+//   单选     → 该项本身的名字（选中文件夹→文件夹名，选中文件→文件名）；
+//   多选     → 所有选中项的全路径（每行一条）。
+// sel 由调用方收敛成“本次右键针对的那几项”。
 static void BuildCopyMenuItem(const std::wstring& dir, const std::vector<std::wstring>& sel,
                               const std::wstring& path,
                               std::wstring& label, std::wstring& text)
@@ -2419,14 +2431,26 @@ static void BuildCopyMenuItem(const std::wstring& dir, const std::vector<std::ws
     if (path.empty()) {
         label = L"复制当前目录全路径(&A)";
         text = NormalizePath(dir);
-    } else {
-        label = sel.size() > 1
-                    ? L"复制全路径(&P)（" + std::to_wstring(sel.size()) + L" 项）"
-                    : L"复制全路径(&P)";
-        for (size_t i = 0; i < sel.size(); ++i) {
-            if (i) text += L"\r\n";
-            text += sel[i];
-        }
+        return;
+    }
+    if (sel.size() <= 1) {
+        // 单选（或选区只剩命中项）：只复制名字，不含路径。
+        // 末尾分隔符去掉（盘符根 "C:\" 去掉后剩 "C:"），目录名/文件名都取末段。
+        std::wstring p = NormalizePath(path);
+        while (p.size() > 1 && (p.back() == L'\\' || p.back() == L'/'))
+            p.pop_back();
+        std::wstring name = p;
+        if (size_t slash = p.find_last_of(L"\\/"); slash != std::wstring::npos)
+            name = p.substr(slash + 1);
+        label = L"复制文件名、目录名(&P)";
+        text = name;
+        return;
+    }
+    // 多选：复制全部全路径，每行一条。
+    label = L"复制全路径(&P)（" + std::to_wstring(sel.size()) + L" 项）";
+    for (size_t i = 0; i < sel.size(); ++i) {
+        if (i) text += L"\r\n";
+        text += NormalizePath(sel[i]);
     }
 }
 
@@ -2532,6 +2556,39 @@ int MainWindow::PaneOfShellView(const ShellFolderView* view) const
 // （IShellView::TranslateAccelerator）。不转发的话视图里的 F2 / Ctrl+C / Ctrl+V /
 // Delete 全部没反应，表现为“复制了却粘不出来”——因为剪贴板压根没东西。
 // 返回 true = 视图已吃掉该消息，调用方不要再分发。
+// 焦点在 shell 视图（Q 视图）里时，按键会先交给 IShellView::TranslateAccelerator
+// ——Ctrl+C / Delete 这些正是要留给视图的，所以本程序自己的全局键必须在那次转发
+// **之前**拦下来，否则焦点在 Q 视图时 Ctrl+T/W/N、Ctrl+Shift+C、Ctrl+1~4、F4、
+// Backspace 全都没反应。命中就转成命令消息延后执行，返回 true 表示消息已消费。
+bool MainWindow::TakeAppGlobalKey(const MSG* msg)
+{
+    if (!msg || msg->message != WM_KEYDOWN) return false;
+    const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    const int vk = static_cast<int>(msg->wParam);
+    if (!ctrl && !shift && vk == VK_BACK) {
+        // 视图里正在就地改名（焦点是编辑框）时，Backspace 是文本编辑，不抢
+        wchar_t cls[16] = {};
+        GetClassNameW(msg->hwnd, cls, 16);
+        if (wcscmp(cls, L"Edit") == 0) return false;
+        PostMessageW(hwnd_, WM_APP_NAV, IDC_UP, 0);
+        return true;
+    }
+    WORD id = 0;
+    if (!ctrl && !shift && vk == VK_F4) id = IDC_FOCUS_ADDRESS;
+    else if (ctrl && shift && vk == 'C') id = IDC_COPY_PATH;
+    else if (ctrl && !shift && vk == 'T') id = IDC_TAB_NEW;
+    else if (ctrl && !shift && vk == 'W') id = IDC_TAB_CLOSE;
+    else if (ctrl && !shift && vk == 'N') id = IDC_NEWFOLDER;
+    else if (ctrl && !shift && vk >= '1' && vk <= '4')
+        id = static_cast<WORD>(IDC_FOCUS_PANE1 + (vk - '1'));
+    else if (ctrl && !shift && vk >= VK_NUMPAD1 && vk <= VK_NUMPAD4)
+        id = static_cast<WORD>(IDC_FOCUS_PANE1 + (vk - VK_NUMPAD1));
+    if (!id) return false;
+    PostMessageW(hwnd_, WM_COMMAND, MAKEWPARAM(id, BN_CLICKED), 0);
+    return true;
+}
+
 bool MainWindow::TranslateShellViewKey(MSG* msg)
 {
     if (!msg) return false;
@@ -2546,6 +2603,7 @@ bool MainWindow::TranslateShellViewKey(MSG* msg)
     if (!view) return false;
     // 焦点必须确实在这个视图里（或其子窗口），否则会抢走地址栏/搜索框的按键
     if (msg->hwnd != view && !IsChild(view, msg->hwnd)) return false;
+    if (TakeAppGlobalKey(msg)) return true;
     return t.shellView->TranslateAccelerator(*msg);
 }
 
@@ -2994,6 +3052,38 @@ void MainWindow::OnProperties()
     std::wstring path;
     if (!SelectedPath(path)) path = CurTab().dir;   // 没选中条目 -> 当前目录的属性
     shell::ShowProperties(hwnd_, path);
+}
+
+// Ctrl+Shift+C：选中项全路径进剪贴板（每行一条）。没有选中项时复制当前目录，
+// 与右键菜单“复制当前目录全路径”一致（见 BuildCopyMenuItem）。
+void MainWindow::CopySelectedPaths()
+{
+    std::vector<std::wstring> sel = SelectedPaths();
+    std::wstring text;
+    if (sel.empty()) {
+        text = NormalizePath(CurTab().dir);
+    } else {
+        for (size_t i = 0; i < sel.size(); ++i) {
+            if (i) text += L"\r\n";
+            text += NormalizePath(sel[i]);
+        }
+    }
+    if (text.empty()) return;
+    WriteAppLog((L"COPY_PATH items=" + std::to_wstring(sel.size()) +
+                 L" text=" + text).c_str());
+    shell::CopyTextToClipboard(hwnd_, text);
+}
+
+// Ctrl+1~4：激活窗格并把焦点送进它的内容区。加速键是在消息循环里分发的，
+// 不在控件的消息链里，所以这里同步切窗格是安全的（不必走 PostSelectPane）。
+void MainWindow::FocusPane(size_t index)
+{
+    if (index >= panes_.size() || panes_[index].tabs.empty()) return;
+    if (index != activePane_) SelectPane(index);
+    TabState& t = PaneActiveTab(index);
+    HWND h = (t.listMode == 1 && t.shellView && t.shellView->HasView())
+                 ? t.shellView->ViewWindow() : panes_[index].list;
+    if (h) SetFocus(h);
 }
 
 void MainWindow::StartDragOut(std::vector<std::wstring> paths)
@@ -3562,7 +3652,11 @@ void MainWindow::UpdateNewTabButtons()
                     MapWindowPoints(p.tab, hwnd_, &vr, 1);
                     SetWindowPos(p.btnViewMode, HWND_TOP, vr.x, vr.y, 24, 20,
                                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
-                    toolsLeft = vr.x;   // “+”收起判断以最左的按钮为准
+                    // 窗格编号标记再往左一格（vr 已是主窗口坐标，直接减即可）
+                    if (p.lblPaneTag != nullptr)
+                        SetWindowPos(p.lblPaneTag, HWND_TOP, vr.x - 16, vr.y, 14, 20,
+                                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                    toolsLeft = (p.lblPaneTag != nullptr) ? vr.x - 16 : vr.x;   // “+”收起判断以最左的按钮为准
                 } else {
                     toolsLeft = tr.x;
                 }
@@ -4188,8 +4282,15 @@ void MainWindow::Layout()
             if (want < 150) want = 150;
             if (want > maxSide) want = maxSide;
             treeBar->SetPos(want);
+            int applied = treeBar->GetPos();
+            // 把分隔条内记的千分比也同步成这次像素宽度：m_nProportionalPos 仍是
+            // 默认 sideWidth_ 推出来的旧值，不更新，随后的 WM_SIZE（窗口显示/
+            // 最大化/还原）会按旧千分比重算，把侧栏宽度弹回默认，表现为
+            // “重启后目录树分割栏回到原来的位置”。
+            if (applied > 0 && W > 0)
+                treeBar->SetPosPermille(applied * 1000 / W);
             pendingSideWidth_ = 0;
-            sideWidth_ = treeBar->GetPos();
+            sideWidth_ = applied;
             geometryChanged_ = true;
         }
     }
@@ -4573,6 +4674,34 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         case IDC_PROPERTIES:
             OnProperties();
             return 0;
+        case IDC_TAB_NEW:
+            AddRightTab(true, activePane_);   // 与分页栏“+”同一行为
+            return 0;
+        case IDC_TAB_CLOSE:
+            CloseRightTab(activeTab_);        // 不带 force：锁定分页不关
+            return 0;
+        case IDC_COPY_PATH:
+            CopySelectedPaths();
+            return 0;
+        case IDC_FOCUS_PANE1: FocusPane(0); return 0;
+        case IDC_FOCUS_PANE2: FocusPane(1); return 0;
+        case IDC_FOCUS_PANE3: FocusPane(2); return 0;
+        case IDC_FOCUS_PANE4: FocusPane(3); return 0;
+        case IDC_FOCUS_ADDRESS: {
+            // F4 落在下拉框上时按它的原生语义（展开列表），不抢去地址栏
+            if (HWND f = GetFocus()) {
+                wchar_t cls[16] = {};
+                GetClassNameW(f, cls, 16);
+                if (wcscmp(cls, L"ComboBox") == 0) {
+                    SendMessageW(f, CB_SHOWDROPDOWN, TRUE, 0);
+                    return 0;
+                }
+            }
+            // F4：焦点进地址栏并全选，直接敲新路径就能整体替换
+            SetFocus(address_);
+            SendMessageW(address_, EM_SETSEL, 0, -1);
+            return 0;
+        }
         case IDC_MENU_FILTERS:
             shell::OpenContextMenuFilterSettings(hwnd_);
             return 0;
@@ -4604,7 +4733,9 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                     if (CurTab().locked) NavigateFromSidebar(buf);
                     else Navigate(buf);
                 }
-                if (HIWORD(wp) == EN_ADDR_RETURN) SetFocus(CurList());
+                // 交还焦点给当前窗格的“内容区”：Q 视图分页要给视图窗口，
+                // 否则焦点落到隐藏着的自绘列表上，地址栏回车后键盘就没反应了
+                if (HIWORD(wp) == EN_ADDR_RETURN) FocusPane(activePane_);
             }
             return 0;
         }
@@ -4695,6 +4826,31 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         } else {
             SyncShellViewActivation();
         }
+        return 0;
+    }
+
+    case WM_APP + 30: {          // 驱动诊断：把窗格/分页状态写进应用日志（外部工具用）
+        for (size_t i = 0; i < panes_.size(); ++i) {
+            Pane& p = panes_[i];
+            RECT rc{};
+            if (p.host) GetWindowRect(p.host->Handle(), &rc);
+            WriteAppLog((L"STATE pane" + std::to_wstring(i) +
+                         L" tag=" + std::to_wstring(p.tag) +
+                         L" rect=" + std::to_wstring(rc.left) + L"," + std::to_wstring(rc.top) +
+                         L" " + std::to_wstring(rc.right - rc.left) + L"x" +
+                         std::to_wstring(rc.bottom - rc.top) +
+                         L" active=" + std::to_wstring(p.active)).c_str());
+        }
+        for (size_t k = 0; k < tabs_.size(); ++k) {
+            TabState& t = tabs_[k];
+            WriteAppLog((L"STATE tab" + std::to_wstring(k) +
+                         L" pane=" + std::to_wstring(t.pane) +
+                         L" listmode=" + std::to_wstring(t.listMode) +
+                         L" shell=" + std::to_wstring(t.shellView ? 1 : 0) +
+                         L" items=" + std::to_wstring((int)t.pageItems.size()) +
+                         L" dir=[" + t.dir + L"]").c_str());
+        }
+        WriteAppLog((L"STATE activePane=" + std::to_wstring(activePane_)).c_str());
         return 0;
     }
 

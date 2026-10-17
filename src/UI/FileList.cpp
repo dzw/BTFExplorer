@@ -171,6 +171,8 @@ LRESULT FileList::Proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             if (ctrl && wp == 'V')      { delegate_->ListKeyCommand(h, CmdPaste); return 0; }
             if (wp == VK_DELETE)        { delegate_->ListKeyCommand(h, shift ? CmdDeleteNoRecycle : CmdDelete); return 0; }
             if (wp == VK_ESCAPE)        { delegate_->ListKeyCommand(h, CmdEscape); return 0; }
+            // Backspace = 上一级目录（与 shell 视图那条路径一致，见 ListKeyCommand）
+            if (wp == VK_BACK)          { delegate_->ListKeyCommand(h, CmdUp); return 0; }
             // F2 不拦截：放行给默认处理，走 LVN_KEYDOWN 的重命名通知
         }
 

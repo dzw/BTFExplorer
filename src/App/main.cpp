@@ -152,7 +152,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
     //   Alt+小键盘4/6 = 三窗格不对称布局（4=1 大左 + 2 小右上下排，6=2 小左 + 1 大右）
     // 小键盘 NumLock 关闭时 8/2/4/6 会被上报成 VK_UP/VK_DOWN/VK_LEFT/VK_RIGHT：
     // 8 与 Alt+Up（上级目录）冲突，保持导航；2 无冲突，额外绑 Alt+Down 兜底
-    ACCEL accel[16] = {};
+    ACCEL accel[25] = {};
     accel[0].fVirt = FVIRTKEY | FALT; accel[0].key = VK_UP;      accel[0].cmd = IDC_UP;
     accel[1].fVirt = FVIRTKEY | FALT; accel[1].key = VK_LEFT;    accel[1].cmd = IDC_BACK;
     accel[2].fVirt = FVIRTKEY | FALT; accel[2].key = VK_RIGHT;   accel[2].cmd = IDC_FORWARD;
@@ -172,7 +172,19 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
     // 常用文件操作：Ctrl+Shift+N 新建文件夹，Alt+Enter 属性（原版 0x47413E 的 Alt+Enter）
     accel[14].fVirt = FVIRTKEY | FCONTROL | FSHIFT; accel[14].key = 'N'; accel[14].cmd = IDC_NEWFOLDER;
     accel[15].fVirt = FVIRTKEY | FALT; accel[15].key = VK_RETURN; accel[15].cmd = IDC_PROPERTIES;
-    HACCEL hAccel = CreateAcceleratorTableW(accel, 16);
+    // 分页 / 窗格 / 剪贴板：Ctrl+T 新建分页，Ctrl+W 关闭分页，Ctrl+N 新建文件夹，
+    // Ctrl+Shift+C 复制选中项全路径，Ctrl+1~4 聚焦窗格，F4 激活地址栏
+    // Backspace 不进加速键表：地址栏编辑要用它删字符，改由列表控件与 shell 视图各自转发
+    accel[16].fVirt = FVIRTKEY | FCONTROL; accel[16].key = 'T'; accel[16].cmd = IDC_TAB_NEW;
+    accel[17].fVirt = FVIRTKEY | FCONTROL; accel[17].key = 'W'; accel[17].cmd = IDC_TAB_CLOSE;
+    accel[18].fVirt = FVIRTKEY | FCONTROL; accel[18].key = 'N'; accel[18].cmd = IDC_NEWFOLDER;
+    accel[19].fVirt = FVIRTKEY | FCONTROL | FSHIFT; accel[19].key = 'C'; accel[19].cmd = IDC_COPY_PATH;
+    accel[20].fVirt = FVIRTKEY | FCONTROL; accel[20].key = '1'; accel[20].cmd = IDC_FOCUS_PANE1;
+    accel[21].fVirt = FVIRTKEY | FCONTROL; accel[21].key = '2'; accel[21].cmd = IDC_FOCUS_PANE2;
+    accel[22].fVirt = FVIRTKEY | FCONTROL; accel[22].key = '3'; accel[22].cmd = IDC_FOCUS_PANE3;
+    accel[23].fVirt = FVIRTKEY | FCONTROL; accel[23].key = '4'; accel[23].cmd = IDC_FOCUS_PANE4;
+    accel[24].fVirt = FVIRTKEY; accel[24].key = VK_F4; accel[24].cmd = IDC_FOCUS_ADDRESS;
+    HACCEL hAccel = CreateAcceleratorTableW(accel, 25);
 
     int ret = 1;
     if (MainWindow* w = MainWindow::Create(hInst)) {

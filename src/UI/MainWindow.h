@@ -37,8 +37,15 @@ enum {
     // 分页标题右键菜单：关闭 / 关闭其他 / 关闭右边 / 锁定
     IDC_TM_LOCK = 1030, IDC_TM_CLOSE = 1031, IDC_TM_OTHERS = 1032, IDC_TM_RIGHT = 1033,
     IDC_LAYOUT6 = 1034, IDC_LAYOUT8 = 1035,   // Alt+6 / Alt+8 排布方向（见 main.cpp 加速键）
-    IDC_NEWFOLDER = 1036,    // Ctrl+Shift+N 新建文件夹
+    IDC_NEWFOLDER = 1036,    // Ctrl+N / Ctrl+Shift+N 新建文件夹
     IDC_PROPERTIES = 1037,   // Alt+Enter 属性对话框
+    // 键盘命令（加速键见 main.cpp）。跳过 1040~1051：那段是设置对话框自用 ID。
+    IDC_TAB_NEW = 1060,      // Ctrl+T 当前窗格新建分页
+    IDC_TAB_CLOSE = 1061,    // Ctrl+W 关闭当前分页（锁定的不关）
+    IDC_COPY_PATH = 1062,    // Ctrl+Shift+C 选中项全路径进剪贴板
+    IDC_FOCUS_PANE1 = 1063, IDC_FOCUS_PANE2 = 1064,   // Ctrl+1~4 聚焦窗格
+    IDC_FOCUS_PANE3 = 1065, IDC_FOCUS_PANE4 = 1066,
+    IDC_FOCUS_ADDRESS = 1067, // F4 激活地址栏并全选
 };
 
 // 每个右侧分页的独立状态（目录/页码/历史/加载器各自独立）
@@ -76,6 +83,7 @@ struct Pane {
     // GWLP_USERDATA 取 FileList*，地址必须稳定，不能跟着 vector 搬走
     std::unique_ptr<FileList> fileList;
     HWND btnViewMode = nullptr;              // 该窗格右上角“Q”列表实现切换按钮（只作用于当前分页）
+    HWND lblPaneTag = nullptr;               // “Q”左边的窗格编号标记（tag 数字，便于指认窗格）
     int tag = -1;                            // 窗格唯一编号（控件 ID 后缀，删除后编号可复用）
     int width = 340;                         // 窗格宽度（分隔条可拖）
     std::vector<size_t> tabs;                // 本窗格持有的 TabState 下标
@@ -210,6 +218,9 @@ private:
     void CreateLinks(const std::vector<std::wstring>& paths, int kind);
     // kind: 0=快捷方式(.lnk) 1=硬链接(文件) 2=Junction(目录)
     void OnProperties();             // 选中项属性，无选中时当前目录属性
+    void CopySelectedPaths();        // Ctrl+Shift+C：选中项全路径（无选中则当前目录）进剪贴板
+    void FocusPane(size_t index);    // Ctrl+1~4：激活窗格并把焦点送进它的内容区
+    bool TakeAppGlobalKey(const MSG* msg); // shell 视图转发前抢下本程序的全局键
     void StartDragOut(std::vector<std::wstring> paths); // 拖出：SHDoDragDrop
     void ApplyMenuCommands(const shell::MenuCommands& commands,
                            const std::vector<std::wstring>& targets); // 右键菜单项分发

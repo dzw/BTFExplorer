@@ -37,4 +37,8 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
 // Opens the editable UTF-8 filter list in Notepad, creating it with defaults if needed.
 bool OpenContextMenuFilterSettings(HWND owner);
 
+// 纯文本进剪贴板（CF_UNICODETEXT）：记事本、资源管理器地址栏、IDE 都能直接粘。
+// 右键菜单的“复制名称/全路径”与 Ctrl+Shift+C 共用。
+void CopyTextToClipboard(HWND hwnd, const std::wstring& text);
+
 } // namespace shell

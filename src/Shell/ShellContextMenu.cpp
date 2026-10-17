@@ -28,7 +28,7 @@ static constexpr UINT CMD_PROPERTIES = CMD_LAST + 9;
 static constexpr UINT CMD_PASTE      = CMD_LAST + 10; // 剪贴板有文件时出现
 
 // 纯文本进剪贴板（CF_UNICODETEXT）：记事本、资源管理器地址栏、IDE 都能直接粘
-static void CopyPlainText(HWND hwnd, const std::wstring& text)
+void CopyTextToClipboard(HWND hwnd, const std::wstring& text)
 {
     if (text.empty() || !OpenClipboard(hwnd)) return;
     if (EmptyClipboard()) {
@@ -573,7 +573,7 @@ bool ShowContextMenu(HWND hwnd, const std::wstring& path, const std::wstring& me
         } else if (commands && cmd == CMD_JUNCTION) {
             commands->junctionSelected = true;
         } else if (cmd == CMD_COPYTEXT) {
-            CopyPlainText(hwnd, copyItemText);
+            CopyTextToClipboard(hwnd, copyItemText);
             std::wstring flat = copyItemText;
             for (wchar_t& ch : flat)
                 if (ch == L'\r' || ch == L'\n') ch = L'|';
