@@ -30,6 +30,13 @@ public:
     void Destroy();                  // 解绑并销毁视图（切回自绘列表/窗格销毁时）
     void Layout();                   // 宿主尺寸变化后让视图填满客户区
 
+    // 浏览器职责：本视图所在窗格获得/失去焦点时由主窗口调用
+    // （SVUIA_ACTIVATE_FOCUS / SVUIA_DEACTIVATE）。视图文件操作（删除/复制等
+    // 键盘路径）依赖激活状态，Navigate 里只挂 NOFOCUS，聚焦后必须补 FOCUS。
+    void UIActivateView(UINT uActivate);
+
+    HWND InnerListView() const;          // 视图内部的 SysListView32（找不到返回空）
+
     // 视图内激活文件夹（双击/回车）或请求上级 -> 目标目录路径（onBrowse 触发；
     // 接收方必须延后处理：Navigate 会销毁发起回调的这个视图）
     std::function<void(const std::wstring&)> onBrowse;
@@ -117,8 +124,6 @@ private:
     bool TakeRenameKey();
     bool InstallContextMenuSubclass();   // 返回内部 SysListView32 是否已挂上
     void RemoveContextMenuSubclass();
-
-    HWND InnerListView() const;          // 视图内部的 SysListView32（找不到返回空）
 
     std::wstring ActivatedFolderPath() const;  // 当前选中项若是文件夹返回其绝对路径
 

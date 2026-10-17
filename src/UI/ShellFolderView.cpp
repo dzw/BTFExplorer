@@ -86,6 +86,11 @@ void ShellFolderView::Layout()
     MoveWindow(view_, 0, 0, rc.right, rc.bottom, TRUE);
 }
 
+void ShellFolderView::UIActivateView(UINT uActivate)
+{
+    if (viewObj_) viewObj_->UIActivate(uActivate);
+}
+
 bool ShellFolderView::Navigate(const std::wstring& dir)
 {
     if (!host_ || dir.empty()) return false;
@@ -175,7 +180,26 @@ bool ShellFolderView::TranslateAccelerator(const MSG& msg)
 {
     if (!viewObj_) return false;
     MSG m = msg;   // 接口要可写指针
-    return viewObj_->TranslateAccelerator(&m) == S_OK;
+    const HRESULT hr = viewObj_->TranslateAccelerator(&m);
+    // 诊断：记录文件操作键（Delete / Ctrl+C/X/V/A / F5 / Backspace）的转发结果。
+    // S_OK(0x00000000)=视图自认处理了；S_FALSE(0x00000001)=未处理（放行给窗口过程）。
+    // 方向键等由内部列表原生处理，转发结果无关，不记录以免刷屏。
+    if (msg.message == WM_KEYDOWN) {
+        const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        const UINT vk = static_cast<UINT>(msg.wParam);
+        const bool interesting =
+            (vk == VK_DELETE) || (ctrl && (vk == 'C' || vk == 'X' || vk == 'V' || vk == 'A'))
+            || (vk == VK_F5) || (vk == VK_BACK);
+        if (interesting) {
+            wchar_t line[128];
+            swprintf_s(line,
+                L"SHELL TranslateAccel: msg=0x%04X vk=0x%02X ctrl=%d shift=%d -> 0x%08X",
+                msg.message, vk, ctrl ? 1 : 0, shift ? 1 : 0, static_cast<unsigned>(hr));
+            WriteAppLog(line);
+        }
+    }
+    return hr == S_OK;
 }
 
 // 触发 shell 视图自己的就地改名：直接给内部列表发 LVM_EDITLABEL。

@@ -10,3 +10,4 @@ build.bat
 .codebuddy/*.ps1
 /QDirRef
 .dsh-acl-recovery/
+harness/

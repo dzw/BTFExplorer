@@ -103,6 +103,10 @@ public:
     // 打开外部传入的目录或文件（文件则导航到其所在目录）
     void OpenTarget(const std::wstring& path);
 
+    // 主消息循环里调用：把按键交给激活窗格的 shell 视图（见 .cpp 注释）。
+    // 返回 true = 视图已处理，不要分发该消息。
+    bool TranslateShellViewKey(MSG* msg);
+
 private:
     MainWindow() = default;
     MainWindow(const MainWindow&) = delete;
@@ -170,9 +174,6 @@ private:
     void SyncShellView(size_t paneIdx);      // shell 模式下让当前分页的视图对上其目录
     bool EnsureTabShellView(size_t paneIdx, TabState& t);  // 懒创建该分页自己的 shell 视图
     void ShowHidePaneShellViews(size_t paneIdx);           // 只显示当前分页的视图，隐藏同窗格其余
-    // 主消息循环里调用：把按键交给激活窗格的 shell 视图（见 .cpp 注释）。
-    // 返回 true = 视图已处理，不要分发该消息。
-    bool TranslateShellViewKey(MSG* msg);
 
     // FileListDelegate：自绘列表的交互回调（控件侧只管显示与命中，业务在这里）
     void ActivatePaneDeferred(HWND list) override;

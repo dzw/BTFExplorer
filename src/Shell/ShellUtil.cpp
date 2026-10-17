@@ -201,7 +201,6 @@ bool GetClipboardFiles(std::vector<std::wstring>& paths, bool& move)
     CloseClipboard();
     return !paths.empty();
 }
-}
 
 int CachedSysIconIndexForEntry(const std::wstring& path, bool isFolder) {
     if (path.empty()) return -1;
