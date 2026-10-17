@@ -46,6 +46,7 @@ enum {
     IDC_FOCUS_PANE1 = 1063, IDC_FOCUS_PANE2 = 1064,   // Ctrl+1~4 聚焦窗格
     IDC_FOCUS_PANE3 = 1065, IDC_FOCUS_PANE4 = 1066,
     IDC_FOCUS_ADDRESS = 1067, // F4 激活地址栏并全选
+    IDC_PANES4 = 1068,       // Alt+主键盘4 = 四窗格（田字）；不对称三窗格是 Alt+小键盘4/6
 };
 
 // 每个右侧分页的独立状态（目录/页码/历史/加载器各自独立）

@@ -1110,11 +1110,42 @@ bool MainWindow::RestoreSession()
     struct RestoreGuard { bool* p; RestoreGuard(bool* p_) : p(p_) { *p_ = true; } ~RestoreGuard() { *p = false; } };
     RestoreGuard guard(&restoreInProgress_);
     // ---- 读盘 ----
+    // 用 CreateFileW + ReadFile 读，而不是 _wfopen_s：CRT 的 fopen 在部分环境
+    // （实时杀软 / 共享模式 / UAC 虚拟化）下以 "rb" 打开“已存在”的文件会失败，
+    // 导致会话永远读不到，表现为“目录树分割栏 / 窗口尺寸重启后回到默认”。
+    // WriteAppLog 本身用 CreateFileW(FILE_SHARE_READ|WRITE|DELETE) 写的本文件，
+    // 这里用相同共享标志读，保证一定能打开同一个 session.txt；失败时顺带打出
+    // GetLastError，避免再像以前那样只报一句 NOT opened 却看不出原因。
     std::wstring path = SessionFilePath();
-    FILE* f = nullptr;
-    _wfopen_s(&f, path.c_str(), L"rb");
+    std::string data;
+    DWORD openErr = 0;
+    {
+        HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER fsz{};
+            if (GetFileSizeEx(hFile, &fsz) && fsz.QuadPart >= 0 &&
+                fsz.QuadPart <= 0x7FFFFFFFLL) {
+                data.resize((size_t)fsz.QuadPart);
+                if (!data.empty()) {
+                    DWORD got = 0;
+                    if (!ReadFile(hFile, &data[0], (DWORD)data.size(), &got, nullptr))
+                        openErr = GetLastError();
+                    data.resize(got);
+                }
+            } else if (fsz.QuadPart > 0x7FFFFFFFLL) {
+                openErr = ERROR_FILE_TOO_LARGE;
+            }
+            CloseHandle(hFile);
+        } else {
+            openErr = GetLastError();
+        }
+    }
     WriteAppLog((L"RESTORE session file path=" + path +
-        (f ? L" (opened)" : L" (NOT opened)")).c_str());
+        (data.empty()
+            ? (L" (NOT opened/empty err=" + std::to_wstring(openErr) + L")")
+            : (L" (opened bytes=" + std::to_wstring(data.size()) + L")"))).c_str());
     struct TabRec { int pane = 0; int locked = 0; int listMode = -1; int histPos = 0;
                     std::vector<std::wstring> history; };
     int paneCount = 1, tri = 1, sel = 0, sortCol = 0, sortAsc = 1;
@@ -1129,11 +1160,7 @@ bool MainWindow::RestoreSession()
     std::vector<TabRec> recs;
     TabRec cur; bool inTab = false, ok = false;
 
-    if (f) {
-        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-        std::string data; data.resize(sz > 0 ? sz : 0);
-        if (sz > 0) fread(&data[0], 1, sz, f);
-        fclose(f);
+    if (!data.empty()) {
         if (data.size() >= 3 && (unsigned char)data[0] == 0xEF &&
             (unsigned char)data[1] == 0xBB && (unsigned char)data[2] == 0xBF)
             data.erase(0, 3);
@@ -1244,7 +1271,7 @@ bool MainWindow::RestoreSession()
         if (inTab) recs.push_back(cur);
         ok = !recs.empty();
     }
-    if (!f) WriteAppLog(L"RESTORE session file not opened (no saved session)");
+    if (data.empty()) WriteAppLog(L"RESTORE session file not opened (no saved session)");
 
     if (hasSavedWindowRect) {
         // 诊断：恢复前的当前窗口矩形（Create 时设定的默认尺寸）
@@ -1293,12 +1320,12 @@ bool MainWindow::RestoreSession()
     } else {
         WriteAppLog(L"RESTORE no saved window rect; using default window size");
     }
-    RECT clientRect{};
-    GetClientRect(hwnd_, &clientRect);
-    int maxSideWidth = clientRect.right - 260;
-    if (maxSideWidth < 150) maxSideWidth = 150;
-    sideWidth_ = (savedSideWidth < 150) ? 150 :
-                 (savedSideWidth > maxSideWidth ? maxSideWidth : savedSideWidth);
+    // 注意：这里不能用 GetClientRect 来夹上限——此刻窗口还没真正恢复到会话里的
+    // 尺寸（SetWindowPlacement 触发的 WM_SIZE 可能是异步的），用“创建时的默认
+    // 客户区宽度”去夹，会把已保存的较宽侧栏错误地压窄，且 Layout 里的夹值只会
+    // 继续往小夹、不会还原。所以这里只兜底下限，上限交给 Layout（用恢复后的真实
+    // 宽度 W 来算 W-260）去夹，才能精确还原。
+    sideWidth_ = (savedSideWidth < 150) ? 150 : savedSideWidth;
     pendingSideWidth_ = sideWidth_;   // 等窗口恢复成会话里的尺寸后再按像素精确落位
 
     if (!ok) {
@@ -4639,18 +4666,18 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         case IDC_TM_OTHERS: CloseOtherTabs(menuTab_); return 0;
         case IDC_TM_RIGHT:  CloseRightTabs(menuTab_); return 0;
         case IDC_TM_LOCK:   ToggleTabLock(menuTab_); return 0;
-        // Alt+数字（加速键 → 这里，见 main.cpp；2/4/6/8 主键盘行与小键盘行都绑）：
-        //   Alt+1~3 窗格数量；
-        //   2 窗格：Alt+4/6（含小键盘）= 左右并排，Alt+2/8（含小键盘）= 上下排列；
-        //   3 窗格：Alt+4 = 1 大窗格在左 + 2 小窗格在右（上下排），
-        //            Alt+6 = 2 小窗格在左（上下排）+ 1 大窗格在右，
+        // Alt+数字（加速键 → 这里，见 main.cpp）：
+        //   主键盘 Alt+1~4 = 窗格数量 1/2/3/4（4 是田字四窗格）；
+        //   2 窗格：Alt+小键盘4 或 Alt+6 = 左右并排，Alt+2/8（含小键盘）= 上下排列；
+        //   3 窗格：Alt+小键盘4 = 1 大窗格在左 + 2 小窗格在右（上下排），
+        //            Alt+小键盘6 = 2 小窗格在左（上下排）+ 1 大窗格在右，
         //            Alt+小键盘8 = 品字形（1 上 2 下），Alt+小键盘2 = 倒品字形（2 上 1 下）。
-        //   四窗格（田字）由设置对话框选。
         case IDC_LAYOUT1: SetPaneCount(1); return 0;
         case IDC_LAYOUT2:
             if (panes_.size() == 2) SetTwoPaneVert(1); else SetPaneCount(2);
             return 0;
         case IDC_LAYOUT3: SetPaneCount(3); return 0;
+        case IDC_PANES4: SetPaneCount(4); return 0;   // Alt+主键盘4：田字四窗格
         case IDC_LAYOUT4:
             if (panes_.size() == 2) SetTwoPaneVert(0); else SetAsymmetricTri(1);
             return 0;

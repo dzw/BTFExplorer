@@ -148,8 +148,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
 
     // 加速键：焦点在列表/地址栏等子控件上时也能生效（Alt+消息不会自动转到主窗口）
     //   Alt+方向键导航；Alt+1~8 排布（语义见 MainWindow 的 WM_COMMAND：
-    //   1/2/3 = 窗格数量，4/6/8 = 该窗格数下的排布方向）；Alt+小键盘8/2 切品字形态，
-    //   Alt+小键盘4/6 = 三窗格不对称布局（4=1 大左 + 2 小右上下排，6=2 小左 + 1 大右）
+    //   主键盘 1~4 = 窗格数量 1/2/3/4（4 为田字），小键盘 4/6 = 三窗格不对称布局
+    //   （4=1 大左 + 2 小右上下排，6=2 小左 + 1 大右），主键盘 6/8 = 排布方向
+    //   小键盘 8/2 切品字形态）
     // 小键盘 NumLock 关闭时 8/2/4/6 会被上报成 VK_UP/VK_DOWN/VK_LEFT/VK_RIGHT：
     // 8 与 Alt+Up（上级目录）冲突，保持导航；2 无冲突，额外绑 Alt+Down 兜底
     ACCEL accel[25] = {};
@@ -159,14 +160,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
     accel[3].fVirt = FVIRTKEY | FALT; accel[3].key = '1';        accel[3].cmd = IDC_LAYOUT1;
     accel[4].fVirt = FVIRTKEY | FALT; accel[4].key = '2';        accel[4].cmd = IDC_LAYOUT2;
     accel[5].fVirt = FVIRTKEY | FALT; accel[5].key = '3';        accel[5].cmd = IDC_LAYOUT3;
-    accel[6].fVirt = FVIRTKEY | FALT; accel[6].key = '4';        accel[6].cmd = IDC_LAYOUT4;
+    // 主键盘 4 = 四窗格（田字）；不对称三窗格只留给小键盘 4/6
+    accel[6].fVirt = FVIRTKEY | FALT; accel[6].key = '4';        accel[6].cmd = IDC_PANES4;
     // Alt+6 / Alt+8：两窗格时切排布方向，三窗格时切不对称形态（见 MainWindow 的 WM_COMMAND）
     accel[10].fVirt = FVIRTKEY | FALT; accel[10].key = '6';      accel[10].cmd = IDC_LAYOUT6;
     accel[11].fVirt = FVIRTKEY | FALT; accel[11].key = '8';      accel[11].cmd = IDC_LAYOUT8;
     accel[7].fVirt = FVIRTKEY | FALT; accel[7].key = VK_NUMPAD8; accel[7].cmd = IDC_TRI_PINTOP;
     accel[8].fVirt = FVIRTKEY | FALT; accel[8].key = VK_NUMPAD2; accel[8].cmd = IDC_TRI_PINDOWN;
     accel[9].fVirt = FVIRTKEY | FALT; accel[9].key = VK_DOWN;    accel[9].cmd = IDC_TRI_PINDOWN;
-    // 小键盘 4/6：与主键盘行同款命令（不对称布局习惯按小键盘按）
+    // 小键盘 4/6：三窗格不对称布局（习惯按小键盘）；主键盘 4 已是四窗格
     accel[12].fVirt = FVIRTKEY | FALT; accel[12].key = VK_NUMPAD4; accel[12].cmd = IDC_LAYOUT4;
     accel[13].fVirt = FVIRTKEY | FALT; accel[13].key = VK_NUMPAD6; accel[13].cmd = IDC_LAYOUT6;
     // 常用文件操作：Ctrl+Shift+N 新建文件夹，Alt+Enter 属性（原版 0x47413E 的 Alt+Enter）
