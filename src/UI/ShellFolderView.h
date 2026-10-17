@@ -99,7 +99,16 @@ public:
     IFACEMETHODIMP GetViewStateStream(DWORD, IStream**) override { return E_NOTIMPL; }
     IFACEMETHODIMP GetControlWindow(UINT, HWND*) override { return E_NOTIMPL; }
     IFACEMETHODIMP SendControlMsg(UINT, UINT, WPARAM, LPARAM, LRESULT*) override { return E_NOTIMPL; }
-    IFACEMETHODIMP QueryActiveShellView(IShellView**) override { return E_NOTIMPL; }
+    // 单视图浏览器：当前视图即激活视图。视图的文件操作路径（Delete / Ctrl+C 等
+    // 键盘路径）会向浏览器查询激活视图，返回 E_NOTIMPL 会让整条路径静默失败
+    //（实测：Delete 转发到视图并返回 S_OK，但实际什么都没删）。
+    IFACEMETHODIMP QueryActiveShellView(IShellView** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (!viewObj_) return E_FAIL;
+        *ppv = viewObj_.Get();
+        viewObj_.Get()->AddRef();
+        return S_OK;
+    }
     IFACEMETHODIMP OnViewWindowActive(IShellView*) override { return S_OK; }
     IFACEMETHODIMP SetToolbarItems(LPTBBUTTONSB, UINT, UINT) override { return E_NOTIMPL; }
 

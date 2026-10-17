@@ -174,6 +174,7 @@ private:
     void SyncShellView(size_t paneIdx);      // shell 模式下让当前分页的视图对上其目录
     bool EnsureTabShellView(size_t paneIdx, TabState& t);  // 懒创建该分页自己的 shell 视图
     void ShowHidePaneShellViews(size_t paneIdx);           // 只显示当前分页的视图，隐藏同窗格其余
+    void SyncShellViewActivation();                        // 同步 UIActivate：激活窗格当前分页视图 FOCUS，其余 DEACTIVATE
 
     // FileListDelegate：自绘列表的交互回调（控件侧只管显示与命中，业务在这里）
     void ActivatePaneDeferred(HWND list) override;

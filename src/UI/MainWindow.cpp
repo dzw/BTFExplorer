@@ -252,6 +252,7 @@ static constexpr int WM_APP_SHELL_CTXMENU = WM_APP + 20;   // shell 视图内右
 static constexpr int WM_APP_SHELL_RENAME  = WM_APP + 21;   // shell 视图内 F2 -> 延后就地改名
 static constexpr int WM_APP_FILE_DRAG = WM_APP + 22;       // 列表条目拖出 -> 延后进拖拽循环
 static constexpr int WM_APP_LIST_CMD  = WM_APP + 23;       // 列表键盘命令 -> 等切窗完成后执行
+static constexpr int WM_APP_SHELL_ACTIVATE = WM_APP + 24;  // 延后同步 shell 视图激活态（UIActivate FOCUS/DEACTIVATE）
 
 // shell 视图右键请求：视图指针 + 屏幕坐标（堆上随消息传递，处理完即删）
 struct ShellCtxRequest {
@@ -1389,6 +1390,7 @@ void MainWindow::SelectRightTab(size_t index)
     RefreshList();
     SyncTreeToCurrentTab(false);
     SyncShellView(t.pane);
+    SyncShellViewActivation();
 }
 
 void MainWindow::SelectPane(size_t index)
@@ -1404,6 +1406,21 @@ void MainWindow::SelectPane(size_t index)
     RefreshList();
     SyncTreeToCurrentTab(false);
     SyncShellView(index);
+    SyncShellViewActivation();
+}
+
+// 同步 shell 视图激活态：激活窗格的当前分页视图 FOCUS，其余一律 DEACTIVATE。
+// 视图的文件操作键盘路径（Delete / Shift+Delete / Ctrl+C 等）执行前会检查
+// 浏览器的激活状态；之前 Navigate 只挂过 NOFOCUS 再没人补，Delete 转发到
+// 视图返回 S_OK 却什么都不删（实测日志）。
+void MainWindow::SyncShellViewActivation()
+{
+    for (size_t i = 0; i < tabs_.size(); ++i) {
+        TabState& t = tabs_[i];
+        if (!t.shellView) continue;
+        bool focus = (i == activeTab_ && t.pane == activePane_ && t.listMode == 1);
+        t.shellView->UIActivateView(focus ? SVUIA_ACTIVATE_FOCUS : SVUIA_DEACTIVATE);
+    }
 }
 
 // 延后版激活入口：只记录目标并 PostMessage，控件消息链结束后才真正切换。
@@ -2136,13 +2153,19 @@ void MainWindow::ApplyCurrentSort(size_t paneIdx)
 // 懒创建该分页自己的 shell 视图（宿主为主窗口的子窗口，与列表重叠摆放），并导航到分页目录。
 bool MainWindow::EnsureTabShellView(size_t paneIdx, TabState& t)
 {
+    WriteAppLog((L"DBG EnsureTabShellView paneIdx=" + std::to_wstring(paneIdx) +
+                 L" hasView=" + std::to_wstring(t.shellView ? 1 : 0) +
+                 L" dir=[" + t.dir + L"]").c_str());
     if (t.shellView) return true;
     if (paneIdx >= panes_.size()) return false;
     auto sv = std::make_unique<ShellFolderView>();
+    WriteAppLog(L"DBG ShellFolderView create calling");
     if (!sv->Create(panes_[paneIdx].host->Handle())) {
         WriteAppLog(L"ShellFolderView create failed");
         return false;
     }
+    WriteAppLog((L"DBG ShellFolderView create ok host=" +
+                 std::to_wstring((size_t)(uintptr_t)sv->Host())).c_str());
     // 视图内双击目录 -> 浏览请求：必须延后（回调发生在视图自己的消息链内，
     // 处理中的 Navigate 会销毁发起回调的这个视图）。用 SHELL_NAV 而非 TREE_NAV：
     // 在视图自己的分页内切换目录，不因分页被锁定而克隆出新分页。
@@ -2174,8 +2197,11 @@ bool MainWindow::EnsureTabShellView(size_t paneIdx, TabState& t)
     // 不走自绘列表那条 FileList::Proc，没有自动激活，这里补上（同样延后执行）。
     t.shellView->onActivateRequest = [this, view = t.shellView.get()]() {
         int pi = PaneOfShellView(view);
-        if (pi >= 0 && static_cast<size_t>(pi) != activePane_)
-            PostSelectPane(static_cast<size_t>(pi));
+        if (pi < 0) return;
+        if (static_cast<size_t>(pi) != activePane_)
+            PostSelectPane(static_cast<size_t>(pi));   // SelectPane 里会同步激活态
+        else
+            PostMessageW(hwnd_, WM_APP_SHELL_ACTIVATE, 1, 0);  // 窗格已激活：延后补 FOCUS
     };
     // 视图宿主登记给容器摆放（它与自绘列表重叠，显隐由 listMode 决定）
     panes_[paneIdx].host->AddContent(t.shellView->Host());
@@ -2205,6 +2231,8 @@ void MainWindow::ShowHidePaneShellViews(size_t paneIdx)
 // 当前分页右上角“Q”按钮（延后到这里执行）：只切换该分页的实现（窗格内其余分页不受影响）
 void MainWindow::ToggleListMode(size_t paneIdx)
 {
+    WriteAppLog((L"DBG ToggleListMode paneIdx=" + std::to_wstring(paneIdx) +
+                 L" panes=" + std::to_wstring(panes_.size())).c_str());
     if (paneIdx >= panes_.size()) return;
     Pane& p = panes_[paneIdx];
     TabState& t = PaneActiveTab(paneIdx);
@@ -2226,6 +2254,7 @@ void MainWindow::ToggleListMode(size_t paneIdx)
         UpdateStatusBar();
         UpdatePaginationBar();
     }
+    SyncShellViewActivation();   // 切到视图补 FOCUS，切回自绘补 DEACTIVATE
     SaveSession();   // 模式是会话状态，立即落盘
 }
 
@@ -4655,7 +4684,22 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    case WM_ACTIVATE:   // 整窗获失激活：延后同步 shell 视图激活态（1=激活，0=失活）
+        PostMessageW(hwnd_, WM_APP_SHELL_ACTIVATE, (wp == WA_INACTIVE) ? 0 : 1, 0);
+        break;
+
+    case WM_APP_SHELL_ACTIVATE: {
+        if (wp == 0) {
+            for (size_t i = 0; i < tabs_.size(); ++i)
+                if (tabs_[i].shellView) tabs_[i].shellView->UIActivateView(SVUIA_DEACTIVATE);
+        } else {
+            SyncShellViewActivation();
+        }
+        return 0;
+    }
+
     case WM_APP_TOGGLE_VIEWMODE: // “Q”按钮：延后切换窗格的文件列表实现
+        WriteAppLog((L"DBG TOGGLE_VIEWMODE msg received paneIdx=" + std::to_wstring(wp)).c_str());
         ToggleListMode(static_cast<size_t>(wp));
         return 0;
 
