@@ -63,7 +63,9 @@ struct TabState {
     // 本分页的文件列表实现：0=自绘虚拟列表 1=shell 视图。
     // 作用域是分页而非窗格——同一窗格内各分页可各自独立选择实现，
     // “Q”按钮只切换当前分页，切分页时按该分页自己的模式显示。
-    int listMode = 0;
+    // 默认用 shell 视图：新建分页/新窗格/首次启动的首个分页都从它开始；
+    // 会话里保存了 listmode= 的分页仍按保存值恢复（见 RestoreSession）。
+    int listMode = 1;
     std::unique_ptr<PageManager> pages;
     // Q-Dir 式 shell 视图：每个分页一个独立实例（独立 SHELLDLL_DefView 窗口），
     // 切分页只 Show/Hide 不重建，故分页的视图句柄稳定。懒创建。

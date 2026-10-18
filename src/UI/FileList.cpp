@@ -144,15 +144,42 @@ LRESULT FileList::Proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         dragStartPt_ = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         dragStartItem_ = idx;
         dragPending_ = idx >= 0;
+        dragMoveLogged_ = false;
+        WriteAppLog((L"DBG LIST down idx=" + std::to_wstring(idx) +
+                     L" dragPending=" + std::to_wstring(dragPending_ ? 1 : 0)).c_str());
     }
 
-    if (msg == WM_LBUTTONUP || msg == WM_CAPTURECHANGED) dragPending_ = false;
+    // 只认真正的松手来取消候选，绝不因 WM_CAPTURECHANGED 取消：
+    // ListView 在按下时会自己 SetCapture，紧接着 OLE 拖放钩子/窗格激活逻辑会把
+    // 捕获抢走并送来 WM_CAPTURECHANGED；以前据此清 dragPending_，结果“按下后
+    // ~1ms 就被判成取消”（实测日志 idx=13 后立刻 cancelled），鼠标再移动也不会
+    // 触发拖动。这是自绘列表拖不出去的根因。
+    if (msg == WM_LBUTTONUP) {
+        if (dragPending_) WriteAppLog(L"DBG LIST drag cancelled (button up)");
+        dragPending_ = false;
+    }
+
+    if (msg == WM_MOUSEMOVE && (wp & MK_LBUTTON) && !dragMoveLogged_) {
+        dragMoveLogged_ = true;
+        WriteAppLog((L"DBG LIST first mousemove with button, dragPending=" +
+                     std::to_wstring(dragPending_ ? 1 : 0) +
+                     L" capture=" + std::to_wstring(GetCapture() == h ? 1 : 0)).c_str());
+    }
 
     if (msg == WM_MOUSEMOVE && dragPending_ && (wp & MK_LBUTTON)) {
+        // 捕获若被别处抢走，这里抢回来——否则后续 WM_MOUSEMOVE 会发给抢捕获的
+        // 窗口，本控件永远等不到越过阈值那一刻。
+        if (GetCapture() != h) {
+            SetCapture(h);
+            WriteAppLog(L"DBG LIST drag reclaimed capture");
+        }
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         if (abs(pt.x - dragStartPt_.x) > GetSystemMetrics(SM_CXDRAG) ||
             abs(pt.y - dragStartPt_.y) > GetSystemMetrics(SM_CYDRAG)) {
             dragPending_ = false;      // 一次按下只请求一次
+            if (GetCapture() == h) ReleaseCapture();   // 交还捕获，拖拽循环自己接管
+            WriteAppLog((L"DBG LIST drag threshold crossed, calling StartDrag item=" +
+                         std::to_wstring(dragStartItem_)).c_str());
             delegate_->StartDrag(h, dragStartItem_);
         }
     }
@@ -216,6 +243,19 @@ bool FileList::HandleNotify(NMHDR* nm)
         // （RefreshList -> LVM_SETITEMCOUNT），由宿主延后执行
         delegate_->ActivatePaneDeferred(h);
         break;
+    }
+
+    // 控件自己判定“开始拖拽”时发此通知（比手搓阈值更可靠，不受捕获被抢影响）。
+    // 与 WM_MOUSEMOVE 阈值路径二选一：先到者把 dragPending_ 清掉，另一个就跳过，
+    // 不会重复发起。
+    if (nm->code == LVN_BEGINDRAG) {
+        auto* lv = reinterpret_cast<NMLISTVIEW*>(nm);
+        WriteAppLog((L"DBG LIST LVN_BEGINDRAG item=" + std::to_wstring(lv->iItem)).c_str());
+        if (dragPending_ && lv->iItem >= 0) {
+            dragPending_ = false;
+            delegate_->StartDrag(h, lv->iItem);
+        }
+        return true;
     }
 
     if (nm->code == LVN_GETDISPINFOW) {

@@ -69,22 +69,10 @@ bool IsDirectory(const std::wstring& path)
     return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
-// 绝对 PIDL 的最后一个子项（等价 ILFindLastChild；本 SDK 的 shlwapi 没导出该宏化的
-// IDList 辅助函数，这里按 SHITEMID 链自己走）。返回的指针属于 absolute，不单独释放。
-const ITEMIDLIST* LastChildOf(const ITEMIDLIST* absolute)
-{
-    if (!absolute) return nullptr;
-    const BYTE* p = reinterpret_cast<const BYTE*>(absolute);
-    const BYTE* last = nullptr;
-    for (;;) {
-        WORD size;
-        memcpy(&size, p, sizeof(size));
-        if (size == 0) break;              // 结束标记
-        last = p;
-        p += size;
-    }
-    return last ? reinterpret_cast<const ITEMIDLIST*>(last) : nullptr;
-}
+// 绝对 PIDL 的最后一个子项辅助函数已随 DragFilesOut 改用 CF_HDROP 而移除：
+// SHCreateDataObject 只产生 Shell IDList Array、不产生 CF_HDROP，而资源管理器/桌面
+// 等目标是靠 CF_HDROP 读取拖拽文件的，缺它就会静默拒绝拖放（无复制/移动光标、
+// effect 落到 NONE），表现为“普通文件列表拖不出去”。改用 CF_HDROP 后不再需要 PIDL。
 
 // Junction 用的 reparse 数据（winioctl.h 的 REPARSE_DATA_BUFFER 在本工程工具集里取不到，
 // 这里按公开布局摆一遍：8 字节通用头 + 4 个 USHORT 偏移/长度 + 两条以 NUL 结尾的路径）
@@ -308,42 +296,108 @@ DWORD DragFilesOut(HWND owner, const std::vector<std::wstring>& paths)
 {
     if (paths.empty()) return DROPEFFECT_NONE;
 
-    // shell 数据对象（CF_HDROP + Shell IDList Array + FileGroupDescriptor），这样
-    // 拖到资源管理器/桌面才有完整的“复制/移动/创建快捷方式”语义。数据对象要求
-    // “容器 + 子 PIDL”，所以只拖同一目录里的项（文件列表本来就同目录）。
-    std::wstring directory = ParentOf(paths.front());
-    std::vector<UniquePIDL> owned;
-    std::vector<LPCITEMIDLIST> children;
-    for (const auto& p : paths) {
-        if (ParentOf(p) != directory) continue;
-        UniquePIDL absolute = PIDLFromPath(p);
-        if (!absolute) continue;
-        const ITEMIDLIST* child = LastChildOf(
-            reinterpret_cast<const ITEMIDLIST*>(absolute.get()));
-        if (!child) continue;
-        children.push_back(child);
-        owned.push_back(std::move(absolute));   // 子 PIDL 是绝对 PIDL 的后缀，必须留活
-    }
-    if (children.empty()) return DROPEFFECT_NONE;
-    UniquePIDL container = PIDLFromPath(directory);
-    if (!container) return DROPEFFECT_NONE;
-
-    ComPtr<IDataObject> data;
-    HRESULT hr = SHCreateDataObject(reinterpret_cast<LPCITEMIDLIST>(container.get()),
-                                    static_cast<UINT>(children.size()), children.data(),
-                                    nullptr, IID_PPV_ARGS(&data));
-    if (FAILED(hr) || !data) {
-        WriteAppLog((L"FILEOP drag data object failed: hr=" +
-                     std::to_wstring(static_cast<unsigned long>(hr))).c_str());
+    // 拖出用 CF_HDROP：资源管理器/桌面等目标正是从 CF_HDROP 读取拖拽文件的。
+    // 之前用 SHCreateDataObject 只产生 Shell IDList Array、没有 CF_HDROP，目标拿
+    // 不到路径就静默拒绝（无复制/移动光标、effect=NONE），这就是“普通列表拖不出去”。
+    // 这里手工实现 IDataObject，只放 CF_HDROP（DROPFILES 头 + 双 '\0' 结尾的宽字符
+    // 路径串），与 SetFileClipboard 用的一模一样——那份已被证明能跟 Explorer 互通。
+    WriteAppLog((L"FILEOP drag out begin: items=" + std::to_wstring(paths.size()) +
+                 L", first=" + paths.front()).c_str());
+    SIZE_T chars = 0;
+    for (const auto& p : paths) chars += p.size() + 1;
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT,
+                            sizeof(DROPFILES) + (chars + 1) * sizeof(wchar_t));
+    if (!h) {
+        WriteAppLog(L"FILEOP drag out: GlobalAlloc for CF_HDROP failed");
         return DROPEFFECT_NONE;
     }
+    auto* df = static_cast<DROPFILES*>(GlobalLock(h));
+    if (!df) {
+        GlobalFree(h);
+        WriteAppLog(L"FILEOP drag out: GlobalLock for CF_HDROP failed");
+        return DROPEFFECT_NONE;
+    }
+    df->pFiles = sizeof(DROPFILES);
+    df->fWide = TRUE;
+    auto* w = reinterpret_cast<wchar_t*>(df + 1);
+    for (const auto& p : paths) {
+        size_t n = p.size() + 1;
+        wmemcpy(w, p.c_str(), n);
+        w += n;
+    }
+    *w = L'\0';                       // 列表以双 '\0' 结束
+    GlobalUnlock(h);
 
+    class DropData : public IDataObject {
+    public:
+        explicit DropData(HGLOBAL hd) : hd_(hd) {}
+        STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+            if (riid == IID_IDataObject || riid == IID_IUnknown) {
+                *ppv = static_cast<IDataObject*>(this);
+                AddRef();
+                return S_OK;
+            }
+            *ppv = nullptr;
+            return E_NOINTERFACE;
+        }
+        STDMETHODIMP_(ULONG) AddRef() override { return 1; }
+        STDMETHODIMP_(ULONG) Release() override { return 1; }
+        STDMETHODIMP GetData(FORMATETC* fe, STGMEDIUM* stg) override {
+            if (fe->cfFormat != CF_HDROP || !(fe->tymed & TYMED_HGLOBAL) ||
+                fe->dwAspect != DVASPECT_CONTENT)
+                return DV_E_FORMATETC;
+            stg->tymed = TYMED_HGLOBAL;
+            stg->pUnkForRelease = nullptr;
+            // 交出独立副本：SHDoDragDrop 结束时才会释放，避免源 h 提前被我们 GlobalFree
+            HGLOBAL copy = GlobalAlloc(GMEM_MOVEABLE, ::GlobalSize(hd_));
+            if (!copy) return STG_E_MEDIUMFULL;
+            void* cs = GlobalLock(copy);
+            void* ss = GlobalLock(hd_);
+            if (cs && ss) memcpy(cs, ss, ::GlobalSize(hd_));
+            if (cs) GlobalUnlock(copy);
+            if (ss) GlobalUnlock(hd_);
+            stg->hGlobal = copy;
+            return S_OK;
+        }
+        STDMETHODIMP GetDataHere(FORMATETC*, STGMEDIUM*) override { return E_NOTIMPL; }
+        STDMETHODIMP QueryGetData(FORMATETC* fe) override {
+            if (fe->cfFormat == CF_HDROP && (fe->tymed & TYMED_HGLOBAL) &&
+                fe->dwAspect == DVASPECT_CONTENT)
+                return S_OK;
+            return DV_E_FORMATETC;
+        }
+        STDMETHODIMP GetCanonicalFormatEtc(FORMATETC*, FORMATETC* out) override {
+            if (out) { *out = FORMATETC{}; out->ptd = nullptr; }
+            return DATA_S_SAMEFORMATETC;   // 只有一种等价表示
+        }
+        STDMETHODIMP SetData(FORMATETC*, STGMEDIUM*, BOOL) override { return E_NOTIMPL; }
+        STDMETHODIMP EnumFormatEtc(DWORD dwDirection, IEnumFORMATETC** ppEnum) override {
+            if (!ppEnum) return E_POINTER;
+            if (dwDirection != DATADIR_GET) { *ppEnum = nullptr; return E_NOTIMPL; }
+            // 用系统标准枚举器真正枚举出 CF_HDROP。之前返回 E_NOTIMPL：有些目标会
+            // “先枚举格式再决定收不收”，枚举失败就当成“没有可用格式”直接拒绝，
+            // 表现为拖拽完全没有反应。这里补上，让 QueryGetData/EnumFormatEtc 两条
+            // 探测路径都能看到 CF_HDROP。
+            FORMATETC fe{ CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+            return SHCreateStdEnumFmtEtc(1, &fe, ppEnum);
+        }
+        STDMETHODIMP DAdvise(FORMATETC*, DWORD, IAdviseSink*, DWORD*) override { return E_NOTIMPL; }
+        STDMETHODIMP DUnadvise(DWORD) override { return E_NOTIMPL; }
+        STDMETHODIMP EnumDAdvise(IEnumSTATDATA**) override { return E_NOTIMPL; }
+    private:
+        HGLOBAL hd_;
+    };
+
+    DropData data(h);
     DWORD effect = DROPEFFECT_NONE;
-    // 原版 grfEffects=7：COPY|MOVE|LINK 全交给目标决定（0x493929）
-    hr = SHDoDragDrop(owner, data.Get(), nullptr,
+    // grfEffects=7：COPY|MOVE|LINK 全交给目标决定。默认无修饰键为复制，
+    // 按住 Shift=移动，Ctrl+Shift=创建快捷方式（由 Explorer 自己按修饰键解释）。
+    HRESULT hr = SHDoDragDrop(owner, &data, nullptr,
                       DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK, &effect);
     WriteAppLog((L"FILEOP drag out: hr=" + std::to_wstring(static_cast<unsigned long>(hr)) +
-                 L", effect=" + std::to_wstring(effect)).c_str());
+                 L", effect=" + std::to_wstring(effect) +
+                 L", items=" + std::to_wstring(paths.size())).c_str());
+    GlobalFree(h);
     if (FAILED(hr)) return DROPEFFECT_NONE;
     return effect;
 }

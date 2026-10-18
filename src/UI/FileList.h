@@ -80,4 +80,5 @@ private:
     POINT dragStartPt_{};
     int dragStartItem_ = -1;
     bool dragPending_ = false;
+    bool dragMoveLogged_ = false;   // 诊断：每次按下后只记一条“首条带键移动”日志
 };

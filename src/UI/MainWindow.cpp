@@ -2385,6 +2385,10 @@ void MainWindow::CommitRename(HWND list, int item, const std::wstring& newName)
 void MainWindow::StartDrag(HWND list, int item)
 {
     int pi = PaneOfList(list);
+    WriteAppLog((L"DBG StartDrag hwnd=" + std::to_wstring((size_t)(uintptr_t)list) +
+                 L" item=" + std::to_wstring(item) +
+                 L" pane=" + std::to_wstring(pi) +
+                 L" panes=" + std::to_wstring(panes_.size())).c_str());
     if (pi < 0 || item < 0) return;
     std::vector<std::wstring> paths;
     // 按下的行已在选区里 -> 整组拖走；否则只拖这一行
@@ -2399,10 +2403,12 @@ void MainWindow::StartDrag(HWND list, int item)
         std::wstring p = PaneItemPath((size_t)pi, item);
         if (!p.empty()) paths.push_back(std::move(p));
     }
+    WriteAppLog((L"DBG StartDrag collected paths=" + std::to_wstring(paths.size())).c_str());
     if (paths.empty()) return;
     if ((size_t)pi != activePane_) PostSelectPane((size_t)pi);
     PostMessageW(hwnd_, WM_APP_FILE_DRAG, 0,
                  reinterpret_cast<LPARAM>(new std::vector<std::wstring>(std::move(paths))));
+    WriteAppLog(L"DBG StartDrag posted WM_APP_FILE_DRAG");
 }
 
 void MainWindow::ListKeyCommand(HWND list, int cmd)
@@ -4888,6 +4894,8 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_APP_FILE_DRAG: {     // 列表条目拖出（延后：拖拽循环自己泵消息）
         auto* paths = reinterpret_cast<std::vector<std::wstring>*>(lp);
+        WriteAppLog((L"DBG WM_APP_FILE_DRAG paths=" +
+                     std::to_wstring(paths ? paths->size() : 0)).c_str());
         if (paths) {
             StartDragOut(std::move(*paths));
             delete paths;
