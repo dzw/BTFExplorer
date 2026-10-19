@@ -205,8 +205,51 @@ static int PaneUnder(SplitLayout& L, int node)
     return a >= 0 ? a : PaneUnder(L, nd.second);
 }
 
-static constexpr int WM_APP_PAGELOADED = WM_APP + 1;
-static constexpr UINT WM_APP_WIN_E = WM_APP + 2;   // Win+E 被拦截后激活本窗口
+// “我的电脑”的 shell 命名空间路径。新建分页默认开在这里（Q-Dir/资源管理器
+// 的“此电脑”语义）：SHParseDisplayName 能解析这种 CLSID 形式，Shell 视图
+// 可以直接把它当成目录导航，列出所有盘符。
+static constexpr const wchar_t* kThisPcPath =
+    L"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
+
+// 是否 shell 虚拟文件夹（“我的电脑”“网络”“控制面板”等）：这类目录没有
+// 文件系统路径，FindFirstFileEx 枚举不了，只有 Shell 视图能显示。
+static bool IsVirtualShellPath(const std::wstring& path)
+{
+    if (path.size() >= 2 && path[0] == L':' && path[1] == L':') return true;
+    // 其它非文件系统形式（如 “shell:...”）：存在但 GetFileAttributes 失败
+    DWORD attr = GetFileAttributesW(path.c_str());
+    return attr == INVALID_FILE_ATTRIBUTES;
+}
+
+// 地址栏显示文本：虚拟文件夹（“我的电脑”等）显示 shell 友好名，
+// 而不是 CLSID 原文（::{20D04FE0-...} 这种没法看）。
+static std::wstring AddressDisplayText(const std::wstring& path)
+{
+    if (path.empty()) return path;
+    if (!IsVirtualShellPath(path)) return path;
+    UniquePIDL pidl = shell::PIDLFromPath(path);
+    if (!pidl) return path;
+    std::wstring name = shell::DisplayNameFromPIDL(
+        static_cast<PCIDLIST_ABSOLUTE>(pidl.get()));
+    return name.empty() ? path : name;
+}
+
+// 地址栏输入的逆映射：用户手输“此电脑/我的电脑”这类友好名时转成
+// shell 命名空间路径，否则 SHParseDisplayName 解析不到、回车无反应。
+static std::wstring AddressInputToPath(const std::wstring& text)
+{
+    std::wstring t = text;
+    while (!t.empty() && (t.back() == L' ' || t.back() == L'\\')) t.pop_back();
+    if (t.empty()) return text;
+    if (_wcsicmp(t.c_str(), L"此电脑") == 0 ||
+        _wcsicmp(t.c_str(), L"我的电脑") == 0 ||
+        _wcsicmp(t.c_str(), L"This PC") == 0 ||
+        _wcsicmp(t.c_str(), L"My Computer") == 0)
+        return kThisPcPath;
+    return text;
+}
+
+static constexpr int WM_APP_PAGELOADED = WM_APP + 1;static constexpr UINT WM_APP_WIN_E = WM_APP + 2;   // Win+E 被拦截后激活本窗口
 static constexpr int WM_APP_CLOSE_TAB = WM_APP + 3; // 中键点击分页 -> 延后到主窗口关闭
 static constexpr int WM_APP_MOVE_TAB  = WM_APP + 4; // 拖拽分页 -> 延后到主窗口移动
 static constexpr int WM_APP_TREE_NEWTAB = WM_APP + 7;
@@ -561,6 +604,8 @@ void MainWindow::BuildChildren()
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"→", IDC_FORWARD, &btnFwd_);
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"↑", IDC_UP, &btnUp_);
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"刷新", IDC_REFRESH, &btnRefresh_);
+    // “☰”始终在工具栏可见：显示/隐藏左侧目录树+收藏侧栏（侧栏本身被隐藏后也要能点回来）
+    mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"☰", IDC_SIDEBAR_TOGGLE, &btnSidebarToggle_);
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"菜单过滤词", IDC_MENU_FILTERS, &btnMenuFilters_);
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"设置", IDC_SETTINGS, &btnSettings_);
     mk(WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, WC_EDITW, L"", IDC_ADDRESS, &address_);
@@ -648,6 +693,8 @@ void MainWindow::CreateSidePanel()
         PostMessageW(hwnd_, WM_APP_TREE_NAV, 0,
                      reinterpret_cast<LPARAM>(new std::wstring(path)));
     });
+    // “定”= 把目录树同步到当前激活分页（定位回当前所在目录）。原先是侧栏里的按钮，
+    // 现在放进侧栏 Tab 头（始终可见），不再占用列表区。
     btnTreeSync_ = CreateWindowExW(0, WC_BUTTONW, L"定",//定位
         WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
         0, 0, 0, 0, tab_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TREE_SYNC)), hInst, nullptr);
@@ -665,13 +712,30 @@ void MainWindow::CreateSidePanel()
 
 void MainWindow::SwitchSideTab(int index)
 {
-    // 显示/隐藏 tab 页内容（树、收藏列表都是 tab_ 的子窗口）
+    // 显示/隐藏 tab 页内容（树、收藏列表都是 tab_ 的子窗口）；
+    // “定”按钮（同步目录树到当前分页）常驻 Tab 头，两种页都可见。
     ShowWindow(directoryTree_.Handle(), index == 0 ? SW_SHOW : SW_HIDE);
-    ShowWindow(btnTreeSync_, index == 0 ? SW_SHOW : SW_HIDE);
+    ShowWindow(btnTreeSync_, SW_SHOW);
     ShowWindow(favList_, index == 1 ? SW_SHOW : SW_HIDE);
     SendMessageW(tab_, TCM_SETCURSEL, index, 0);
     if (index == 1) LoadFavorites();
     Layout();
+}
+
+// 工具栏“☰”：显示/隐藏左侧目录树+收藏侧栏。
+// 用分隔条的 SetSinglePaneMode：折叠左窗格（侧栏）而保留 m_xySplitterPos，
+// 下次展开时窗格宽度原样回来，不会跳回默认 220。
+void MainWindow::ToggleSidebar()
+{
+    if (splitLayout_ == nullptr || splitLayout_->tree == nullptr) return;
+    PaneSplitter* treeBar = splitLayout_->tree.get();
+    if (!treeBar->m_hWnd) return;
+
+    sidebarVisible_ = !sidebarVisible_;
+    treeBar->SetSinglePaneMode(sidebarVisible_ ? SPLIT_PANE_NONE : SPLIT_PANE_RIGHT);
+    Layout();            // 重排窗格 + 统一重绘（地址栏/工具栏也要跟着让位）
+    SaveSession();       // 记住侧栏开合状态
+    WriteAppLog((L"TOGGLE_SIDEBAR visible=" + std::to_wstring(sidebarVisible_ ? 1 : 0)).c_str());
 }
 
 void MainWindow::SyncTreeToCurrentTab(bool showErrors)
@@ -706,6 +770,60 @@ void MainWindow::SyncPagerSizeCombo()
     SendMessageW(pagerSize_, CB_SETCURSEL, PageSizeToIndex((int)pageSize_), 0);
 }
 
+// 分页 Tab 图标：Q-Dir 同款——把 shell 系统小图标表挂到每个窗格的分页栏上，
+// 每个分页头显示其所在目录的图标（盘符/普通文件夹/特殊文件夹都是系统图标）。
+void MainWindow::AttachTabImageList(HWND tab)
+{
+    if (tab == nullptr) return;
+    if (tabHiml_ == nullptr) {
+        // 取系统小图标表：SHGFI_SYSICONINDEX 时句柄是 SHGetFileInfoW 的【返回值】。
+        // 注意不能传 pshfi=nullptr/cbFileInfo=0——本机实测那样会返回 0（图标表
+        // 拿不到，分页头就一个图标都不显示），必须传结构体。
+        SHFILEINFOW sfi{};
+        DWORD_PTR raw = SHGetFileInfoW(L"C:\\", FILE_ATTRIBUTE_DIRECTORY, &sfi,
+                                       sizeof(sfi),
+                                       SHGFI_SYSICONINDEX | SHGFI_SMALLICON |
+                                       SHGFI_USEFILEATTRIBUTES);
+        tabHiml_ = reinterpret_cast<HIMAGELIST>(raw);   // 系统表：不要 ImageList_Destroy
+    }
+    if (tabHiml_)
+        SendMessageW(tab, TCM_SETIMAGELIST, 0 /*wParam 0=正常(小)图标表*/,
+                     reinterpret_cast<LPARAM>(tabHiml_));
+}
+
+// 目录 -> 系统小图标表下标。带 map 缓存：SHGetFileInfoW 会走 shell/注册表，
+// 每次导航/重绘都查一遍开销不小（同列表图标缓存的教训）。
+// 取不到（空目录/无效路径）返回 I_IMAGENONE：-1 是 I_IMAGECALLBACK，
+// 塞进 TCITEM 会让 tab 控件发 TCN_GETIMAGE 通知回来问我们，形成无谓往返。
+int MainWindow::TabIconIdx(const std::wstring& dir)
+{
+    if (dir.empty() || tabHiml_ == nullptr) return I_IMAGENONE;
+    auto it = tabIconCache_.find(dir);
+    if (it != tabIconCache_.end()) return it->second;
+    int idx = -1;
+    SHFILEINFOW sfi{};
+    // 不加 USEFILEATTRIBUTES：让它按真实路径问 shell，盘符/桌面/下载等
+    // 特殊文件夹才有各自的图标（加了就一律是通用文件夹图标）。
+    if (SHGetFileInfoW(dir.c_str(), FILE_ATTRIBUTE_DIRECTORY, &sfi, sizeof(sfi),
+                       SHGFI_SYSICONINDEX | SHGFI_SMALLICON))
+        idx = sfi.iIcon;
+    // 虚拟文件夹（“我的电脑”等）：CLSID 形式 SHGetFileInfoW 认不出来，
+    // 走 PIDL 的 SHGetFileInfo 重载拿图标下标。
+    if (idx < 0 && IsVirtualShellPath(dir)) {
+        UniquePIDL pidl = shell::PIDLFromPath(dir);
+        if (pidl) {
+            SHFILEINFOW pfi{};
+            if (SHGetFileInfoW(reinterpret_cast<LPCWSTR>(pidl.get()), 0, &pfi,
+                               sizeof(pfi), SHGFI_PIDL | SHGFI_SYSICONINDEX |
+                               SHGFI_SMALLICON))
+                idx = pfi.iIcon;
+        }
+    }
+    if (idx < 0) idx = I_IMAGENONE;
+    tabIconCache_[dir] = idx;
+    return idx;
+}
+
 void MainWindow::CreatePane(Pane& p)
 {
     HINSTANCE hInst = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd_, GWLP_HINSTANCE));
@@ -724,6 +842,7 @@ void MainWindow::CreatePane(Pane& p)
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | TCS_TABS,
         0, 0, 0, 0, host, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RIGHTTAB + p.tag)), hInst, nullptr);
     if (uiFont_) SendMessageW(p.tab, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+    AttachTabImageList(p.tab);   // 挂系统小图标表：每个分页头显示所在目录的图标（Q-Dir 同款）
     // 子类化：支持分页拖拽到其它窗格
     SetWindowLongPtrW(p.tab, GWLP_USERDATA, GetWindowLongPtrW(p.tab, GWLP_WNDPROC));
     SetWindowLongPtrW(p.tab, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&PaneTabProc));
@@ -882,7 +1001,7 @@ void MainWindow::AddRightTab(bool navigateToDefault, size_t paneIdx)
     activeTab_ = idx;
     Layout(); // 新 tab 加入后立即重排（否则控件停在初始位置造成重叠）
     if (navigateToDefault)
-        Navigate(L"C:\\");
+        Navigate(kThisPcPath);   // 新建分页默认打开“我的电脑”（列出各盘符）
     else
         SelectRightTab(idx);
 
@@ -1038,6 +1157,7 @@ void MainWindow::SaveSession()
     putLine(L"row=" + std::to_wstring(rowSplitPermille_)); // 上下两排高度比例
     putLine(L"sel=" + std::to_wstring(selRank));
     putLine(L"sideWidth=" + std::to_wstring(sideWidth_));
+    putLine(L"sidebar=" + std::to_wstring(sidebarVisible_ ? 1 : 0));
     // 设置界面里的开关也要记住，重启后继续生效
     putLine(L"grid=" + std::to_wstring(showGridLines_ ? 1 : 0));
     putLine(L"pagination=" + std::to_wstring(paginationEnabled_ ? 1 : 0));
@@ -1153,6 +1273,7 @@ bool MainWindow::RestoreSession()
     int rowSplit = 500;             // 上下两排高度比例（千分比）
     int twoVert = 0;                // 2 窗格形态：0=左右 1=上下
     int savedSideWidth = sideWidth_, windowMaximized = 0;
+    int savedSidebarVisible = 1;
     RECT savedWindowRect{};
     bool hasSavedWindowRect = false;
     std::vector<int> widths;
@@ -1187,6 +1308,10 @@ bool MainWindow::RestoreSession()
             if (w.rfind(L"sel=", 0) == 0) { swscanf_s(w.c_str() + 4, L"%d", &sel); continue; }
             if (w.rfind(L"sideWidth=", 0) == 0) {
                 swscanf_s(w.c_str() + 10, L"%d", &savedSideWidth);
+                continue;
+            }
+            if (w.rfind(L"sidebar=", 0) == 0) {
+                swscanf_s(w.c_str() + 8, L"%d", &savedSidebarVisible);
                 continue;
             }
             if (w.rfind(L"window=", 0) == 0) {
@@ -1327,6 +1452,8 @@ bool MainWindow::RestoreSession()
     // 宽度 W 来算 W-260）去夹，才能精确还原。
     sideWidth_ = (savedSideWidth < 150) ? 150 : savedSideWidth;
     pendingSideWidth_ = sideWidth_;   // 等窗口恢复成会话里的尺寸后再按像素精确落位
+    sidebarVisible_ = (savedSidebarVisible != 0);
+    pendingSidebarCollapsed_ = !sidebarVisible_;  // 折叠态留给首次 Layout 里的 RebuildSplitters 应用
 
     if (!ok) {
         WriteAppLog(L"RESTORE no tabs in session; using default layout (no window restore)");
@@ -1372,8 +1499,9 @@ bool MainWindow::RestoreSession()
         if (name.empty()) name = L"新建";
         if (t.locked) name = L"[锁] " + name;
         TCITEMW ti{};
-        ti.mask = TCIF_TEXT;
+        ti.mask = TCIF_TEXT | TCIF_IMAGE;
         ti.pszText = const_cast<LPWSTR>(name.c_str());
+        ti.iImage = TabIconIdx(t.dir);   // 恢复会话的分页头带所在目录图标
         SendMessageW(panes_[pi].tab, TCM_INSERTITEMW, panes_[pi].tabs.size() - 1, reinterpret_cast<LPARAM>(&ti));
     }
 
@@ -1522,12 +1650,13 @@ void MainWindow::MoveTabToPane(size_t tabIndex, size_t paneIdx)
     to.tabs.push_back(tabIndex);
     size_t inPane = to.tabs.size() - 1;
     TCITEMW ti{};
-    ti.mask = TCIF_TEXT;
+    ti.mask = TCIF_TEXT | TCIF_IMAGE;
     std::wstring name = tabs_[tabIndex].dir;
     size_t s = name.find_last_of(L'\\');
     if (s != std::wstring::npos && s + 1 < name.size()) name = name.substr(s + 1);
     if (name.empty()) name = L"新建";
     ti.pszText = const_cast<LPWSTR>(name.c_str());
+    ti.iImage = TabIconIdx(tabs_[tabIndex].dir);   // 跨窗格拖分页：目标窗格的分页头带目录图标
     SendMessageW(to.tab, TCM_INSERTITEMW, inPane, reinterpret_cast<LPARAM>(&ti));
     to.active = inPane;
 
@@ -1591,9 +1720,10 @@ void MainWindow::ReorderTabInPane(size_t paneIdx, int toSlot)
     // tab 控件同步：删旧头、在目标位插新头
     SendMessageW(p.tab, TCM_DELETEITEM, fromSlot, 0);
     TCITEMW ti{};
-    ti.mask = TCIF_TEXT;
+    ti.mask = TCIF_TEXT | TCIF_IMAGE;
     std::wstring name = PaneTabLabel(paneIdx, insertAt);
     ti.pszText = const_cast<LPWSTR>(name.c_str());
+    ti.iImage = TabIconIdx(tabs_[tabIndex].dir);   // 重排：保持该分页所在目录的图标
     SendMessageW(p.tab, TCM_INSERTITEMW, insertAt, reinterpret_cast<LPARAM>(&ti));
 
     // 被拖的分页始终是当前显示的那一页：鼠标走到哪一页头就停在哪
@@ -1602,7 +1732,7 @@ void MainWindow::ReorderTabInPane(size_t paneIdx, int toSlot)
     tabDragIndex_ = insertAt;   // 下次 WM_MOUSEMOVE 以新位置为基准
     if (paneIdx == activePane_) {
         activeTab_ = tabIndex;
-        SetWindowTextW(address_, tabs_[tabIndex].dir.c_str());
+        SetWindowTextW(address_, AddressDisplayText(tabs_[tabIndex].dir).c_str());
         RefreshPaneList(paneIdx);
         SyncShellView(paneIdx);
     }
@@ -1617,24 +1747,33 @@ void MainWindow::UpdateRightTabLabels()
         Pane& p = panes_[pi];
         for (size_t k = 0; k < p.tabs.size(); ++k) {
             std::wstring name = tabs_[p.tabs[k]].dir;
-            size_t s = name.find_last_of(L'\\');
-            if (s != std::wstring::npos && s + 1 < name.size()) name = name.substr(s + 1);
-            else if (name.size() >= 2 && name[1] == L':') name = name.substr(0, 2);
+            if (IsVirtualShellPath(name)) {
+                // 虚拟文件夹（“我的电脑”等）：标题用 shell 友好名，
+                // CLSID 原文没法看
+                name = AddressDisplayText(name);
+            } else {
+                size_t s = name.find_last_of(L'\\');
+                if (s != std::wstring::npos && s + 1 < name.size()) name = name.substr(s + 1);
+                else if (name.size() >= 2 && name[1] == L':') name = name.substr(0, 2);
+            }
             if (name.empty()) name = L"新建";
             if (tabs_[p.tabs[k]].locked) name = L"[锁] " + name;
             // 文本没变就不重设：TCM_SETITEMW 会让分页头失效重绘，
-            // 一次导航会把所有窗格的所有分页头全刷一遍（闪）
+            // 一次导航会把所有窗格的所有分页头全刷一遍（闪）。
+            // 图标也要比：同名不同目录的两个分页（都叫 Data）文本一样但图标不同。
+            int wantImg = TabIconIdx(tabs_[p.tabs[k]].dir);
             wchar_t cur[512]{};
             TCITEMW curItem{};
-            curItem.mask = TCIF_TEXT;
+            curItem.mask = TCIF_TEXT | TCIF_IMAGE;
             curItem.pszText = cur;
             curItem.cchTextMax = 512;
             if (SendMessageW(p.tab, TCM_GETITEMW, k, reinterpret_cast<LPARAM>(&curItem)) &&
-                wcscmp(cur, name.c_str()) == 0)
+                wcscmp(cur, name.c_str()) == 0 && curItem.iImage == wantImg)
                 continue;
             TCITEMW ti{};
-            ti.mask = TCIF_TEXT;
+            ti.mask = TCIF_TEXT | TCIF_IMAGE;
             ti.pszText = const_cast<LPWSTR>(name.c_str());
+            ti.iImage = wantImg;
             SendMessageW(p.tab, TCM_SETITEMW, k, reinterpret_cast<LPARAM>(&ti));
         }
     }
@@ -1906,16 +2045,22 @@ struct NavMuteGuard {
 
 void MainWindow::Navigate(const std::wstring& rawPath, bool addHistory)
 {
-    std::wstring path = NormalizePath(rawPath);
+    std::wstring path = NormalizePath(AddressInputToPath(rawPath));
     TabState& t = CurTab();
     const bool dirChanged = (t.dir != path);
     t.dir = path;
     t.curPage = 0;
+    // 虚拟 shell 文件夹（“我的电脑”“网络”等）没有文件系统路径，
+    // 自绘列表用 FindFirstFileEx 枚举不出来——自动切到 Shell 视图显示。
+    if (t.listMode != 1 && IsVirtualShellPath(path)) {
+        t.listMode = 1;
+        WriteAppLog((L"NAV virtual folder -> switch to shell view: " + path).c_str());
+    }
     // 换目录不清空列表：保留旧内容显示并标记过期（Q-Dir/资源管理器做法），
     // 后台加载完成后 OnPageLoaded 整体换入——清空会闪一下空白。
     t.shownPage = SIZE_MAX;   // 显示页号作废
     t.pageStale = true;
-    SetWindowTextW(address_, path.c_str());
+    SetWindowTextW(address_, AddressDisplayText(path).c_str());
 
     if (addHistory) {
         if (!t.history.empty() && t.histPos >= 0 && t.history[t.histPos] == path) {
@@ -1927,8 +2072,18 @@ void MainWindow::Navigate(const std::wstring& rawPath, bool addHistory)
         }
     }
 
-    t.pages->OpenDirectory(path, EffectivePageSize());
-    ListView_SetItemCountEx(CurList(), 0, 0);
+    // 虚拟 shell 文件夹（“我的电脑”等）没有文件系统路径，后台枚举只会得到
+    // 空列表；显示完全交给 Shell 视图，跳过 OpenDirectory 以免白跑一趟。
+    if (!IsVirtualShellPath(path)) {
+        t.pages->OpenDirectory(path, EffectivePageSize());
+        ListView_SetItemCountEx(CurList(), 0, 0);
+    } else {
+        t.pages->Shutdown();          // 停掉旧目录的工作线程，清空缓存
+        t.pageItems.clear();
+        t.shownPage = t.curPage;      // 视为“已显示”：不让 OnPageLoaded 反复重试
+        t.pageStale = false;
+        ListView_SetItemCountEx(CurList(), 0, 0);
+    }
     UpdateStatusBar();
     UpdatePaginationBar();
     UpdateRightTabLabels();
@@ -4124,6 +4279,12 @@ void MainWindow::RebuildSplitters(int totalWidth)
         // （上面把这些窗口摘回 hwnd_ 是为了能安全销毁旧分隔条，这里要挂回去）
         SetParent(tab_, L.tree->m_hWnd);
         L.tree->SetPanesNoUpdate(tab_, right);
+        // 侧栏折叠态在重建分隔条后重新落实：会话恢复（pendingSidebarCollapsed_）和
+        // 运行时折叠后改布局触发重建都要收起左窗格。SetSinglePaneMode 保留
+        // m_xySplitterPos，展开后宽度原样回来，不会跳回默认 220。
+        if (!sidebarVisible_)
+            L.tree->SetSinglePaneMode(SPLIT_PANE_RIGHT);
+        pendingSidebarCollapsed_ = false;
         int permille = totalWidth > 0
                      ? static_cast<int>(static_cast<long long>(sideWidth_) * 1000 / totalWidth) : 220;
         if (permille < 50) permille = 50;    // 侧栏再窄也留一条
@@ -4233,11 +4394,11 @@ bool MainWindow::LayoutSidebarInner()
         moved = true;
         SetWindowPos(h, nullptr, x, yy, w, hh, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
     };
-    place(btnTreeSync_, sideW - 42, treeTop + 2, 36, 20);
+    // “定”= 同步目录树到当前分页：压在 Tab 头最右、目录树之上，两种页都可见。
+    place(btnTreeSync_, sideW - 40, 3, 34, tabH - 4);
     place(directoryTree_.Handle(), 4, treeTop, sideW - 8, innerH);
     place(favList_, 4, tabH + 6, sideW - 8, sideContentH);
-    // “定”要压在目录树上面：与 tab_ 下的其它控件是兄弟窗口，被盖住时点击会落到树上
-    SetWindowPos(btnTreeSync_, HWND_TOP, sideW - 42, treeTop + 2, 36, 20, SWP_NOACTIVATE);
+    SetWindowPos(btnTreeSync_, HWND_TOP, sideW - 40, 3, 34, tabH - 4, SWP_NOACTIVATE);
     return moved;
 }
 
@@ -4270,11 +4431,13 @@ void MainWindow::Layout()
     place(btnFwd_,   48, y + 4, 40, 26);
     place(btnUp_,    92, y + 4, 40, 26);
     place(btnRefresh_,136, y + 4, 50, 26);
+    place(btnSidebarToggle_, 190, y + 4, 34, 26);   // “☰”显示/隐藏侧栏
     int filterButtonX = W - 190;              // 菜单过滤词按钮左缘（要给右侧“设置”腾位）
     if (filterButtonX < 274) filterButtonX = 274;
     int settingsX = W - 82;                  // “设置”按钮固定贴右边
     if (settingsX < filterButtonX + 112) settingsX = filterButtonX + 112;
-    place(address_, 194, y + 6, filterButtonX - 198, 24);
+    // 地址栏从“☰”按钮右侧（190+34=224）之后开始，留 6px 间隙
+    place(address_, 230, y + 6, filterButtonX - 234, 24);
     place(btnMenuFilters_, filterButtonX, y + 4, 106, 26);
     place(btnSettings_, settingsX, y + 4, 76, 26);
     y += 36;
@@ -4667,6 +4830,9 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             break;
         case IDC_TREE_SYNC:
             SyncTreeToCurrentTab();
+            return 0;
+        case IDC_SIDEBAR_TOGGLE:
+            ToggleSidebar();
             return 0;
         case IDC_TM_CLOSE:  CloseRightTab(menuTab_); return 0;
         case IDC_TM_OTHERS: CloseOtherTabs(menuTab_); return 0;

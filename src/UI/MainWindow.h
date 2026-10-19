@@ -4,6 +4,7 @@
 #include <string>
 #include <memory>
 #include <vector>
+#include <map>
 #include "../Pagination/PageManager.h"
 #include "../FileModel/FileEntry.h"
 #include "../Util/DirWatcher.h"
@@ -31,7 +32,8 @@ enum {
     IDC_LAYOUT1 = 1020, IDC_LAYOUT2 = 1021, IDC_LAYOUT3 = 1022, IDC_LAYOUT4 = 1023,
     IDC_TRI_PINTOP = 1024, IDC_TRI_PINDOWN = 1025,
     IDC_MENU_FILTERS = 1026,
-    IDC_TREE_SYNC = 1027,
+    IDC_TREE_SYNC = 1027,    // 侧栏 Tab 头上的“定位”：把目录树同步到当前分页
+    IDC_SIDEBAR_TOGGLE = 1052,   // 顶部工具栏“☰”按钮：显示/隐藏左侧目录树+收藏侧栏
     IDC_TREEHOST = 1029,   // 目录树宿主容器（Q-Dir 同款：Dialog 包住 NamespaceTreeControl）
     IDC_SETTINGS = 1028,   // 工具栏“设置”按钮（对话框控件 ID 见 SettingsDialog.cpp）
     // 分页标题右键菜单：关闭 / 关闭其他 / 关闭右边 / 锁定
@@ -147,11 +149,15 @@ private:
     void UpdatePaneRects();                 // 按窗格窗口实际矩形刷新 paneRects_（分页拖拽命中用）
     void CreateSidePanel();          // 左侧 Tab 容器：目录树 / 收藏
     void SwitchSideTab(int index);   // 切换 tab 显示
+    void ToggleSidebar();            // 工具栏“☰”：显示/隐藏左侧目录树+收藏侧栏
     void SyncTreeToCurrentTab(bool showErrors = true);
     // 列表导航后的树同步去抖（Q-Dir 同款）：连续导航只同步最后一次
     void ScheduleTreeSync();   // 重置 100ms 定时器
     void OnTreeSyncTimer();    // 定时器到期：真正执行 SyncTreeToCurrentTab
     void CreatePane(Pane& p);        // 创建一个窗格（tab 容器 + 虚拟列表）
+    // 分页 Tab 上的目录图标（Q-Dir 同款：系统小图标表 + TCIF_IMAGE）
+    void AttachTabImageList(HWND tab);   // 把系统小图标表挂到窗格分页栏
+    int  TabIconIdx(const std::wstring& dir);  // 目录 -> 系统图标表下标（带缓存）
     void Navigate(const std::wstring& path, bool addHistory = true);
     void NavigateFromSidebar(const std::wstring& path); // 侧栏跳转：分页被锁定时另开新分页
     void OpenDirInNewTab(const std::wstring& path);     // 目录树中键：总是新开分页打开
@@ -237,15 +243,20 @@ private:
     TrayIcon trayIcon_;
     DirectoryTree directoryTree_;
     HWND tab_ = nullptr, favList_ = nullptr, btnTreeSync_ = nullptr; // 左侧 Tab / 收藏 / 树同步
+    HWND btnSidebarToggle_ = nullptr;   // 顶部工具栏“☰”：显示/隐藏左侧侧栏
     std::vector<std::wstring> favorites_;      // 收藏的目录路径
     HWND status_ = nullptr, pagerPrev_ = nullptr, pagerNext_ = nullptr;
     HWND pagerFirst_ = nullptr, pagerLast_ = nullptr, pagerLabel_ = nullptr, pagerSize_ = nullptr;
     HWND btnBack_ = nullptr, btnFwd_ = nullptr, btnUp_ = nullptr, btnRefresh_ = nullptr;
     HWND btnMenuFilters_ = nullptr, btnSettings_ = nullptr;
     HFONT uiFont_ = nullptr;
+    HIMAGELIST tabHiml_ = nullptr;           // 系统小图标表（SHGFI_SYSICONINDEX，分页 Tab 用）
+    std::map<std::wstring, int> tabIconCache_;  // 目录 -> 图标表下标（避免每次导航都打进 shell）
 
     // 布局 / 交互
     int sideWidth_ = 220;          // 左侧面板宽度（分隔条拖动的落点，落盘用）
+    bool sidebarVisible_ = true;   // 左侧目录树+收藏侧栏是否展开（工具栏“☰”切换）
+    bool pendingSidebarCollapsed_ = false;  // 会话恢复时的折叠态，等首次 Layout 重建分隔条后再应用
     int pendingSideWidth_ = 0;     // 待按像素生效的侧栏宽度（会话恢复值/重建后的旧值）：
                                    // 分隔条内部按千分比存位置，等到尺寸定了再精确落一次
     int startupShowCmd_ = SW_SHOW;
