@@ -294,6 +294,7 @@ static constexpr int WM_APP_SHELL_NAV = WM_APP + 17;       // shell 视图内激
 static constexpr int WM_APP_SHELL_CTXMENU = WM_APP + 20;   // shell 视图内右键 -> 延后弹本程序的菜单
 static constexpr int WM_APP_SHELL_RENAME  = WM_APP + 21;   // shell 视图内 F2 -> 延后就地改名
 static constexpr int WM_APP_FILE_DRAG = WM_APP + 22;       // 列表条目拖出 -> 延后进拖拽循环
+static constexpr int WM_APP_STATUS_REFRESH = WM_APP + 31;  // 延后刷新状态栏（shell 视图选中/条目变化）
 static constexpr int WM_APP_LIST_CMD  = WM_APP + 23;       // 列表键盘命令 -> 等切窗完成后执行
 static constexpr int WM_APP_SHELL_ACTIVATE = WM_APP + 24;  // 延后同步 shell 视图激活态（UIActivate FOCUS/DEACTIVATE）
 
@@ -604,6 +605,8 @@ void MainWindow::BuildChildren()
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"→", IDC_FORWARD, &btnFwd_);
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"↑", IDC_UP, &btnUp_);
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"刷新", IDC_REFRESH, &btnRefresh_);
+    // “🏠”：跳转到“我的电脑”（列出各盘符），与资源管理器的“此电脑”入口对应
+    mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"🏠", IDC_HOME, &btnHome_);
     // “☰”始终在工具栏可见：显示/隐藏左侧目录树+收藏侧栏（侧栏本身被隐藏后也要能点回来）
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"☰", IDC_SIDEBAR_TOGGLE, &btnSidebarToggle_);
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"菜单过滤词", IDC_MENU_FILTERS, &btnMenuFilters_);
@@ -2255,19 +2258,126 @@ void MainWindow::OnExternalDirChanged(const std::wstring& dir)
     // 树节点由命名空间树控件自己刷新（shell 变化通知），无需干预
 }
 
+// 状态栏分区：0=选中/总数信息（左，可伸缩） 1=磁盘可用空间（右，固定宽）
+// 资源管理器同款布局：左边报“已选择 N 个项目  X MB”，右边报“可用空间 X，共 Y”。
+static constexpr int kStatusDiskPartW = 240;
+
+void MainWindow::UpdateStatusBarParts(int clientW)
+{
+    if (status_ == nullptr) return;
+    if (clientW <= 0) {
+        RECT rc{}; GetClientRect(hwnd_, &rc);
+        clientW = rc.right;
+    }
+    // 右分区固定宽度贴右边；窗口太窄时给它一半，别把左分区挤没
+    int diskW = kStatusDiskPartW;
+    if (diskW > clientW / 2) diskW = clientW / 2;
+    int parts[3] = { clientW - diskW, -1, -1 };
+    SendMessageW(status_, SB_SETPARTS, 2, reinterpret_cast<LPARAM>(parts));
+}
+
+// 右分区：当前分页所在盘的可用空间/总容量（资源管理器同款）。
+// 虚拟文件夹（“我的电脑”等）没有盘符，显示为空。
+void MainWindow::UpdateStatusBarDisk()
+{
+    if (status_ == nullptr) return;
+    std::wstring dir = CurTab().dir;
+    // 只有本地盘符路径才有“可用空间”概念（UNC/虚拟文件夹都不显示）
+    bool hasDrive = dir.size() >= 2 && dir[1] == L':' &&
+                    ((dir[0] >= L'A' && dir[0] <= L'Z') ||
+                     (dir[0] >= L'a' && dir[0] <= L'z'));
+    if (!hasDrive) {
+        SendMessageW(status_, SB_SETTEXTW, 1, reinterpret_cast<LPARAM>(L""));
+        return;
+    }
+    wchar_t root[4] = { dir[0], L':', L'\\', 0 };
+    ULARGE_INTEGER freeBytes{}, totalBytes{}, totalFree{};
+    if (!GetDiskFreeSpaceExW(root, &freeBytes, &totalBytes, &totalFree)) {
+        SendMessageW(status_, SB_SETTEXTW, 1, reinterpret_cast<LPARAM>(L""));
+        return;
+    }
+    std::wstring freeStr = filelist::FormatSize(freeBytes.QuadPart);
+    std::wstring totalStr = filelist::FormatSize(totalBytes.QuadPart);
+    std::wstring text = L"可用空间 " + freeStr + L"，共 " + totalStr;
+    SendMessageW(status_, SB_SETTEXTW, 1, reinterpret_cast<LPARAM>(text.c_str()));
+}
+
 void MainWindow::UpdateStatusBar()
 {
-    // shell 视图模式：条目数由视图自己发状态文本（SetStatusTextSB），别覆盖
-    if (activePane_ < panes_.size() && PaneActiveTab(activePane_).listMode == 1) return;
-    wchar_t buf[160];
-    unsigned long long total = CurTab().pages->TotalCount();
-    if (total > 0 && !paginationEnabled_)
-        wsprintfW(buf, L"共 %I64u 项（未分页）", total);
-    else if (total > 0)
-        wsprintfW(buf, L"共 %I64u 项   第 %I64u / %zu 页   每页 %zu 项",
-            total, static_cast<unsigned long long>(CurTab().curPage + 1), CurTab().pages->PageCount(), pageSize_);
-    else
-        wsprintfW(buf, L"正在统计 %s ...", CurTab().dir.c_str());
+    if (status_ == nullptr) return;
+    // 分区按当前窗口宽度重排一次（窗口可缩放）
+    RECT rc{}; GetClientRect(hwnd_, &rc);
+    UpdateStatusBarParts(rc.right);
+    UpdateStatusBarDisk();
+
+    TabState& t = CurTab();
+    HWND list = CurList();
+
+    // shell 视图模式：条目数优先由视图自己发（SetStatusTextSB 会带“选中 N 个对象”），
+    // 但视图不一定每次都发——没收到时就由这里按视图里的条目数兜底，
+    // 否则左分区会一直空着。
+    if (activePane_ < panes_.size() && t.listMode == 1) {
+        std::wstring viewText;
+        if (t.shellView) viewText = t.shellView->LastStatusText();
+        int n = (t.shellView && t.shellView->HasView()) ? t.shellView->ItemCount() : -1;
+        int sel = (t.shellView && t.shellView->HasView()) ? t.shellView->SelectedCount() : -1;
+        wchar_t buf[200];
+        if (sel > 0) {
+            // 选中优先（资源管理器同款）。字节数要从视图取太慢，这里只报项目数。
+            wsprintfW(buf, L"已选择 %d 个项目", sel);
+            SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(buf));
+        } else if (!viewText.empty()) {
+            SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(viewText.c_str()));
+        } else if (n >= 0) {
+            wsprintfW(buf, L"共 %d 个项目", n);
+            SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(buf));
+        } else {
+            // 视图内部列表还没建出来（DefView 异步创建）：先用目录枚举总数兜底，
+            // 别让左分区空着或只剩一个路径。
+            unsigned long long total = t.pages->TotalCount();
+            if (total > 0) {
+                wsprintfW(buf, L"共 %I64u 个项目", total);
+                SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(buf));
+            } else {
+                SendMessageW(status_, SB_SETTEXTW, 0,
+                             reinterpret_cast<LPARAM>(AddressDisplayText(t.dir).c_str()));
+            }
+        }
+        return;
+    }
+
+    // 选中统计（资源管理器：选中时优先报选中项，未选中才报总数）
+    int selCount = list ? ListView_GetSelectedCount(list) : 0;
+    unsigned long long selBytes = 0;
+    int selFolders = 0, selFiles = 0;
+    if (selCount > 0 && list) {
+        int n = ListView_GetItemCount(list);
+        for (int i = 0; i < n; ++i) {
+            if (!(ListView_GetItemState(list, i, LVIS_SELECTED) & LVIS_SELECTED)) continue;
+            if (i < 0 || i >= (int)t.pageItems.size()) continue;
+            const FileEntry& e = t.pageItems[i];
+            if (e.isFolder) ++selFolders;
+            else { ++selFiles; selBytes += e.size; }
+        }
+    }
+
+    wchar_t buf[256];
+    if (selCount > 0) {
+        // “已选择 3 个项目  1.25 MB”；只有文件夹时不报字节数（文件夹大小要递归，太慢）
+        std::wstring sizeStr;
+        if (selFiles > 0) sizeStr = L"  " + filelist::FormatSize(selBytes);
+        wsprintfW(buf, L"已选择 %d 个项目%s", selCount, sizeStr.c_str());
+    } else {
+        unsigned long long total = t.pages->TotalCount();
+        if (total > 0 && !paginationEnabled_)
+            wsprintfW(buf, L"共 %I64u 项（未分页）", total);
+        else if (total > 0)
+            wsprintfW(buf, L"共 %I64u 项   第 %I64u / %zu 页   每页 %zu 项",
+                total, static_cast<unsigned long long>(t.curPage + 1),
+                t.pages->PageCount(), pageSize_);
+        else
+            wsprintfW(buf, L"正在统计 %s ...", t.dir.c_str());
+    }
     SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(buf));
 }
 
@@ -2363,12 +2473,20 @@ bool MainWindow::EnsureTabShellView(size_t paneIdx, TabState& t)
                      reinterpret_cast<LPARAM>(new std::wstring(dir)));
     };
     sv->onStatusText = [this](const std::wstring& text) {
-        // 视图的“N 个对象”等状态文本：只在该窗格是活动窗格时显示
+        // 视图的“N 个对象”等状态文本：只在该窗格是活动窗格时显示。
+        // 文本已由 SetStatusTextSB 存进视图（LastStatusText），这里直接写左分区；
+        // 右侧磁盘信息仍归主窗口管，所以不能整条刷新（会覆盖掉）。
         if (activePane_ < panes_.size() && PaneActiveTab(activePane_).listMode == 1)
             SendMessageW(status_, SB_SETTEXTW, 0,
                          reinterpret_cast<LPARAM>(text.c_str()));
     };
     t.shellView = std::move(sv);
+    // 视图内条目数/选中数变化 -> 刷新状态栏（“已选择 N 个项目 X MB”）。
+    // 必须延后：回调发生在视图的定时器/消息链内，直接刷状态栏虽安全但统一走
+    // 延后更稳妥（避免在 shell 回调栈里重入布局）。
+    t.shellView->onSelectionMaybeChanged = [this]() {
+        PostMessageW(hwnd_, WM_APP_STATUS_REFRESH, 0, 0);
+    };
     // 视图内右键 -> 延后到主循环弹本程序的菜单：shell 的原生菜单没有过滤配置，
     // 也没有“复制名称/全路径”“添加到收藏”“在 Explorer 中打开”这些自定义项，
     // 两种列表实现因此才有同一套右键菜单。
@@ -2916,6 +3034,15 @@ int MainWindow::GetItemIcon(HWND list, int item)
     if (e.iconIndex < 0)
         e.iconIndex = shell::CachedSysIconIndexForEntry(e.path, e.isFolder);
     return e.iconIndex >= 0 ? e.iconIndex : I_IMAGENONE;
+}
+
+// 列表选中变化：刷新状态栏的“已选择 N 个项目 X MB”（资源管理器同款）。
+// 只在这个窗格是活动窗格时才刷新，否则别的窗格的选中会把状态栏抢走。
+void MainWindow::SelectionChanged(HWND list)
+{
+    int pi = PaneOfList(list);
+    if (pi < 0 || (size_t)pi != activePane_) return;
+    UpdateStatusBar();
 }
 
 std::wstring MainWindow::CurrentPagePath(int item) const
@@ -4431,13 +4558,14 @@ void MainWindow::Layout()
     place(btnFwd_,   48, y + 4, 40, 26);
     place(btnUp_,    92, y + 4, 40, 26);
     place(btnRefresh_,136, y + 4, 50, 26);
-    place(btnSidebarToggle_, 190, y + 4, 34, 26);   // “☰”显示/隐藏侧栏
+    place(btnHome_,  190, y + 4, 34, 26);            // “🏠”跳到“我的电脑”
+    place(btnSidebarToggle_, 228, y + 4, 34, 26);   // “☰”显示/隐藏侧栏
     int filterButtonX = W - 190;              // 菜单过滤词按钮左缘（要给右侧“设置”腾位）
-    if (filterButtonX < 274) filterButtonX = 274;
+    if (filterButtonX < 312) filterButtonX = 312;
     int settingsX = W - 82;                  // “设置”按钮固定贴右边
     if (settingsX < filterButtonX + 112) settingsX = filterButtonX + 112;
-    // 地址栏从“☰”按钮右侧（190+34=224）之后开始，留 6px 间隙
-    place(address_, 230, y + 6, filterButtonX - 234, 24);
+    // 地址栏从“☰”按钮右侧（228+34=262）之后开始，留 6px 间隙
+    place(address_, 268, y + 6, filterButtonX - 272, 24);
     place(btnMenuFilters_, filterButtonX, y + 4, 106, 26);
     place(btnSettings_, settingsX, y + 4, 76, 26);
     y += 36;
@@ -4446,6 +4574,8 @@ void MainWindow::Layout()
     RECT rs; SendMessageW(status_, WM_SIZE, 0, MAKELPARAM(W, H));
     GetWindowRect(status_, &rs);
     int statusH = rs.bottom - rs.top;
+    // 分区宽度随窗口宽度重排（右分区贴右边固定宽，左边伸缩）
+    UpdateStatusBarParts(W);
 
     // 分页栏关闭时整条隐藏，28px 高度还给文件列表
     int pagerH = paginationEnabled_ ? 28 : 0;
@@ -4794,6 +4924,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         case IDC_BACK:    PostMessageW(hwnd_, WM_APP_NAV, IDC_BACK, 0); return 0;
         case IDC_FORWARD: PostMessageW(hwnd_, WM_APP_NAV, IDC_FORWARD, 0); return 0;
         case IDC_UP:      PostMessageW(hwnd_, WM_APP_NAV, IDC_UP, 0); return 0;
+        case IDC_HOME:    PostMessageW(hwnd_, WM_APP_NAV, IDC_HOME, 0); return 0;
         default:
             // 每个窗格一个“+”按钮，命令 ID 落在 IDC_NEWTAB_BASE..+7 区间
             if (id >= IDC_NEWTAB_BASE && id < IDC_NEWTAB_BASE + 8) {
@@ -5028,6 +5159,10 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    case WM_APP_STATUS_REFRESH:   // shell 视图内选中/条目数变化 -> 刷新状态栏
+        UpdateStatusBar();
+        return 0;
+
     case WM_APP + 30: {          // 驱动诊断：把窗格/分页状态写进应用日志（外部工具用）
         for (size_t i = 0; i < panes_.size(); ++i) {
             Pane& p = panes_[i];
@@ -5186,6 +5321,11 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             if (!parent.empty() && parent != dir) NavigateFromSidebar(parent);
             return 0;
         }
+        case IDC_HOME:
+            // “🏠”：跳转到“我的电脑”。锁定分页不改目录，走侧栏同款逻辑
+            //（同窗格新开分页打开），与其它导航入口保持一致。
+            NavigateFromSidebar(kThisPcPath);
+            return 0;
         case IDC_REFRESH:
             RefreshListFromDisk();             // 刷新=真正重新枚举目录
             return 0;

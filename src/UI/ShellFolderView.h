@@ -36,12 +36,20 @@ public:
     void UIActivateView(UINT uActivate);
 
     HWND InnerListView() const;          // 视图内部的 SysListView32（找不到返回空）
+    // 状态栏用：最近一次视图自己发来的状态文本（没有则为空），
+    // 以及视图当前条目数（取不到返回 -1）。
+    const std::wstring& LastStatusText() const { return lastStatusText_; }
+    int ItemCount() const;
+    int SelectedCount() const;   // 视图当前选中数（取不到返回 -1）
 
     // 视图内激活文件夹（双击/回车）或请求上级 -> 目标目录路径（onBrowse 触发；
     // 接收方必须延后处理：Navigate 会销毁发起回调的这个视图）
     std::function<void(const std::wstring&)> onBrowse;
     // 视图发来的状态栏文本（“N 个对象”等）
     std::function<void(const std::wstring&)> onStatusText;
+    // 视图内条目数/选中数变化（宿主据此刷新状态栏“已选择 N 个项目”）。
+    // DefView 不向站点发选中变化通知，所以靠宿主定时器轮询发现。
+    std::function<void()> onSelectionMaybeChanged;
     // 视图内右键（鼠标右键/菜单键）：shell 的原生菜单不带本程序的自定义项
     //（复制名称/全路径、添加到收藏、过滤后的菜单），所以拦下 WM_CONTEXTMENU
     // 交回调，由主窗口弹同一套菜单。接收方必须延后处理（回调在视图消息链内）。
@@ -146,5 +154,8 @@ private:
     ComPtr<IShellView> viewObj_;
     std::wstring dir_;
     UniquePIDL dirPidl_;
+    std::wstring lastStatusText_;    // 视图最近一次 SetStatusTextSB 发来的文本
+    int lastSelCount_ = -1;          // 上次观察到的选中数（变化时通知宿主刷新状态栏）
+    int lastItemCount_ = -1;         // 上次观察到的条目数
     ULONG refs_ = 1;                 // 归属引用在 MainWindow；Release 不 delete
 };

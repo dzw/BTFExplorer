@@ -34,6 +34,7 @@ enum {
     IDC_MENU_FILTERS = 1026,
     IDC_TREE_SYNC = 1027,    // 侧栏 Tab 头上的“定位”：把目录树同步到当前分页
     IDC_SIDEBAR_TOGGLE = 1052,   // 顶部工具栏“☰”按钮：显示/隐藏左侧目录树+收藏侧栏
+    IDC_HOME = 1053,             // 顶部工具栏“🏠”按钮：跳转到“我的电脑”
     IDC_TREEHOST = 1029,   // 目录树宿主容器（Q-Dir 同款：Dialog 包住 NamespaceTreeControl）
     IDC_SETTINGS = 1028,   // 工具栏“设置”按钮（对话框控件 ID 见 SettingsDialog.cpp）
     // 分页标题右键菜单：关闭 / 关闭其他 / 关闭右边 / 锁定
@@ -176,6 +177,8 @@ private:
     void InvalidateTabStrips(size_t prevPane = SIZE_MAX);
     void OnPageLoaded();              // 后台加载完成（已 PostMessage 转到 UI 线程）
     void UpdateStatusBar();
+    void UpdateStatusBarParts(int clientW);   // 按窗口宽度重排状态栏分区
+    void UpdateStatusBarDisk();               // 右分区：当前盘可用空间/总容量
     void UpdatePaginationBar();
     void OnColumnClick(int col);
     void ApplyCurrentSort(size_t paneIdx); // 按 sortCol_/sortAsc_ 排序指定窗格的当前分页
@@ -206,6 +209,7 @@ private:
     void ListItemActivated(HWND list, int item) override;
     bool GetItemText(HWND list, int item, int subItem, std::wstring& out) override;
     int  GetItemIcon(HWND list, int item) override;
+    void SelectionChanged(HWND list) override;
 
     // 收藏
     void LoadFavorites();
@@ -244,6 +248,7 @@ private:
     DirectoryTree directoryTree_;
     HWND tab_ = nullptr, favList_ = nullptr, btnTreeSync_ = nullptr; // 左侧 Tab / 收藏 / 树同步
     HWND btnSidebarToggle_ = nullptr;   // 顶部工具栏“☰”：显示/隐藏左侧侧栏
+    HWND btnHome_ = nullptr;            // 顶部工具栏“🏠”：跳转到“我的电脑”
     std::vector<std::wstring> favorites_;      // 收藏的目录路径
     HWND status_ = nullptr, pagerPrev_ = nullptr, pagerNext_ = nullptr;
     HWND pagerFirst_ = nullptr, pagerLast_ = nullptr, pagerLabel_ = nullptr, pagerSize_ = nullptr;

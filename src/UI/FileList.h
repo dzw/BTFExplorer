@@ -40,6 +40,8 @@ public:
     // 取行数据（GETDISPINFO）；返回 false = 该格无内容
     virtual bool GetItemText(HWND list, int item, int subItem, std::wstring& out) = 0;
     virtual int  GetItemIcon(HWND list, int item) = 0;
+    // 选中项发生变化（状态栏刷新“已选择 N 个项目 X MB”用）
+    virtual void SelectionChanged(HWND list) = 0;
 };
 
 // 自绘虚拟文件列表（窗格的默认实现）：LVS_OWNERDATA 报表视图，

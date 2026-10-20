@@ -286,6 +286,15 @@ bool FileList::HandleNotify(NMHDR* nm)
         if (kd->wVKey == VK_F2) delegate_->ListKeyCommand(h, CmdRename);
         return true;
     }
+    // 选中变化：宿主据此刷新状态栏的“已选择 N 个项目 X MB”（资源管理器同款）。
+    // 只在选中态真正翻转时通知，避免 LVN_ITEMCHANGED 的高频骚扰。
+    if (nm->code == LVN_ITEMCHANGED) {
+        auto* lv = reinterpret_cast<NMLISTVIEW*>(nm);
+        if ((lv->uChanged & LVIF_STATE) &&
+            ((lv->uOldState ^ lv->uNewState) & LVIS_SELECTED))
+            delegate_->SelectionChanged(h);
+        return true;
+    }
 
     // ---- 就地重命名（资源管理器风格）----
     if (nm->code == LVN_BEGINLABELEDITW) {

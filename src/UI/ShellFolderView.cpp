@@ -73,6 +73,17 @@ LRESULT ShellFolderView::HostProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         // 内部 SysListView32 由 shell 异步创建/重建（换目录、切视图模式）：
         // 子类化随旧窗口一起消失，句柄一变就补装，否则该窗口的 F2 收不到
         if (InnerListView() != ctxList_) InstallContextMenuSubclass();
+        // 选中数/条目数变化 -> 通知宿主刷新状态栏（资源管理器同款：
+        // “已选择 N 个项目”）。用轮询是因为 DefView 不向站点发选中变化通知。
+        if (InnerListView()) {
+            int sel = SelectedCount();
+            int cnt = ItemCount();
+            if (sel != lastSelCount_ || cnt != lastItemCount_) {
+                lastSelCount_ = sel;
+                lastItemCount_ = cnt;
+                if (onSelectionMaybeChanged) onSelectionMaybeChanged();
+            }
+        }
         return 0;
     }
     return DefWindowProcW(h, msg, wp, lp);
@@ -441,8 +452,26 @@ IFACEMETHODIMP ShellFolderView::GetWindow(HWND* phwnd)
 
 IFACEMETHODIMP ShellFolderView::SetStatusTextSB(LPCWSTR pszText)
 {
+    if (pszText) lastStatusText_ = pszText;   // 记住最近一次文本（状态栏兜底用）
     if (onStatusText && pszText) onStatusText(pszText);
     return S_OK;
+}
+
+// 视图当前条目数：走内部 SysListView32 的 LVM_GETITEMCOUNT。
+// 视图还没建好/内部列表还没出来时返回 -1（调用方据此决定显示什么）。
+int ShellFolderView::ItemCount() const
+{
+    HWND lv = InnerListView();
+    if (!lv) return -1;
+    return static_cast<int>(SendMessageW(lv, LVM_GETITEMCOUNT, 0, 0));
+}
+
+// 视图当前选中数：LVM_GETSELECTEDCOUNT。取不到返回 -1。
+int ShellFolderView::SelectedCount() const
+{
+    HWND lv = InnerListView();
+    if (!lv) return -1;
+    return static_cast<int>(SendMessageW(lv, LVM_GETSELECTEDCOUNT, 0, 0));
 }
 
 // shell 视图内双击文件夹/点上级/历史导航都会走到这里。
