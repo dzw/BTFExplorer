@@ -51,7 +51,7 @@ bool FileList::Create(HWND parent, FileListDelegate* delegate, HFONT font, int c
 {
     delegate_ = delegate;
     HINSTANCE hInst = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(parent, GWLP_HINSTANCE));
-    list_ = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+    list_ = CreateWindowExW(0, WC_LISTVIEWW, L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_OWNERDATA |
             LVS_SHAREIMAGELISTS | LVS_EDITLABELS,
         0, 0, 0, 0, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(controlId)), hInst, nullptr);

@@ -14,7 +14,7 @@
 #include <atlcrack.h>  // WTL 的消息映射宏（MSG_WM_SIZE 等）
 
 namespace {
-constexpr int kEdgePad = 4;        // 内容区与容器左/右/下的留白
+constexpr int kEdgePad = 0;        // 内容区（列表 / shell 视图）齐边贴满窗格，不留缝隙
 constexpr int kStripPad = 6;       // 分页标题行下方的留白
 constexpr int kDefaultStripH = 30; // 分页头未量到时的标题行高度（24 行高 + 留白）
 constexpr wchar_t kBlankHitClass[] = L"PEShellTabBlankHit";
@@ -87,8 +87,7 @@ struct PaneHost::Impl : public ATL::CWindowImpl<Impl> {
         PlaceAll(static_cast<int>(size.cx), static_cast<int>(size.cy));
     }
 
-    // 容器背景统一刷成列表同款底色：内缩留白(kEdgePad)若不刷，会露出后面的深色，
-    // 沿左/右/下围成一圈 U 形边框（顶部被列表头盖住看不见）。
+    // 容器背景统一刷成列表同款底色（内容区现已齐边贴满，无留白，这里只是兜底底色）
     LRESULT OnEraseBkgnd(UINT /*msg*/, WPARAM wparam, LPARAM /*lparam*/, BOOL& handled)
     {
         HDC dc = reinterpret_cast<HDC>(wparam);

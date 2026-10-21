@@ -57,7 +57,9 @@ bool ShellFolderView::Create(HWND parent)
         classRegistered = true;
     }
     HINSTANCE hInst = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(parent, GWLP_HINSTANCE));
-    host_ = CreateWindowExW(WS_EX_CLIENTEDGE, kHostClass, L"",
+    // 不要 WS_EX_CLIENTEDGE：否则 shell 视图四周会多一圈 2px 凹陷边框，
+    // 和容器内容区留白叠加成可见的缝隙（Q-Dir/资源管理器里视图是齐边贴满的）
+    host_ = CreateWindowExW(0, kHostClass, L"",
         WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
         0, 0, 0, 0, parent, nullptr, hInst, nullptr);
     if (!host_) return false;
