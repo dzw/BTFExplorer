@@ -600,17 +600,37 @@ void MainWindow::BuildChildren()
         return h;
     };
 
-    // 工具栏行：后退 前进 上级 刷新 + 地址栏
-    mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"←", IDC_BACK, &btnBack_);
-    mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"→", IDC_FORWARD, &btnFwd_);
-    mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"↑", IDC_UP, &btnUp_);
-    mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"刷新", IDC_REFRESH, &btnRefresh_);
-    // “🏠”：跳转到“我的电脑”（列出各盘符），与资源管理器的“此电脑”入口对应
-    mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"🏠", IDC_HOME, &btnHome_);
-    // “☰”始终在工具栏可见：显示/隐藏左侧目录树+收藏侧栏（侧栏本身被隐藏后也要能点回来）
-    mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"☰", IDC_SIDEBAR_TOGGLE, &btnSidebarToggle_);
-    mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"菜单过滤词", IDC_MENU_FILTERS, &btnMenuFilters_);
-    mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"设置", IDC_SETTINGS, &btnSettings_);
+    // 工具栏：用真正的 ToolbarWindow32 承载“后退/前进/上级/刷新/🏠/☰/菜单过滤词/设置”
+    // 等命令按钮（文本按钮，不挂图标列表，省去图标资源）。地址栏继续是独立 EDIT 控件，
+    // 摆在工具栏右侧（与资源管理器同款：工具栏 + 地址栏两带）。
+    toolbar_ = CreateWindowExW(0, TOOLBARCLASSNAMEW, nullptr,
+        WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | CCS_NODIVIDER | CCS_NORESIZE,
+        0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TOOLBAR)), hInst, nullptr);
+    if (toolbar_) {
+        SendMessageW(toolbar_, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
+        if (uiFont_) SendMessageW(toolbar_, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+        // 文本按钮：iBitmap = I_IMAGENONE，纯文字由 iString 索引字符串池给出
+        static const wchar_t kTbTxt[] =
+            L"←\0→\0↑\0刷新\0🏠\0☰\0菜单过滤词\0设置\0";
+        SendMessageW(toolbar_, TB_ADDSTRINGW, 0, reinterpret_cast<LPARAM>(kTbTxt));
+
+        TBBUTTON b[] = {
+            { I_IMAGENONE, IDC_BACK,           TBSTATE_ENABLED, BTNS_AUTOSIZE, {0}, 0, 0 },
+            { I_IMAGENONE, IDC_FORWARD,        TBSTATE_ENABLED, BTNS_AUTOSIZE, {0}, 0, 1 },
+            { I_IMAGENONE, IDC_UP,             TBSTATE_ENABLED, BTNS_AUTOSIZE, {0}, 0, 2 },
+            { I_IMAGENONE, IDC_REFRESH,        TBSTATE_ENABLED, BTNS_AUTOSIZE, {0}, 0, 3 },
+            { I_IMAGENONE, IDC_HOME,           TBSTATE_ENABLED, BTNS_AUTOSIZE, {0}, 0, 4 },
+            { 8,           0,                  TBSTATE_ENABLED, BTNS_SEP,      {0}, 0, -1 },
+            { I_IMAGENONE, IDC_SIDEBAR_TOGGLE, TBSTATE_ENABLED, BTNS_AUTOSIZE, {0}, 0, 5 },
+            { 8,           0,                  TBSTATE_ENABLED, BTNS_SEP,      {0}, 0, -1 },
+            { I_IMAGENONE, IDC_MENU_FILTERS,   TBSTATE_ENABLED, BTNS_AUTOSIZE, {0}, 0, 6 },
+            { 8,           0,                  TBSTATE_ENABLED, BTNS_SEP,      {0}, 0, -1 },
+            { I_IMAGENONE, IDC_SETTINGS,       TBSTATE_ENABLED, BTNS_AUTOSIZE, {0}, 0, 7 },
+        };
+        SendMessageW(toolbar_, TB_ADDBUTTONSW, ARRAYSIZE(b), reinterpret_cast<LPARAM>(b));
+        SendMessageW(toolbar_, TB_SETBUTTONSIZE, 0, MAKELPARAM(0, 26));
+        SendMessageW(toolbar_, TB_AUTOSIZE, 0, 0);
+    }
     mk(WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, WC_EDITW, L"", IDC_ADDRESS, &address_);
     // 子类化地址栏：原过程存 GWLP_USERDATA，回车跳转靠 AddressProc
     SetWindowLongPtrW(address_, GWLP_USERDATA,
@@ -659,9 +679,22 @@ MainWindow::~MainWindow() = default;
 void MainWindow::CreateSidePanel()
 {
     HINSTANCE hInst = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd_, GWLP_HINSTANCE));
+
+    // 侧栏容器：把“顶部切换条(tab_)”与“内容(树/收藏)”按 PaneHost 模型拆开，
+    // tab_ 只占标题行、内容排在它下面（不再像原来那样把树/列表当子窗口装进 tab_
+    // 的页面区）。分隔条左窗格改由这个容器担任。
+    sideHost_ = std::make_unique<PaneHost>();
+    sideHost_->Create(hwnd_, 0);
+    // 标题行上方不留边距，让侧栏 Tab 直接贴在 PEShellPaneHost 的最顶部。
+    // 与顶部工具栏之间本就有“工具栏行 36 - 工具栏高 30 = 6px”的间隙，不会盖住工具栏。
+    // 留白由 PaneHost 自己摆，避免和 LayoutSidebarInner 抢着放 tab。
+    sideHost_->SetTabTopPad(0);
+    // 标题行右侧留 40px 给“定”按钮：Tab 条缩窄，按钮移到条右侧外，不再压在条上。
+    sideHost_->SetTabRightReserve(40);
+
     tab_ = CreateWindowExW(0, WC_TABCONTROLW, L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | TCS_TABS,
-        0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TAB)), hInst, nullptr);
+        0, 0, 0, 0, sideHost_->Handle(), reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TAB)), hInst, nullptr);
     if (uiFont_) SendMessageW(tab_, WM_SETFONT, (WPARAM)uiFont_, TRUE);
     WNDPROC tabOld = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
         tab_, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&SideTabProc)));
@@ -677,11 +710,11 @@ void MainWindow::CreateSidePanel()
     addTab(L"目录树", 0);
     addTab(L"收藏", 1);
 
-    // 树和收藏列表都是 tab_ 的子窗口，显示由 SwitchSideTab 控制。
+    // 树和收藏列表都归侧栏容器管（不再做 tab_ 的子窗口），显示由 SwitchSideTab 控制。
     // 目录树用 shell 自带的命名空间树控件（CLSID_NamespaceTreeControl，Q-Dir
     // 同款做法）：节点/图标/Infotip/外部变化后的自动刷新全由 shell 维护，
     // 本程序只负责设置根（命名空间桌面）与同步选中项。
-    if (!directoryTree_.Create(tab_))
+    if (!directoryTree_.Create(sideHost_->Handle()))
         WriteAppLog(L"DirectoryTree create failed: tree disabled");
     // 目录树中键点击：在当前活动窗格新开分页打开该目录。
     // 不能在树的窗口过程里直接 AddRightTab（Layout 会重入树/页签控件导致
@@ -704,10 +737,16 @@ void MainWindow::CreateSidePanel()
     if (uiFont_) SendMessageW(btnTreeSync_, WM_SETFONT, (WPARAM)uiFont_, TRUE);
     favList_ = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
         WS_CHILD | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER | LVS_SINGLESEL,
-        0, 0, 0, 0, tab_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_FAVLIST)), hInst, nullptr);
+        0, 0, 0, 0, sideHost_->Handle(), reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_FAVLIST)), hInst, nullptr);
     if (uiFont_) SendMessageW(favList_, WM_SETFONT, (WPARAM)uiFont_, TRUE);
     LVCOLUMNW c = { LVCF_TEXT | LVCF_WIDTH, 0, 400, const_cast<LPWSTR>(L"目录") };
     ListView_InsertColumn(favList_, 0, &c);
+
+    // 把 tab_ 登记成容器的“标题行”（只负责切换、压在顶部），树/收藏作为容器内容
+    // 排在它下面。容器自身由分隔条当左窗格摆放，内部布局交给 LayoutSidebarInner。
+    sideHost_->SetTabStrip(tab_);
+    sideHost_->AddContent(directoryTree_.Handle());
+    sideHost_->AddContent(favList_);
 
     SwitchSideTab(0);
     LoadFavorites(); // 启动时读回 sort= 配置和收藏列表
@@ -858,6 +897,9 @@ void MainWindow::CreatePane(Pane& p)
     p.list = p.fileList->Handle();
     p.host->SetTabStrip(p.tab);
     p.host->SetList(p.list);
+    // 标题行右侧留 70px 给“▾/Q/0”按钮：Tab 条缩窄，按钮移到条右侧外，
+    // 否则分页很多、tab 内部出现左右滚动按钮时会和这些按钮打架。
+    p.host->SetTabRightReserve(70);
     auto* dropTarget = new FileDropTarget(this, p.list);
     HRESULT dropResult = RegisterDragDrop(p.list, dropTarget);
     dropTarget->Release();
@@ -3932,6 +3974,20 @@ LRESULT MainWindow::PaneTabHandler(HWND h, UINT m, WPARAM wp, LPARAM lp, WNDPROC
         }
         return 0;   // 吞掉中键，别触发系统的滚动热点
     }
+    case WM_MOUSEWHEEL: {  // 在分页栏上滚轮 -> 前后切换分页（上=前一页，下=后一页，循环）
+        int pi = PaneOfTab(h);
+        if (pi < 0) break;            // 不是窗格分页栏，走默认
+        Pane& p = panes_[pi];
+        int n = (int)p.tabs.size();
+        if (n <= 1) return 0;         // 只有一个分页，无前后可切，吃掉滚轮
+        int cur = (int)SendMessageW(h, TCM_GETCURSEL, 0, 0);
+        if (cur < 0) cur = (int)p.active;
+        int delta = GET_WHEEL_DELTA_WPARAM(wp);
+        int next = (delta > 0) ? (cur - 1 + n) % n : (cur + 1) % n;  // 上=前、下=后，循环
+        if (next != cur)
+            SendMessageW(h, TCM_SETCURSEL, (WPARAM)next, 0);  // 触发 TCN_SELCHANGE -> 既有切换逻辑
+        return 0;  // 光标在分页栏上，不滚列表
+    }
     case WM_CAPTURECHANGED:
         tabDragActive_ = false;
         break;
@@ -3950,30 +4006,31 @@ void MainWindow::UpdateNewTabButtons()
             if (p.host) p.host->SetTabBlankHitArea(RECT{});
         };
 
-        // 右上角“Q”（列表实现切换）+“▾”（外部工具）：贴本窗格 tab 条的最右端
+        // 右上角“Q”（列表实现切换）+“▾”（外部工具）+ 窗格编号：移到本窗格 tab 条
+        // 右侧的“保留区”外（tab 条已被 PaneHost 按 tabRightReserve_ 缩窄），不再压在
+        // tab 条上——否则分页很多、tab 内部出现左右滚动按钮时会和这些按钮打架。
         int toolsLeft = -1;
-        if (p.btnTools != nullptr && p.tab != nullptr) {
-            RECT tc{};
-            if (GetClientRect(p.tab, &tc) && tc.right > 30) {
-                POINT tr{ tc.right - 26, 1 };
-                MapWindowPoints(p.tab, hwnd_, &tr, 1);
-                SetWindowPos(p.btnTools, HWND_TOP, tr.x, tr.y, 24, 20,
+        if (p.btnTools != nullptr && p.tab != nullptr && p.host != nullptr) {
+            RECT hc{};
+            if (GetClientRect(p.host->Handle(), &hc) && (hc.right - hc.left) > 90) {
+                POINT o{ 0, 0 };
+                MapWindowPoints(p.host->Handle(), hwnd_, &o, 1);  // 宿主原点 -> 主窗口坐标
+                int baseX = o.x + (hc.right - hc.left);            // 窗格最右（主窗口坐标）
+                int topY  = o.y + 1;
+                int toolsX = baseX - 24;                          // “▾”最右
+                SetWindowPos(p.btnTools, HWND_TOP, toolsX, topY, 24, 20,
                              SWP_NOACTIVATE | SWP_SHOWWINDOW);
                 if (p.btnViewMode != nullptr) {
-                    // “Q”在“▾”左边：同样从 tab 客户区坐标出发，各换算一次
-                    // （tr 已是主窗口坐标，不能再拿去 MapWindowPoints，否则 Q 会被
-                    // 多加一次 tab 原点偏移、飘到外部工具按钮右边老远）
-                    POINT vr{ tc.right - 26 - 24 - 2, 1 };
-                    MapWindowPoints(p.tab, hwnd_, &vr, 1);
-                    SetWindowPos(p.btnViewMode, HWND_TOP, vr.x, vr.y, 24, 20,
+                    int qX = toolsX - 2 - 24;                     // “Q”在“▾”左边
+                    SetWindowPos(p.btnViewMode, HWND_TOP, qX, topY, 24, 20,
                                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
-                    // 窗格编号标记再往左一格（vr 已是主窗口坐标，直接减即可）
+                    int tagX = qX - 2 - 14;                       // 窗格编号再往左一格
                     if (p.lblPaneTag != nullptr)
-                        SetWindowPos(p.lblPaneTag, HWND_TOP, vr.x - 16, vr.y, 14, 20,
+                        SetWindowPos(p.lblPaneTag, HWND_TOP, tagX, topY, 14, 20,
                                      SWP_NOACTIVATE | SWP_SHOWWINDOW);
-                    toolsLeft = (p.lblPaneTag != nullptr) ? vr.x - 16 : vr.x;   // “+”收起判断以最左的按钮为准
+                    toolsLeft = tagX;   // “+”收起判断以最左的按钮为准
                 } else {
-                    toolsLeft = tr.x;
+                    toolsLeft = toolsX;
                 }
             }
         }
@@ -4320,7 +4377,9 @@ void MainWindow::RebuildSplitters(int totalWidth)
 
     for (Pane& p : panes_)
         if (p.host) SetParent(p.host->Handle(), hwnd_);
-    if (tab_) SetParent(tab_, hwnd_);
+    // tab_ 是 sideHost_（PEShellPaneHost）的子窗口，随 sideHost_ 一起摘回主窗口即可，
+    // 不能再单独 SetParent 到 hwnd_，否则会被拽出容器、不再位于 PEShellPaneHost 内。
+    if (sideHost_) SetParent(sideHost_->Handle(), hwnd_);
 
     DestroySplitWindows(L.root);
     L.nodes.clear();
@@ -4381,7 +4440,8 @@ void MainWindow::RebuildSplitters(int totalWidth)
     attach(L.root, L.tree->m_hWnd);
 
     // 分隔条一动，主窗口就要把跟着它走的东西都重摆一遍、并回写位置：
-    //   - 侧栏内部（目录树/收藏/定位按钮）是 tab_ 的子窗口，分隔条只动 tab_ 本身；
+    //   - 侧栏整体是 sideHost_（容器）这个左窗格，tab_ 只当顶部切换条、树/收藏是
+    //     它的内容；分隔条只动 sideHost_ 本身，内部由 LayoutSidebarInner 重摆；
     //   - 贴在窗格右上角的 +/Q/▾ 按钮是主窗口的子窗口，不随分隔条走；
     //   - CaptureSplitState：以前只有 SaveSession 才回读位置，拖完不落盘，
     //     下次重建树时侧栏宽度会跳回旧值。
@@ -4404,8 +4464,11 @@ void MainWindow::RebuildSplitters(int totalWidth)
         // rect.top)），父窗口还留在主窗口时这组坐标会被当成主窗口客户区坐标，
         // 侧栏就整体上移一个工具栏高度、压到工具栏那一行上去。
         // （上面把这些窗口摘回 hwnd_ 是为了能安全销毁旧分隔条，这里要挂回去）
-        SetParent(tab_, L.tree->m_hWnd);
-        L.tree->SetPanesNoUpdate(tab_, right);
+        SetParent(sideHost_->Handle(), L.tree->m_hWnd);
+        // 确保侧栏 Tab 始终在 PEShellPaneHost 内（它本就是 sideHost_ 的子窗口，
+        // 这里再显式挂一次，抵消任何历史遗留的错位，避免跑到主窗口下）。
+        if (tab_) SetParent(tab_, sideHost_->Handle());
+        L.tree->SetPanesNoUpdate(sideHost_->Handle(), right);
         // 侧栏折叠态在重建分隔条后重新落实：会话恢复（pendingSidebarCollapsed_）和
         // 运行时折叠后改布局触发重建都要收起左窗格。SetSinglePaneMode 保留
         // m_xySplitterPos，展开后宽度原样回来，不会跳回默认 220。
@@ -4491,41 +4554,30 @@ void MainWindow::UpdatePaneRects()
 // 返回 true = 本轮真的动了某个控件（Layout() 据此决定要不要整窗重绘）。
 bool MainWindow::LayoutSidebarInner()
 {
-    if (tab_ == nullptr) return false;
+    if (sideHost_ == nullptr || sideHost_->Handle() == nullptr) return false;
 
-    int sideW = 0, sideH = 0;
-    RECT tcr{};
-    if (GetClientRect(tab_, &tcr)) {
-        sideW = tcr.right - tcr.left;
-        sideH = tcr.bottom - tcr.top;
-    }
-    if (sideW <= 0 || sideH <= 0) return false;   // 还没量到尺寸（建树中途）
+    // 标题行(tab_)与内容(树/收藏)的摆放交给 PaneHost 自己按 tabTopPad 完成
+    // （分隔条拖动时 sideHost_ 收到 WM_SIZE 也会自己重摆，这里再兜底一次保持一致，
+    // 免得和容器抢着放 tab 又把顶部留白冲掉）。本函数只额外摆“定”按钮。
+    sideHost_->Relayout();
 
+    // “定”= 同步目录树到当前分页：它是 tab_ 的子窗口，单独压在 Tab 头最右、两种页都可见
+    bool moved = false;
+    RECT rc{}; GetClientRect(sideHost_->Handle(), &rc);
+    int sideW = rc.right - rc.left;
     RECT rt{};
     SendMessageW(tab_, TCM_GETITEMRECT, 0, reinterpret_cast<LPARAM>(&rt));
-    const int tabH = rt.bottom - rt.top;
-    const int treeTop = tabH + 6;
-    const int innerH = sideH - treeTop - 6;
-    const int sideContentH = sideH - tabH - 12;
-
-    // 只挪不画：拖动中由分隔条的 RepaintSubtree 统一重绘，Layout() 里则并入
-    // 末尾那一次 RedrawWindow。
-    bool moved = false;
-    auto place = [&](HWND h, int x, int yy, int w, int hh) {
-        if (h == nullptr) return;
-        RECT r{}; GetWindowRect(h, &r);
+    int tabH = rt.bottom - rt.top;
+    if (btnTreeSync_) {
+        RECT r{}; GetWindowRect(btnTreeSync_, &r);
         POINT org{ r.left, r.top };
-        ScreenToClient(tab_, &org);      // 这些都是 tab_ 的子窗口，坐标相对它
-        if (org.x == x && org.y == yy && r.right - r.left == w && r.bottom - r.top == hh)
-            return;
-        moved = true;
-        SetWindowPos(h, nullptr, x, yy, w, hh, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
-    };
-    // “定”= 同步目录树到当前分页：压在 Tab 头最右、目录树之上，两种页都可见。
-    place(btnTreeSync_, sideW - 40, 3, 34, tabH - 4);
-    place(directoryTree_.Handle(), 4, treeTop, sideW - 8, innerH);
-    place(favList_, 4, tabH + 6, sideW - 8, sideContentH);
-    SetWindowPos(btnTreeSync_, HWND_TOP, sideW - 40, 3, 34, tabH - 4, SWP_NOACTIVATE);
+        ScreenToClient(tab_, &org);      // 它的父是 tab_，坐标相对 tab_
+        int nx = sideW - 40, ny = 3, nw = 34, nh = tabH - 4;
+        if (org.x != nx || org.y != ny || r.right - r.left != nw || r.bottom - r.top != nh) {
+            moved = true;
+            SetWindowPos(btnTreeSync_, HWND_TOP, nx, ny, nw, nh, SWP_NOACTIVATE | SWP_NOREDRAW);
+        }
+    }
     return moved;
 }
 
@@ -4553,21 +4605,20 @@ void MainWindow::Layout()
                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
     };
 
-    // 工具栏行
-    place(btnBack_,   4, y + 4, 40, 26);
-    place(btnFwd_,   48, y + 4, 40, 26);
-    place(btnUp_,    92, y + 4, 40, 26);
-    place(btnRefresh_,136, y + 4, 50, 26);
-    place(btnHome_,  190, y + 4, 34, 26);            // “🏠”跳到“我的电脑”
-    place(btnSidebarToggle_, 228, y + 4, 34, 26);   // “☰”显示/隐藏侧栏
-    int filterButtonX = W - 190;              // 菜单过滤词按钮左缘（要给右侧“设置”腾位）
-    if (filterButtonX < 312) filterButtonX = 312;
-    int settingsX = W - 82;                  // “设置”按钮固定贴右边
-    if (settingsX < filterButtonX + 112) settingsX = filterButtonX + 112;
-    // 地址栏从“☰”按钮右侧（228+34=262）之后开始，留 6px 间隙
-    place(address_, 268, y + 6, filterButtonX - 272, 24);
-    place(btnMenuFilters_, filterButtonX, y + 4, 106, 26);
-    place(btnSettings_, settingsX, y + 4, 76, 26);
+    // 工具栏（ToolbarWindow32）：左对齐排按钮；地址栏接在它右侧，占满剩余宽度。
+    if (toolbar_) {
+        SIZE sz{};
+        SendMessageW(toolbar_, TB_GETMAXSIZE, 0, reinterpret_cast<LPARAM>(&sz));
+        int tbW = sz.cx > 0 ? sz.cx : 0;
+        place(toolbar_, 0, 0, tbW, 30);
+        int ax = tbW + 6;                       // 地址栏从工具栏右侧之后开始
+        int aw = W - ax - 4;
+        if (aw < 80) { ax = 4; aw = W - 8; }    // 窗口太窄放不下工具栏时退回整行
+        if (aw < 0) aw = 0;
+        place(address_, ax, y + 6, aw, 24);
+    } else {
+        place(address_, 268, y + 6, W - 272, 24);  // 兜底：未创建工具栏时
+    }
     y += 36;
 
     // 状态栏占据底部一条，先量出它的高度，分页栏放在它上面

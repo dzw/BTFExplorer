@@ -35,6 +35,7 @@ enum {
     IDC_TREE_SYNC = 1027,    // 侧栏 Tab 头上的“定位”：把目录树同步到当前分页
     IDC_SIDEBAR_TOGGLE = 1052,   // 顶部工具栏“☰”按钮：显示/隐藏左侧目录树+收藏侧栏
     IDC_HOME = 1053,             // 顶部工具栏“🏠”按钮：跳转到“我的电脑”
+    IDC_TOOLBAR = 1090,         // 顶部工具栏控件（ToolbarWindow32）自身 ID
     IDC_TREEHOST = 1029,   // 目录树宿主容器（Q-Dir 同款：Dialog 包住 NamespaceTreeControl）
     IDC_SETTINGS = 1028,   // 工具栏“设置”按钮（对话框控件 ID 见 SettingsDialog.cpp）
     // 分页标题右键菜单：关闭 / 关闭其他 / 关闭右边 / 锁定
@@ -247,13 +248,11 @@ private:
     TrayIcon trayIcon_;
     DirectoryTree directoryTree_;
     HWND tab_ = nullptr, favList_ = nullptr, btnTreeSync_ = nullptr; // 左侧 Tab / 收藏 / 树同步
-    HWND btnSidebarToggle_ = nullptr;   // 顶部工具栏“☰”：显示/隐藏左侧侧栏
-    HWND btnHome_ = nullptr;            // 顶部工具栏“🏠”：跳转到“我的电脑”
+    std::unique_ptr<PaneHost> sideHost_; // 侧栏容器：顶部“切换条(tab_)”+ 树/收藏内容（PaneHost 模型）
+    HWND toolbar_ = nullptr;            // 顶部工具栏（ToolbarWindow32）：承载导航/操作按钮
     std::vector<std::wstring> favorites_;      // 收藏的目录路径
     HWND status_ = nullptr, pagerPrev_ = nullptr, pagerNext_ = nullptr;
     HWND pagerFirst_ = nullptr, pagerLast_ = nullptr, pagerLabel_ = nullptr, pagerSize_ = nullptr;
-    HWND btnBack_ = nullptr, btnFwd_ = nullptr, btnUp_ = nullptr, btnRefresh_ = nullptr;
-    HWND btnMenuFilters_ = nullptr, btnSettings_ = nullptr;
     HFONT uiFont_ = nullptr;
     HIMAGELIST tabHiml_ = nullptr;           // 系统小图标表（SHGFI_SYSICONINDEX，分页 Tab 用）
     std::map<std::wstring, int> tabIconCache_;  // 目录 -> 图标表下标（避免每次导航都打进 shell）

@@ -30,6 +30,8 @@ struct PaneHost::Impl : public ATL::CWindowImpl<Impl> {
     HWND list = nullptr;
     std::vector<HWND> contents;
     int stripH = kDefaultStripH;
+    int tabTopPad_ = 0;   // 标题行上方的留白（侧栏用它和顶部工具栏拉开距离）
+    int tabRightReserve_ = 0;  // 标题行右侧留宽（给 ▾/Q/0 等按钮让位，按钮移到条外）
 
     BEGIN_MSG_MAP_EX(Impl)
         MSG_WM_SIZE(OnSize)
@@ -134,9 +136,10 @@ struct PaneHost::Impl : public ATL::CWindowImpl<Impl> {
             ::SetWindowPos(hwnd, nullptr, x, y, cw, ch,
                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
         };
-        if (tab) place(tab, 0, 0, w, strip);
-        const int contentY = strip;
-        const int contentH = h - strip - kEdgePad;
+        int tabW = (w > tabRightReserve_) ? (w - tabRightReserve_) : w;
+        if (tab) place(tab, 0, tabTopPad_, tabW, strip);
+        const int contentY = tabTopPad_ + strip;
+        const int contentH = h - contentY - kEdgePad;
         if (contentH <= 0) return;
         if (list) place(list, kEdgePad, contentY, w - kEdgePad * 2, contentH);
         // shell 视图宿主与列表重叠摆放，可见性由分页的 listMode 决定
@@ -189,6 +192,20 @@ bool PaneHost::Create(HWND parent, int controlId)
     }
     hwnd_ = hwnd;
     return true;
+}
+
+void PaneHost::SetTabTopPad(int pad)
+{
+    if (!impl_) return;
+    impl_->tabTopPad_ = pad;
+    Relayout();   // 改了留白立即按新尺寸重摆
+}
+
+void PaneHost::SetTabRightReserve(int reserve)
+{
+    if (!impl_) return;
+    impl_->tabRightReserve_ = reserve;
+    Relayout();   // 改了留宽立即按新尺寸重摆
 }
 
 void PaneHost::SetTabStrip(HWND tab)

@@ -23,6 +23,8 @@ public:
 
     // 内部控件由主窗口创建并持有生命周期，这里只登记“归容器摆放”
     void SetTabStrip(HWND tab);        // 分页栏（只占标题行）
+    void SetTabTopPad(int pad);        // 标题行上方的留白（侧栏用它和顶部工具栏拉开距离）
+    void SetTabRightReserve(int reserve); // 标题行右侧留宽（给 ▾/Q/0 等按钮让位，按钮移到条外）
     void SetTabBlankHitArea(const RECT& area); // 分页栏尾部空白的透明鼠标接收区
     void SetList(HWND list);           // 自绘虚拟列表（内容区）
     void AddContent(HWND content);     // 与列表重叠摆放的其它内容：分页的 shell 视图宿主
