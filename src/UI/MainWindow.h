@@ -24,6 +24,7 @@ enum {
     IDC_BACK = 1004, IDC_FORWARD = 1005, IDC_UP = 1006, IDC_REFRESH = 1007,
     IDC_FIRST = 1010, IDC_PREV = 1011, IDC_NEXT = 1012, IDC_LAST = 1013,
     IDC_PAGE_SIZE = 1014, IDC_PAGER_LABEL = 1015,
+    IDC_PAGER_HOST = 1091,         // 分页栏容器（PaneHost）：承载分页导航按钮 + 每页大小
     IDC_TAB = 1016, IDC_FAVLIST = 1017, IDC_RIGHTTAB = 1018, IDC_NEWTAB = 1019,
     IDC_NEWTAB_BASE = 1200,    // 每个窗格一个“+”按钮，命令 ID = IDC_NEWTAB_BASE + 窗格 tag
     IDC_TOOLS_BASE = 1210,     // 每个窗格一个“▾”外部工具按钮，命令 ID = IDC_TOOLS_BASE + tag
@@ -51,6 +52,7 @@ enum {
     IDC_FOCUS_PANE3 = 1065, IDC_FOCUS_PANE4 = 1066,
     IDC_FOCUS_ADDRESS = 1067, // F4 激活地址栏并全选
     IDC_PANES4 = 1068,       // Alt+主键盘4 = 四窗格（田字）；不对称三窗格是 Alt+小键盘4/6
+    IDC_FAV_FILTER = 1069,   // 收藏页顶部的过滤输入框
 };
 
 // 每个右侧分页的独立状态（目录/页码/历史/加载器各自独立）
@@ -248,7 +250,10 @@ private:
     TrayIcon trayIcon_;
     DirectoryTree directoryTree_;
     HWND tab_ = nullptr, favList_ = nullptr, btnTreeSync_ = nullptr; // 左侧 Tab / 收藏 / 树同步
+    HWND favFilter_ = nullptr;   // 收藏页顶部的过滤输入框（只过滤显示，不改收藏列表）
     std::unique_ptr<PaneHost> sideHost_; // 侧栏容器：顶部“切换条(tab_)”+ 树/收藏内容（PaneHost 模型）
+    std::unique_ptr<PaneHost> pagerHost_; // 分页栏容器：承载分页导航按钮 + 每页大小，摆在右侧窗格区底部
+    std::unique_ptr<PaneHost> rightWrap_; // 右侧窗格区容器：多窗格(上) + 分页栏(下)，让左栏目录树撑满整高
     HWND toolbar_ = nullptr;            // 顶部工具栏（ToolbarWindow32）：承载导航/操作按钮
     std::vector<std::wstring> favorites_;      // 收藏的目录路径
     HWND status_ = nullptr, pagerPrev_ = nullptr, pagerNext_ = nullptr;

@@ -10,6 +10,7 @@
 #include <shlobj.h>
 #include <mmsystem.h>   // PlaySoundW / SND_* / MessageBeep
 #include <cstdio>
+#include <cwctype>
 #include <algorithm>
 #include <vector>
 
@@ -42,6 +43,14 @@ namespace {
 // Q-Dir 覆盖的两条分隔条参数（见上）
 constexpr int kMinPaneSize = 7;
 constexpr int kBarEdgeSize = 3;
+
+// 顶部工具栏行：按钮高度同时也是工具栏窗口高度（不匹配会让文字在按钮里偏上），
+// 行高 36 里上下各留 4px，按钮与右侧地址栏共用同一条水平中线。
+constexpr int kToolbarRowH = 36;
+constexpr int kToolbarBtnH = 28;
+constexpr int kToolbarTop = (kToolbarRowH - kToolbarBtnH) / 2;
+constexpr int kAddressH = 24;
+constexpr int kAddressTop = (kToolbarRowH - kAddressH) / 2;
 
 // 一条分隔条窗口。竖/横只是构造参数 m_bVertical 的差别，窗口类名与 Q-Dir 一致。
 class PaneSplitter : public ATL::CWindowImpl<PaneSplitter>,
@@ -609,9 +618,15 @@ void MainWindow::BuildChildren()
     if (toolbar_) {
         SendMessageW(toolbar_, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
         if (uiFont_) SendMessageW(toolbar_, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+        // 按钮尺寸要在加按钮之前定好：BTNS_AUTOSIZE 只自动算宽度，高度取这里的值。
+        // 高度必须与 Layout 里给工具栏窗口的高度一致（kToolbarBtnH），否则按钮贴
+        // 在工具栏顶部、文字整体偏上。左右内边距让纯文本按钮的文字不贴边框。
+        SendMessageW(toolbar_, TB_SETBUTTONSIZE, 0, MAKELPARAM(0, kToolbarBtnH));
+        SendMessageW(toolbar_, TB_SETPADDING, 0, MAKELPARAM(10, 0));
+        SendMessageW(toolbar_, TB_SETMAXTEXTROWS, 1, 0);
         // 文本按钮：iBitmap = I_IMAGENONE，纯文字由 iString 索引字符串池给出
         static const wchar_t kTbTxt[] =
-            L"←\0→\0↑\0刷新\0🏠\0☰\0菜单过滤词\0设置\0";
+            L"←\0→\0↑\0刷新\0⌂\0☰\0菜单过滤词\0设置\0";
         SendMessageW(toolbar_, TB_ADDSTRINGW, 0, reinterpret_cast<LPARAM>(kTbTxt));
 
         TBBUTTON b[] = {
@@ -628,7 +643,10 @@ void MainWindow::BuildChildren()
             { I_IMAGENONE, IDC_SETTINGS,       TBSTATE_ENABLED, BTNS_AUTOSIZE, {0}, 0, 7 },
         };
         SendMessageW(toolbar_, TB_ADDBUTTONSW, ARRAYSIZE(b), reinterpret_cast<LPARAM>(b));
-        SendMessageW(toolbar_, TB_SETBUTTONSIZE, 0, MAKELPARAM(0, 26));
+        // 按钮高度必须与工具栏窗口高度(kToolbarBtnH=28)一致：窗口由 Layout 以
+        // kToolbarBtnH 摆放，若这里又把高度设小(如 26)，按钮面比窗口矮，glyph(←→↑⌂☰)
+        // 与文字整体偏上、和右侧地址栏(同一条水平中线)不对齐。
+        SendMessageW(toolbar_, TB_SETBUTTONSIZE, 0, MAKELPARAM(0, kToolbarBtnH));
         SendMessageW(toolbar_, TB_AUTOSIZE, 0, 0);
     }
     mk(WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, WC_EDITW, L"", IDC_ADDRESS, &address_);
@@ -654,6 +672,18 @@ void MainWindow::BuildChildren()
     ti0.pszText = const_cast<LPWSTR>(L"新建");
     SendMessageW(panes_[0].tab, TCM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&ti0));
 
+    // 分页栏容器（PaneHost）：把分页导航按钮 + 每页大小收进一个容器，之后摆在
+    // 右侧窗格区（目录树右边界）底部。容器负责把子控件的 WM_COMMAND/WM_NOTIFY
+    // 转回主窗口，所以分页按钮/下拉划过来后照常工作。
+    pagerHost_ = std::make_unique<PaneHost>();
+    pagerHost_->Create(hwnd_, IDC_PAGER_HOST);
+
+    // 右侧窗格区容器：包住“多窗格(上) + 分页栏(下)”。由 RebuildSplitters 挂到外层
+    // 拆分条右窗格，多窗格树登记为内容、pagerHost_ 登记为底部窗格。这样外层拆分条
+    // 可撑满整高，左栏目录树随之满高，而右侧多窗格仍在分页栏处收住。
+    rightWrap_ = std::make_unique<PaneHost>();
+    rightWrap_->Create(hwnd_, 0);
+
     // 分页栏
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"|◀", IDC_FIRST, &pagerFirst_);
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"◀", IDC_PREV, &pagerPrev_);
@@ -661,6 +691,9 @@ void MainWindow::BuildChildren()
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"▶", IDC_NEXT, &pagerNext_);
     mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, L"▶|", IDC_LAST, &pagerLast_);
     mk(WS_TABSTOP | CBS_DROPDOWNLIST, 0, WC_COMBOBOXW, L"", IDC_PAGE_SIZE, &pagerSize_);
+    // 划归容器：父窗口改到 pagerHost_（命令 ID 不变，容器负责转回主窗口）
+    for (HWND h : { pagerFirst_, pagerPrev_, pagerLabel_, pagerNext_, pagerLast_, pagerSize_ })
+        if (h) SetParent(h, pagerHost_->Handle());
     for (int i = 0; i < kPageSizeCount; ++i) {
         wchar_t buf[32]; wsprintfW(buf, L"%d / 页", kPageSizes[i]);
         SendMessageW(pagerSize_, CB_ADDSTRING, 0, (LPARAM)buf);
@@ -742,11 +775,20 @@ void MainWindow::CreateSidePanel()
     LVCOLUMNW c = { LVCF_TEXT | LVCF_WIDTH, 0, 400, const_cast<LPWSTR>(L"目录") };
     ListView_InsertColumn(favList_, 0, &c);
 
-    // 把 tab_ 登记成容器的“标题行”（只负责切换、压在顶部），树/收藏作为容器内容
+    // 收藏页顶部的过滤框：边输入边筛列表（只影响显示，不动 favorites_）。
+    favFilter_ = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, L"",
+        WS_CHILD | WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL,
+        0, 0, 0, 0, sideHost_->Handle(), reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_FAV_FILTER)), hInst, nullptr);
+    if (uiFont_) SendMessageW(favFilter_, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+    SendMessageW(favFilter_, EM_SETCUEBANNER, TRUE,
+                 reinterpret_cast<LPARAM>(L"过滤收藏（名称或路径）"));
+
+    // 把 tab_ 登记成容器的“标题行”（只负责切换、压在顶部），树作为容器内容
     // 排在它下面。容器自身由分隔条当左窗格摆放，内部布局交给 LayoutSidebarInner。
+    // 收藏列表不登记给容器：收藏页要在列表上方留出过滤框的位置，由
+    // LayoutSidebarInner 自己摆（容器会把内容窗口铺满整块内容区）。
     sideHost_->SetTabStrip(tab_);
     sideHost_->AddContent(directoryTree_.Handle());
-    sideHost_->AddContent(favList_);
 
     SwitchSideTab(0);
     LoadFavorites(); // 启动时读回 sort= 配置和收藏列表
@@ -758,6 +800,7 @@ void MainWindow::SwitchSideTab(int index)
     // “定”按钮（同步目录树到当前分页）常驻 Tab 头，两种页都可见。
     ShowWindow(directoryTree_.Handle(), index == 0 ? SW_SHOW : SW_HIDE);
     ShowWindow(btnTreeSync_, SW_SHOW);
+    ShowWindow(favFilter_, index == 1 ? SW_SHOW : SW_HIDE);
     ShowWindow(favList_, index == 1 ? SW_SHOW : SW_HIDE);
     SendMessageW(tab_, TCM_SETCURSEL, index, 0);
     if (index == 1) LoadFavorites();
@@ -3315,12 +3358,35 @@ void MainWindow::SaveFavoritesCore(bool allowEmptyFavorites)
     fclose(f);
 }
 
+// 收藏过滤：不区分大小写的“包含”匹配（名称或完整路径命中都算）
+static std::wstring ToLowerCopy(const std::wstring& s)
+{
+    std::wstring r = s;
+    for (wchar_t& c : r) c = static_cast<wchar_t>(std::towlower(c));
+    return r;
+}
+
 void MainWindow::RefreshFavoritesList()
 {
+    // 行上的 lParam 是本函数 new 出来的路径字符串，ListView_DeleteAllItems 不会
+    // 释放它；过滤时每次击键都重刷，必须先逐行回收再清空。
+    for (int i = 0, n = ListView_GetItemCount(favList_); i < n; ++i) {
+        LVITEMW it{}; it.iItem = i; it.mask = LVIF_PARAM;
+        if (ListView_GetItem(favList_, &it))
+            delete reinterpret_cast<std::wstring*>(it.lParam);
+    }
     ListView_DeleteAllItems(favList_);
-    for (int i = 0; i < (int)favorites_.size(); ++i) {
+
+    std::wstring filter;
+    if (favFilter_) {
+        wchar_t buf[256]{};
+        GetWindowTextW(favFilter_, buf, ARRAYSIZE(buf));
+        filter = ToLowerCopy(buf);
+    }
+
+    int row = 0;
+    for (const std::wstring& dir : favorites_) {
         // 显示最后一段目录名
-        const std::wstring& dir = favorites_[i];
         std::wstring name = dir;
         size_t s = name.find_last_of(L'\\');
         if (s + 1 == name.size()) {           // 以 \ 结尾（盘符 C:\）
@@ -3329,9 +3395,13 @@ void MainWindow::RefreshFavoritesList()
         }
         if (s != std::wstring::npos) name = name.substr(s + 1);
 
+        if (!filter.empty() && ToLowerCopy(name).find(filter) == std::wstring::npos &&
+            ToLowerCopy(dir).find(filter) == std::wstring::npos)
+            continue;
+
         LVITEMW it{};
         it.mask = LVIF_TEXT | LVIF_PARAM | LVIF_IMAGE;
-        it.iItem = i;
+        it.iItem = row++;
         it.lParam = reinterpret_cast<LPARAM>(new std::wstring(dir));
         it.pszText = const_cast<LPWSTR>(name.c_str());
         it.iImage = shell::SysIconIndexForEntry(dir, true);
@@ -3347,23 +3417,27 @@ void MainWindow::OnAddFavorite()
         if (_wcsicmp(d.c_str(), CurTab().dir.c_str()) == 0) return;
     favorites_.push_back(CurTab().dir);
     SaveFavorites();
+    // 新加的项可能被当前过滤词挡掉：清空过滤框，保证一定能看到它
+    if (favFilter_) SetWindowTextW(favFilter_, L"");
     RefreshFavoritesList();
 }
 
 void MainWindow::OnRemoveFavorite()
 {
+    // 列表可能被过滤，行号不再等于 favorites_ 的下标：按行上挂的路径反查。
     int sel = ListView_GetNextItem(favList_, -1, LVNI_SELECTED);
-    if (sel < 0 || sel >= (int)favorites_.size()) return;
-    auto* p = reinterpret_cast<std::wstring*>([&] {
-        LVITEMW it{}; it.iItem = sel; it.mask = LVIF_PARAM;
-        ListView_GetItem(favList_, &it);
-        return it.lParam;
-    }());
-    delete p;
-    favorites_.erase(favorites_.begin() + sel);
+    if (sel < 0) return;
+    LVITEMW it{}; it.iItem = sel; it.mask = LVIF_PARAM;
+    if (!ListView_GetItem(favList_, &it)) return;
+    auto* p = reinterpret_cast<std::wstring*>(it.lParam);
+    if (p == nullptr) return;
+    std::wstring target = *p;
+    auto found = std::find_if(favorites_.begin(), favorites_.end(),
+        [&](const std::wstring& d) { return _wcsicmp(d.c_str(), target.c_str()) == 0; });
+    if (found != favorites_.end()) favorites_.erase(found);
     // 显式删除：允许写空文件（绕过防丢失保护，否则删掉的最后一条会被“恢复”）
     SaveFavoritesCore(favorites_.empty());
-    RefreshFavoritesList();
+    RefreshFavoritesList();   // 行上的 lParam 由这里统一回收
 }
 
 // ---------------------------------------------------------------------------
@@ -4380,6 +4454,8 @@ void MainWindow::RebuildSplitters(int totalWidth)
     // tab_ 是 sideHost_（PEShellPaneHost）的子窗口，随 sideHost_ 一起摘回主窗口即可，
     // 不能再单独 SetParent 到 hwnd_，否则会被拽出容器、不再位于 PEShellPaneHost 内。
     if (sideHost_) SetParent(sideHost_->Handle(), hwnd_);
+    // 右侧窗格区容器也摘回主窗口：下面要挂到新的外层拆分条右窗格下
+    if (rightWrap_) SetParent(rightWrap_->Handle(), hwnd_);
 
     DestroySplitWindows(L.root);
     L.nodes.clear();
@@ -4401,6 +4477,12 @@ void MainWindow::RebuildSplitters(int totalWidth)
         return;
     }
 
+    // 右侧窗格区容器挂到外层拆分条下：整个多窗格树都建在它里面（它是右窗格），它再
+    // 内部分成“多窗格(上) + 分页栏(下)”。这样外层拆分条能撑满整高，左栏目录树随之
+    // 满高，而右侧多窗格仍在分页栏处收住。
+    HWND rightHost = (rightWrap_ != nullptr) ? rightWrap_->Handle() : L.tree->m_hWnd;
+    if (rightWrap_) SetParent(rightWrap_->Handle(), L.tree->m_hWnd);
+
     L.root = BuildRightTree();
     // 分隔条窗口自顶向下建：子分隔条是父分隔条的子窗口
     std::function<void(int, HWND)> create = [&](int node, HWND parent) {
@@ -4415,7 +4497,7 @@ void MainWindow::RebuildSplitters(int totalWidth)
         create(nd.first, nd.bar->m_hWnd);
         create(nd.second, nd.bar->m_hWnd);
     };
-    create(L.root, L.tree->m_hWnd);
+    create(L.root, rightHost);
 
     // 窗格容器挂到各自叶子所属的那条分隔条下，并把两个窗格交给它
     std::function<void(int, HWND)> attach = [&](int node, HWND parent) {
@@ -4437,7 +4519,7 @@ void MainWindow::RebuildSplitters(int totalWidth)
         nd.bar->SetPanesNoUpdate(a, b);
         nd.bar->SetPosPermille(nd.permille);
     };
-    attach(L.root, L.tree->m_hWnd);
+    attach(L.root, rightHost);
 
     // 分隔条一动，主窗口就要把跟着它走的东西都重摆一遍、并回写位置：
     //   - 侧栏整体是 sideHost_（容器）这个左窗格，tab_ 只当顶部切换条、树/收藏是
@@ -4468,7 +4550,18 @@ void MainWindow::RebuildSplitters(int totalWidth)
         // 确保侧栏 Tab 始终在 PEShellPaneHost 内（它本就是 sideHost_ 的子窗口，
         // 这里再显式挂一次，抵消任何历史遗留的错位，避免跑到主窗口下）。
         if (tab_) SetParent(tab_, sideHost_->Handle());
-        L.tree->SetPanesNoUpdate(sideHost_->Handle(), right);
+        if (rightWrap_ != nullptr) {
+            // 多窗格树登记为右侧容器内容（填满除底部外的区域）
+            rightWrap_->SetList(right);
+            // 分页栏挂到右侧容器底部（固定高度，随分页开关 28<->0）
+            if (pagerHost_ != nullptr) {
+                SetParent(pagerHost_->Handle(), rightWrap_->Handle());
+                rightWrap_->SetBottomPane(pagerHost_->Handle(), paginationEnabled_ ? 28 : 0);
+            }
+            L.tree->SetPanesNoUpdate(sideHost_->Handle(), rightWrap_->Handle());
+        } else {
+            L.tree->SetPanesNoUpdate(sideHost_->Handle(), right);
+        }
         // 侧栏折叠态在重建分隔条后重新落实：会话恢复（pendingSidebarCollapsed_）和
         // 运行时折叠后改布局触发重建都要收起左窗格。SetSinglePaneMode 保留
         // m_xySplitterPos，展开后宽度原样回来，不会跳回默认 220。
@@ -4578,6 +4671,27 @@ bool MainWindow::LayoutSidebarInner()
             SetWindowPos(btnTreeSync_, HWND_TOP, nx, ny, nw, nh, SWP_NOACTIVATE | SWP_NOREDRAW);
         }
     }
+
+    // 收藏页：过滤框贴内容区顶部，列表占满其下剩余空间。内容区起点与 PaneHost
+    // 的排法一致（标题行高 + 6px 留白）；这两个控件不登记给容器，所以这里摆。
+    auto placeInHost = [&](HWND h, int x, int yy, int w, int hh) -> bool {
+        if (h == nullptr) return false;
+        RECT r{}; GetWindowRect(h, &r);
+        POINT org{ r.left, r.top };
+        ScreenToClient(sideHost_->Handle(), &org);
+        if (org.x == x && org.y == yy && r.right - r.left == w && r.bottom - r.top == hh)
+            return false;
+        SetWindowPos(h, nullptr, x, yy, w, hh,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+        return true;
+    };
+    const int kFilterH = 24;
+    const int contentY = tabH + 6;                 // 与 PaneHost 的 kStripPad 一致
+    const int listTop = contentY + kFilterH + 4;
+    int listH = (rc.bottom - rc.top) - listTop;
+    if (listH < 0) listH = 0;
+    moved |= placeInHost(favFilter_, 0, contentY, sideW, kFilterH);
+    moved |= placeInHost(favList_, 0, listTop, sideW, listH);
     return moved;
 }
 
@@ -4610,16 +4724,17 @@ void MainWindow::Layout()
         SIZE sz{};
         SendMessageW(toolbar_, TB_GETMAXSIZE, 0, reinterpret_cast<LPARAM>(&sz));
         int tbW = sz.cx > 0 ? sz.cx : 0;
-        place(toolbar_, 0, 0, tbW, 30);
+        // 工具栏窗口高度 = 按钮高度，且与地址栏同一条水平中线（kToolbarRowH 内居中）
+        place(toolbar_, 0, kToolbarTop, tbW, kToolbarBtnH);
         int ax = tbW + 6;                       // 地址栏从工具栏右侧之后开始
         int aw = W - ax - 4;
         if (aw < 80) { ax = 4; aw = W - 8; }    // 窗口太窄放不下工具栏时退回整行
         if (aw < 0) aw = 0;
-        place(address_, ax, y + 6, aw, 24);
+        place(address_, ax, kAddressTop, aw, kAddressH);
     } else {
-        place(address_, 268, y + 6, W - 272, 24);  // 兜底：未创建工具栏时
+        place(address_, 268, kAddressTop, W - 272, kAddressH);  // 兜底：未创建工具栏时
     }
-    y += 36;
+    y += kToolbarRowH;
 
     // 状态栏占据底部一条，先量出它的高度，分页栏放在它上面
     RECT rs; SendMessageW(status_, WM_SIZE, 0, MAKELPARAM(W, H));
@@ -4630,8 +4745,10 @@ void MainWindow::Layout()
 
     // 分页栏关闭时整条隐藏，28px 高度还给文件列表
     int pagerH = paginationEnabled_ ? 28 : 0;
-    int pagerY = H - statusH - pagerH;
-    int listH = pagerY - y;
+    // 拆分区整高：左栏目录树撑满到状态栏；右侧底部的分页栏由 rightWrap_ 从右窗格切出，
+    // 所以外层拆分条按整高摆，多窗格区再在 rightWrap_ 里让出底部 pagerH。
+    int fullH = H - statusH - y;
+    if (fullH < 0) fullH = 0;
 
     // 目录树 / 窗格区：整块交给分隔条树。
     // 布局（窗格数或形态）一变就得重建：现在窗格是分隔条的窗格，树形结构随布局变。
@@ -4649,7 +4766,7 @@ void MainWindow::Layout()
     // 只摆最外层那条分隔条：后面的级联由各条分隔条的 WM_SIZE 自己完成
     PaneSplitter* treeBar = (splitLayout_ != nullptr) ? splitLayout_->tree.get() : nullptr;
     if (treeBar != nullptr && treeBar->m_hWnd != nullptr) {
-        treeBar->MoveBar(0, y, W, listH);
+        treeBar->MoveBar(0, y, W, fullH);
         // 分隔条内部按千分比记位置，而会话里存的是像素宽度。尺寸定了就按像素
         // 精确落一次并重新登记比例，否则“像素→千分比→像素”每次启动都会缩一点。
         if (pendingSideWidth_ > 0) {
@@ -4671,6 +4788,9 @@ void MainWindow::Layout()
             geometryChanged_ = true;
         }
     }
+
+    // 右侧容器底部分页栏高度随分页开关变化（rightWrap_ 据此重排：多窗格变矮/满高）
+    if (rightWrap_) rightWrap_->SetBottomPane(pagerHost_ ? pagerHost_->Handle() : nullptr, pagerH);
 
     // 侧栏内部（目录树 / 收藏 / 定位按钮）相对侧栏 tab 摆放，
     // 侧栏自身的宽度/高度由它所属的那条分隔条给出。
@@ -4702,20 +4822,33 @@ void MainWindow::Layout()
     // 每个窗格的“+”按钮贴在其最后一个分页头右侧（UpdateNewTabButtons 里算）
     UpdateNewTabButtons();
 
-    // 分页栏：关闭分页开关时整条隐藏
-    {
-        HWND pagerCtls[] = { pagerFirst_, pagerPrev_, pagerLabel_, pagerNext_, pagerLast_, pagerSize_ };
-        for (HWND h : pagerCtls)
-            if (h) ShowWindow(h, paginationEnabled_ ? SW_SHOWNA : SW_HIDE);
-    }
-    if (paginationEnabled_) {
-        int px = 4;
-        place(pagerFirst_, px, pagerY + 2, 40, 24); px += 44;
-        place(pagerPrev_,  px, pagerY + 2, 40, 24); px += 44;
-        place(pagerLabel_, px, pagerY + 4, 160, 20); px += 164;
-        place(pagerNext_,  px, pagerY + 2, 40, 24); px += 44;
-        place(pagerLast_,  px, pagerY + 2, 40, 24); px += 48;
-        place(pagerSize_,  px, pagerY + 2, 100, 24);
+    // 分页栏控件：pagerHost_ 容器已由 rightWrap_ 当底部窗格摆好（贴在右侧窗格区底部），
+    // 这里只把控件摆进容器内，坐标相对容器原点。
+    if (pagerHost_ && pagerHost_->Handle()) {
+        HWND ph = pagerHost_->Handle();
+        if (paginationEnabled_) {
+            auto placeIn = [&](HWND h, int x, int yy, int w, int hh) {
+                if (h == nullptr) return;
+                RECT r{}; GetWindowRect(h, &r);
+                POINT org{ r.left, r.top };
+                ScreenToClient(ph, &org);            // 坐标相对容器
+                if (org.x == x && org.y == yy && r.right - r.left == w && r.bottom - r.top == hh)
+                    return;
+                geometryChanged_ = true;
+                SetWindowPos(h, nullptr, x, yy, w, hh,
+                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+            };
+            int px = 4;
+            placeIn(pagerFirst_, px, 2, 40, 24); px += 44;
+            placeIn(pagerPrev_,  px, 2, 40, 24); px += 44;
+            placeIn(pagerLabel_, px, 4, 160, 20); px += 164;
+            placeIn(pagerNext_,  px, 2, 40, 24); px += 44;
+            placeIn(pagerLast_,  px, 2, 40, 24); px += 48;
+            placeIn(pagerSize_,  px, 2, 100, 24);
+            ShowWindow(ph, SW_SHOWNA);
+        } else {
+            ShowWindow(ph, SW_HIDE);   // 关分页开关：整条隐藏（子控件随之隐藏）
+        }
     }
 
     // 状态栏自动布局
@@ -4946,6 +5079,11 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             }
             else if (nm->code == NM_RCLICK) {
                 auto* ni = reinterpret_cast<NMITEMACTIVATE*>(nm);
+                if (ni->iItem < 0) return 0;   // 空白处右键：没有可操作的收藏项
+                // 右键行先选中它，删除/打开都以该行为准（OnRemoveFavorite 取选中项）
+                ListView_SetItemState(favList_, ni->iItem,
+                                      LVIS_SELECTED | LVIS_FOCUSED,
+                                      LVIS_SELECTED | LVIS_FOCUSED);
                 POINT pt = ni->ptAction;
                 ClientToScreen(favList_, &pt);
                 HMENU menu = CreatePopupMenu();
@@ -5102,6 +5240,10 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                 CurTab().curPage = 0;
                 Navigate(CurTab().dir, false);
             }
+            return 0;
+        case IDC_FAV_FILTER:
+            // 输入即过滤：只重建收藏列表的显示行，不动 favorites_ 与磁盘
+            if (HIWORD(wp) == EN_CHANGE) RefreshFavoritesList();
             return 0;
         case IDC_ADDRESS:
             if (HIWORD(wp) == EN_KILLFOCUS || HIWORD(wp) == EN_ADDR_RETURN) {

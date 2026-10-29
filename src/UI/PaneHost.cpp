@@ -32,6 +32,8 @@ struct PaneHost::Impl : public ATL::CWindowImpl<Impl> {
     int stripH = kDefaultStripH;
     int tabTopPad_ = 0;   // 标题行上方的留白（侧栏用它和顶部工具栏拉开距离）
     int tabRightReserve_ = 0;  // 标题行右侧留宽（给 ▾/Q/0 等按钮让位，按钮移到条外）
+    HWND bottomPane_ = nullptr; // 底部窗格（固定高贴底，如分页栏）
+    int bottomH_ = 0;           // 底部窗格高度
 
     BEGIN_MSG_MAP_EX(Impl)
         MSG_WM_SIZE(OnSize)
@@ -139,12 +141,16 @@ struct PaneHost::Impl : public ATL::CWindowImpl<Impl> {
         int tabW = (w > tabRightReserve_) ? (w - tabRightReserve_) : w;
         if (tab) place(tab, 0, tabTopPad_, tabW, strip);
         const int contentY = tabTopPad_ + strip;
-        const int contentH = h - contentY - kEdgePad;
-        if (contentH <= 0) return;
-        if (list) place(list, kEdgePad, contentY, w - kEdgePad * 2, contentH);
-        // shell 视图宿主与列表重叠摆放，可见性由分页的 listMode 决定
-        for (HWND hwnd : contents)
-            place(hwnd, kEdgePad, contentY, w - kEdgePad * 2, contentH);
+        const int contentH = h - contentY - bottomH_;
+        if (contentH > 0) {
+            if (list) place(list, kEdgePad, contentY, w - kEdgePad * 2, contentH);
+            // shell 视图宿主与列表重叠摆放，可见性由分页的 listMode 决定
+            for (HWND hwnd : contents)
+                place(hwnd, kEdgePad, contentY, w - kEdgePad * 2, contentH);
+        }
+        // 底部窗格（如分页栏）：固定高度贴在容器底部，上面的内容区相应变矮
+        if (bottomPane_ && bottomH_ > 0)
+            place(bottomPane_, 0, h - bottomH_, w, bottomH_);
     }
 };
 
@@ -206,6 +212,14 @@ void PaneHost::SetTabRightReserve(int reserve)
     if (!impl_) return;
     impl_->tabRightReserve_ = reserve;
     Relayout();   // 改了留宽立即按新尺寸重摆
+}
+
+void PaneHost::SetBottomPane(HWND pane, int height)
+{
+    if (!impl_) return;
+    impl_->bottomPane_ = pane;
+    impl_->bottomH_ = height;
+    Relayout();
 }
 
 void PaneHost::SetTabStrip(HWND tab)
