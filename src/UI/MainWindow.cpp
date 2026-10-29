@@ -44,13 +44,27 @@ namespace {
 constexpr int kMinPaneSize = 7;
 constexpr int kBarEdgeSize = 3;
 
-// 顶部工具栏行：按钮高度同时也是工具栏窗口高度（不匹配会让文字在按钮里偏上），
+// 顶部工具栏行：普通按钮一排（不再用 ToolbarWindow32）。按钮高度同时也是窗口高度，
 // 行高 36 里上下各留 4px，按钮与右侧地址栏共用同一条水平中线。
 constexpr int kToolbarRowH = 36;
 constexpr int kToolbarBtnH = 28;
 constexpr int kToolbarTop = (kToolbarRowH - kToolbarBtnH) / 2;
 constexpr int kAddressH = 24;
 constexpr int kAddressTop = (kToolbarRowH - kAddressH) / 2;
+
+// 顶部工具栏按钮表：BuildChildren 按它创建，Layout 按它量宽从左往右摆。
+// groupEnd=true 表示一组到此结束，组与组之间多留一点空隙（原来是工具栏分隔条）。
+struct ToolbarBtn { const wchar_t* text; int id; bool groupEnd; };
+constexpr ToolbarBtn kToolbarBtns[] = {
+    { L"←", IDC_BACK,           false },
+    { L"→", IDC_FORWARD,        false },
+    { L"↑", IDC_UP,             false },
+    { L"刷新", IDC_REFRESH,     false },
+    { L"⌂", IDC_HOME,           true  },
+    { L"☰", IDC_SIDEBAR_TOGGLE, true  },
+    { L"菜单过滤词", IDC_MENU_FILTERS, false },
+    { L"设置", IDC_SETTINGS,    true  },
+};
 
 // 一条分隔条窗口。竖/横只是构造参数 m_bVertical 的差别，窗口类名与 Q-Dir 一致。
 class PaneSplitter : public ATL::CWindowImpl<PaneSplitter>,
@@ -609,46 +623,12 @@ void MainWindow::BuildChildren()
         return h;
     };
 
-    // 工具栏：用真正的 ToolbarWindow32 承载“后退/前进/上级/刷新/🏠/☰/菜单过滤词/设置”
-    // 等命令按钮（文本按钮，不挂图标列表，省去图标资源）。地址栏继续是独立 EDIT 控件，
-    // 摆在工具栏右侧（与资源管理器同款：工具栏 + 地址栏两带）。
-    toolbar_ = CreateWindowExW(0, TOOLBARCLASSNAMEW, nullptr,
-        WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | CCS_NODIVIDER | CCS_NORESIZE,
-        0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TOOLBAR)), hInst, nullptr);
-    if (toolbar_) {
-        SendMessageW(toolbar_, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
-        if (uiFont_) SendMessageW(toolbar_, WM_SETFONT, (WPARAM)uiFont_, TRUE);
-        // 按钮尺寸要在加按钮之前定好：BTNS_AUTOSIZE 只自动算宽度，高度取这里的值。
-        // 高度必须与 Layout 里给工具栏窗口的高度一致（kToolbarBtnH），否则按钮贴
-        // 在工具栏顶部、文字整体偏上。左右内边距让纯文本按钮的文字不贴边框。
-        SendMessageW(toolbar_, TB_SETBUTTONSIZE, 0, MAKELPARAM(0, kToolbarBtnH));
-        SendMessageW(toolbar_, TB_SETPADDING, 0, MAKELPARAM(10, 0));
-        SendMessageW(toolbar_, TB_SETMAXTEXTROWS, 1, 0);
-        // 文本按钮：iBitmap = I_IMAGENONE，纯文字由 iString 索引字符串池给出
-        static const wchar_t kTbTxt[] =
-            L"←\0→\0↑\0刷新\0⌂\0☰\0菜单过滤词\0设置\0";
-        SendMessageW(toolbar_, TB_ADDSTRINGW, 0, reinterpret_cast<LPARAM>(kTbTxt));
-
-        TBBUTTON b[] = {
-            { I_IMAGENONE, IDC_BACK,           TBSTATE_ENABLED, BTNS_AUTOSIZE, {0}, 0, 0 },
-            { I_IMAGENONE, IDC_FORWARD,        TBSTATE_ENABLED, BTNS_AUTOSIZE, {0}, 0, 1 },
-            { I_IMAGENONE, IDC_UP,             TBSTATE_ENABLED, BTNS_AUTOSIZE, {0}, 0, 2 },
-            { I_IMAGENONE, IDC_REFRESH,        TBSTATE_ENABLED, BTNS_AUTOSIZE, {0}, 0, 3 },
-            { I_IMAGENONE, IDC_HOME,           TBSTATE_ENABLED, BTNS_AUTOSIZE, {0}, 0, 4 },
-            { 8,           0,                  TBSTATE_ENABLED, BTNS_SEP,      {0}, 0, -1 },
-            { I_IMAGENONE, IDC_SIDEBAR_TOGGLE, TBSTATE_ENABLED, BTNS_AUTOSIZE, {0}, 0, 5 },
-            { 8,           0,                  TBSTATE_ENABLED, BTNS_SEP,      {0}, 0, -1 },
-            { I_IMAGENONE, IDC_MENU_FILTERS,   TBSTATE_ENABLED, BTNS_AUTOSIZE, {0}, 0, 6 },
-            { 8,           0,                  TBSTATE_ENABLED, BTNS_SEP,      {0}, 0, -1 },
-            { I_IMAGENONE, IDC_SETTINGS,       TBSTATE_ENABLED, BTNS_AUTOSIZE, {0}, 0, 7 },
-        };
-        SendMessageW(toolbar_, TB_ADDBUTTONSW, ARRAYSIZE(b), reinterpret_cast<LPARAM>(b));
-        // 按钮高度必须与工具栏窗口高度(kToolbarBtnH=28)一致：窗口由 Layout 以
-        // kToolbarBtnH 摆放，若这里又把高度设小(如 26)，按钮面比窗口矮，glyph(←→↑⌂☰)
-        // 与文字整体偏上、和右侧地址栏(同一条水平中线)不对齐。
-        SendMessageW(toolbar_, TB_SETBUTTONSIZE, 0, MAKELPARAM(0, kToolbarBtnH));
-        SendMessageW(toolbar_, TB_AUTOSIZE, 0, 0);
-    }
+    // 顶部工具栏：普通按钮一排（原 ToolbarWindow32 已去掉，按钮表见 kToolbarBtns）。
+    // 地址栏继续是独立 EDIT 控件，摆在按钮行右侧（与资源管理器同款：工具栏 + 地址栏两带）。
+    toolbarBtns_.assign(ARRAYSIZE(kToolbarBtns), nullptr);
+    for (size_t i = 0; i < ARRAYSIZE(kToolbarBtns); ++i)
+        mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, kToolbarBtns[i].text,
+           kToolbarBtns[i].id, &toolbarBtns_[i]);
     mk(WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, WC_EDITW, L"", IDC_ADDRESS, &address_);
     // 子类化地址栏：原过程存 GWLP_USERDATA，回车跳转靠 AddressProc
     SetWindowLongPtrW(address_, GWLP_USERDATA,
@@ -4719,20 +4699,30 @@ void MainWindow::Layout()
                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
     };
 
-    // 工具栏（ToolbarWindow32）：左对齐排按钮；地址栏接在它右侧，占满剩余宽度。
-    if (toolbar_) {
-        SIZE sz{};
-        SendMessageW(toolbar_, TB_GETMAXSIZE, 0, reinterpret_cast<LPARAM>(&sz));
-        int tbW = sz.cx > 0 ? sz.cx : 0;
-        // 工具栏窗口高度 = 按钮高度，且与地址栏同一条水平中线（kToolbarRowH 内居中）
-        place(toolbar_, 0, kToolbarTop, tbW, kToolbarBtnH);
-        int ax = tbW + 6;                       // 地址栏从工具栏右侧之后开始
+    // 顶部工具栏：普通按钮从左往右排，宽度按各自文字量出；地址栏接在最后一个
+    // 按钮右侧，占满剩余宽度。按钮与地址栏同一条水平中线（kToolbarRowH 内居中）。
+    if (toolbarBtns_.size() == ARRAYSIZE(kToolbarBtns)) {
+        HDC dc = GetDC(hwnd_);
+        HFONT oldFont = uiFont_ ? (HFONT)SelectObject(dc, uiFont_) : nullptr;
+        int x = 0;
+        for (size_t i = 0; i < ARRAYSIZE(kToolbarBtns); ++i) {
+            const ToolbarBtn& b = kToolbarBtns[i];
+            SIZE sz{};
+            GetTextExtentPoint32W(dc, b.text, (int)wcslen(b.text), &sz);
+            const int w = sz.cx + 16;        // 左右各留 8px：文字不贴按钮边框
+            place(toolbarBtns_[i], x, kToolbarTop, w, kToolbarBtnH);
+            x += w + 2;                      // 按钮之间的间距
+            if (b.groupEnd) x += 6;          // 组与组之间多留空（原来是分隔条）
+        }
+        if (oldFont) SelectObject(dc, oldFont);
+        ReleaseDC(hwnd_, dc);
+        int ax = x - 2 + 6;                  // 末尾多的那次间距还原，再留空给地址栏
         int aw = W - ax - 4;
-        if (aw < 80) { ax = 4; aw = W - 8; }    // 窗口太窄放不下工具栏时退回整行
+        if (aw < 80) { ax = 4; aw = W - 8; } // 窗口太窄放不下按钮行时退回整行
         if (aw < 0) aw = 0;
         place(address_, ax, kAddressTop, aw, kAddressH);
     } else {
-        place(address_, 268, kAddressTop, W - 272, kAddressH);  // 兜底：未创建工具栏时
+        place(address_, 268, kAddressTop, W - 272, kAddressH);  // 兜底：未创建按钮时
     }
     y += kToolbarRowH;
 
