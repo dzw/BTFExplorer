@@ -1023,6 +1023,19 @@ void MainWindow::CreatePane(Pane& p)
     // 主窗口归一化 lParam 后按它区分是哪条地址栏。默认隐藏，ApplyPaneAddressBars 决定。
     p.address = CreateAddressCombo(host, IDC_ADDRESS, false, uiFont_);
     SubclassAddressEdit(p.address);
+
+    // 地址栏左侧的导航按钮（←/→/↑/⌂）：每窗格一套，点的是这个窗格的当前分页。
+    // 父窗口是容器，WM_COMMAND 由容器转回主窗口；默认隐藏，独立地址栏模式才显示。
+    static const wchar_t* kNavLabels[4] = { L"←", L"→", L"↑", L"⌂" };
+    for (int k = 0; k < 4; ++k) {
+        p.navBtns[k] = CreateWindowExW(0, WC_BUTTONW, kNavLabels[k],
+            WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
+            0, 0, 0, 0, host,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_NAVBASE + p.tag * 4 + k)),
+            hInst, nullptr);
+        if (uiFont_) SendMessageW(p.navBtns[k], WM_SETFONT, (WPARAM)uiFont_, TRUE);
+    }
+    p.host->SetNavButtons(p.navBtns, 4);
 }
 
 // 分配当前未被占用的窗格编号（最多同时 4 个窗格，编号池 0~7 足够）
@@ -1058,6 +1071,7 @@ void MainWindow::RemovePane(size_t idx)
     if (panes_[idx].lblPaneTag) DestroyWindow(panes_[idx].lblPaneTag);
     if (panes_[idx].btnTools) DestroyWindow(panes_[idx].btnTools);
     panes_[idx].address = nullptr;   // 独立地址栏是容器子窗口，随容器一起销毁
+    for (HWND& b : panes_[idx].navBtns) b = nullptr;   // 导航按钮同样随容器销毁
     panes_.erase(panes_.begin() + idx);   // 该窗格分页的 shell 视图宿主随 TabState 析构销毁
     for (auto& t : tabs_)
         if (t.pane > idx) --t.pane;
@@ -1135,6 +1149,10 @@ void MainWindow::ApplyPaneAddressBars()
         p.host->SetAddressBar(p.address, paneAddressBars_ ? kAddressH : 0);
         if (p.address)
             ShowWindow(p.address, paneAddressBars_ ? SW_SHOW : SW_HIDE);
+        // 导航按钮（←/→/↑/⌂）跟地址栏一起走：独立模式才显示
+        for (int k = 0; k < 4; ++k)
+            if (p.navBtns[k])
+                ShowWindow(p.navBtns[k], paneAddressBars_ ? SW_SHOW : SW_HIDE);
     }
     if (address_ != nullptr)
         ShowWindow(address_, paneAddressBars_ ? SW_HIDE : SW_SHOW);
@@ -4951,6 +4969,14 @@ void MainWindow::Layout()
         int x = 0;
         for (size_t i = 0; i < ARRAYSIZE(kToolbarBtns); ++i) {
             const ToolbarBtn& b = kToolbarBtns[i];
+            // 独立地址栏模式：←/→/↑/⌂ 已下放到各窗格地址栏左侧，顶部这几个隐藏让位
+            if (paneAddressBars_ &&
+                (b.id == IDC_BACK || b.id == IDC_FORWARD ||
+                 b.id == IDC_UP || b.id == IDC_HOME)) {
+                ShowWindow(toolbarBtns_[i], SW_HIDE);
+                continue;    // 不占宽度：后面按钮左移补位
+            }
+            ShowWindow(toolbarBtns_[i], SW_SHOW);
             // 量按钮自己的当前文字：地址栏开关的文字随模式变（共用 ⇄ 独立）
             wchar_t btxt[64]{};
             GetWindowTextW(toolbarBtns_[i], btxt, ARRAYSIZE(btxt));
@@ -5365,6 +5391,22 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         case IDC_UP:      PostMessageW(hwnd_, WM_APP_NAV, IDC_UP, 0); return 0;
         case IDC_HOME:    PostMessageW(hwnd_, WM_APP_NAV, IDC_HOME, 0); return 0;
         default:
+            // 每个窗格一套导航按钮（←/→/↑/⌂，独立地址栏模式下随地址栏显示），
+            // 命令 ID = IDC_NAVBASE + tag*4 + {0后退 1前进 2上级 3主页}。
+            // 点的是那个窗格的当前分页：目标窗格不是激活窗格时先切过去，
+            // 再复用顶部导航的同一条延后路径（WM_APP_NAV 读的是激活窗格）。
+            if (id >= IDC_NAVBASE && id < IDC_NAVBASE + 16) {
+                const int tag = (id - IDC_NAVBASE) / 4;
+                const int k = (id - IDC_NAVBASE) % 4;
+                for (size_t i = 0; i < panes_.size(); ++i) {
+                    if (panes_[i].tag != tag) continue;
+                    if (i != activePane_) SelectPane(i);
+                    break;
+                }
+                static const int kNavCmd[4] = { IDC_BACK, IDC_FORWARD, IDC_UP, IDC_HOME };
+                PostMessageW(hwnd_, WM_APP_NAV, kNavCmd[k], 0);
+                return 0;
+            }
             // 每个窗格一个“+”按钮，命令 ID 落在 IDC_NEWTAB_BASE..+7 区间
             if (id >= IDC_NEWTAB_BASE && id < IDC_NEWTAB_BASE + 8) {
                 int tag = id - IDC_NEWTAB_BASE;

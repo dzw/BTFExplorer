@@ -18,6 +18,11 @@ constexpr int kEdgePad = 0;        // 内容区（列表 / shell 视图）齐边
 constexpr int kStripPad = 6;       // 分页标题行下方的留白
 constexpr int kDefaultStripH = 30; // 分页头未量到时的标题行高度（24 行高 + 留白）
 constexpr wchar_t kBlankHitClass[] = L"PEShellTabBlankHit";
+// 独立地址栏行左侧的导航按钮带（Q-Dir 同款：←/→/↑/⌂ 挤在地址栏左边）
+constexpr int kNavBtnW = 28;  // 单个导航按钮宽
+constexpr int kNavGap = 2;    // 按钮间距
+constexpr int kNavPad = 4;    // 带左侧留白（也是带与地址栏之间的缝）
+constexpr int kNavMax = 4;    // 最多 4 个（←/→/↑/⌂）
 }
 
 // 容器窗口本体。分页栏、列表、shell 视图宿主都由主窗口创建后登记进来，
@@ -28,6 +33,8 @@ struct PaneHost::Impl : public ATL::CWindowImpl<Impl> {
     HWND tab = nullptr;
     HWND addressBar = nullptr;  // 顶部地址栏行（每窗格独立地址栏，主窗口创建后登记）
     int addressH = 0;           // 地址栏行高（0 = 不启用，不占行）
+    HWND navBtns[kNavMax] = {}; // 地址栏行左侧的导航按钮（←/→/↑/⌂，显隐由主窗口控制）
+    int navCount = 0;
     HWND blankHit = nullptr;
     HWND list = nullptr;
     std::vector<HWND> contents;
@@ -141,9 +148,16 @@ struct PaneHost::Impl : public ATL::CWindowImpl<Impl> {
                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
         };
         int tabW = (w > tabRightReserve_) ? (w - tabRightReserve_) : w;
-        // 顶部地址栏行（每窗格独立地址栏）：压在最上，分页栏与内容区整体下移让位
+        // 顶部地址栏行（每窗格独立地址栏）：压在最上，分页栏与内容区整体下移让位。
+        // 导航按钮带（←/→/↑/⌂）挤在地址栏左边，地址栏只占剩下的宽度。
         const int addrH = (addressBar != nullptr && addressH > 0) ? addressH : 0;
-        if (addressBar) place(addressBar, 0, 0, w, addrH);
+        int navW = 0;
+        for (int i = 0; i < navCount && i < kNavMax; ++i) {
+            if (navBtns[i] == nullptr) continue;
+            place(navBtns[i], kNavPad + i * (kNavBtnW + kNavGap), 0, kNavBtnW, addrH);
+            navW = kNavPad + (i + 1) * (kNavBtnW + kNavGap);
+        }
+        if (addressBar) place(addressBar, navW, 0, (w > navW) ? (w - navW) : 0, addrH);
         if (tab) place(tab, 0, addrH + tabTopPad_, tabW, strip);
         const int contentY = addrH + tabTopPad_ + strip;
         const int contentH = h - contentY - bottomH_;
@@ -233,6 +247,17 @@ void PaneHost::SetAddressBar(HWND edit, int height)
     impl_->addressBar = edit;
     impl_->addressH = height;
     Relayout();   // 行高变了立即重摆（显示/隐藏由主窗口控制）
+}
+
+void PaneHost::SetNavButtons(const HWND* btns, int count)
+{
+    if (!impl_) return;
+    impl_->navCount = (count > kNavMax) ? kNavMax : count;
+    for (int i = 0; i < impl_->navCount; ++i)
+        impl_->navBtns[i] = btns[i];
+    for (int i = impl_->navCount; i < kNavMax; ++i)
+        impl_->navBtns[i] = nullptr;
+    Relayout();
 }
 
 void PaneHost::SetTabStrip(HWND tab)

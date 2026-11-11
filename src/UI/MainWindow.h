@@ -30,6 +30,8 @@ enum {
     IDC_TOOLS_BASE = 1210,     // 每个窗格一个“▾”外部工具按钮，命令 ID = IDC_TOOLS_BASE + tag
     IDC_VIEWMODE_BASE = 1220,  // 每个窗格一个“Q”列表实现切换按钮，命令 ID = IDC_VIEWMODE_BASE + tag
     IDC_PANEHOST_BASE = 1240,  // 每个窗格的容器窗口（PaneHost）控件 ID = 基址 + tag
+    IDC_NAVBASE = 1260,        // 每个窗格的导航按钮（←/→/↑/⌂，独立地址栏模式下随地址栏显示）
+                               // 命令 ID = IDC_NAVBASE + tag*4 + {0后退 1前进 2上级 3主页}
     IDC_LAYOUT1 = 1020, IDC_LAYOUT2 = 1021, IDC_LAYOUT3 = 1022, IDC_LAYOUT4 = 1023,
     IDC_TRI_PINTOP = 1024, IDC_TRI_PINDOWN = 1025,
     IDC_MENU_FILTERS = 1026,
@@ -110,6 +112,7 @@ struct Pane {
     HWND btnNewTab = nullptr;                // 本窗格的“+”新增分页按钮
     HWND btnTools = nullptr;                 // 本窗格右上角的“▾”外部工具按钮
     HWND address = nullptr;                  // 本窗格的独立地址栏（paneAddressBars_ 开时显示）
+    HWND navBtns[4] = { nullptr, nullptr, nullptr, nullptr }; // 地址栏左侧的 ←/→/↑/⌂
 };
 
 // 资源管理器主窗口：树 + 虚拟 ListView + 地址栏 + 分页栏 + 状态栏。
