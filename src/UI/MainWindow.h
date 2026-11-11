@@ -351,6 +351,9 @@ private:
     // “地址栏模式”：共用 = 只有顶部一条（默认）；独立 = 每个窗格容器顶部一条自己的。
     // 切换时套用模式：登记/摘除窗格地址栏、显示/隐藏顶部共用地址栏并重排。
     bool paneAddressBars_ = false;
+    // 地址栏/外部打开传入的是文件路径时先记下它，所在目录加载完成后（OnPageLoaded）
+    // 在列表里选中该文件。单次生效：用掉即清空。
+    std::wstring pendingSelectFile_;
     void ApplyPaneAddressBars();
     // 顶部工具栏的“地址栏”开关：点一下在“共用 ⇄ 每窗格独立”之间切换并落盘
     void ToggleAddressBarMode();

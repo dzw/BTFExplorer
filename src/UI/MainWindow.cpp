@@ -263,11 +263,47 @@ static std::wstring AddressDisplayText(const std::wstring& path)
 
 // 地址栏输入的逆映射：用户手输“此电脑/我的电脑”这类友好名时转成
 // shell 命名空间路径，否则 SHParseDisplayName 解析不到、回车无反应。
+// file:/// 形式的 URL 转本地路径：去前缀、%xx 解码、'/' 换 '\'。
+// 例：file:///f%3A/My%20Documents/report.html -> f:\My Documents\report.html
+static std::wstring FileUrlToPath(const std::wstring& t)
+{
+    const wchar_t kPrefix[] = L"file://";
+    size_t off = _wcsnicmp(t.c_str(), kPrefix, 7) == 0 ? 7 : 0;
+    if (off == 0) return {};
+    std::wstring p = t.substr(off);
+    if (!p.empty() && p[0] == L'/') p.erase(0, 1);   // file:/// 前缀里的第三个 '/'
+    std::wstring out;
+    out.reserve(p.size());
+    for (size_t i = 0; i < p.size(); ++i) {
+        if (p[i] == L'%' && i + 2 < p.size()) {
+            auto hex = [](wchar_t c) -> int {
+                if (c >= L'0' && c <= L'9') return c - L'0';
+                if (c >= L'a' && c <= L'f') return c - L'a' + 10;
+                if (c >= L'A' && c <= L'F') return c - L'A' + 10;
+                return -1;
+            };
+            int hi = hex(p[i + 1]), lo = hex(p[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out += static_cast<wchar_t>((hi << 4) | lo);
+                i += 2;
+                continue;
+            }
+        }
+        out += (p[i] == L'/') ? L'\\' : p[i];
+    }
+    return out;
+}
+
 static std::wstring AddressInputToPath(const std::wstring& text)
 {
     std::wstring t = text;
     while (!t.empty() && (t.back() == L' ' || t.back() == L'\\')) t.pop_back();
     if (t.empty()) return text;
+    // file:/// URL（浏览器/文件管理器拖出来的地址）解码成本地路径
+    if (_wcsnicmp(t.c_str(), L"file://", 7) == 0) {
+        std::wstring p = FileUrlToPath(t);
+        return p.empty() ? text : p;
+    }
     if (_wcsicmp(t.c_str(), L"此电脑") == 0 ||
         _wcsicmp(t.c_str(), L"我的电脑") == 0 ||
         _wcsicmp(t.c_str(), L"This PC") == 0 ||
@@ -2470,6 +2506,30 @@ void MainWindow::OnPageLoaded()
     CurTab().pages->PrefetchAround(CurTab().curPage);
     UpdateStatusBar();
     UpdatePaginationBar();
+
+    // 地址栏/外部打开传入的文件目标：所在目录这一页装进来后选中该文件。
+    // 单次尝试：无论是否命中（比如文件不在当前页）都清掉挂起，避免迟到的误选中。
+    if (!pendingSelectFile_.empty()) {
+        std::wstring dir = pendingSelectFile_;
+        size_t s = dir.find_last_of(L'\\');
+        std::wstring name = (s != std::wstring::npos) ? dir.substr(s + 1) : dir;
+        if (s != std::wstring::npos && s > 0) dir.resize(s);
+        if (_wcsicmp(dir.c_str(), CurTab().dir.c_str()) == 0) {
+            HWND lv = CurList();
+            const int n = static_cast<int>(CurTab().pageItems.size());
+            for (int i = 0; i < n; ++i) {
+                const FileEntry& e = CurTab().pageItems[i];
+                if (_wcsicmp(e.name.c_str(), name.c_str()) != 0) continue;
+                ListView_SetItemState(lv, -1, 0, LVIS_SELECTED);   // 清旧选中
+                ListView_SetItemState(lv, i,
+                                      LVIS_SELECTED | LVIS_FOCUSED,
+                                      LVIS_SELECTED | LVIS_FOCUSED);
+                ListView_EnsureVisible(lv, i, FALSE);
+                break;
+            }
+        }
+        pendingSelectFile_.clear();
+    }
 }
 
 // 更新外部变化监视集：所有分页的当前目录 + 目录树所有已展开节点
@@ -3369,6 +3429,8 @@ void MainWindow::OpenTarget(const std::wstring& rawPath)
     if (attr & FILE_ATTRIBUTE_DIRECTORY) {
         NavigateFromSidebar(path);
     } else {
+        // 文件：跳到所在目录并挂起选中，加载完成后列表里选中它
+        pendingSelectFile_ = path;
         size_t s = path.find_last_of(L'\\');
         if (s != std::wstring::npos && s > 0) NavigateFromSidebar(path.substr(0, s));
     }
@@ -5605,8 +5667,23 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                     // 锁定只挡关闭与地址变化：激活的是锁定分页时，改走侧栏同款逻辑，
                     // 在同一窗格里新开一个分页打开新地址，不动锁定分页本身
                     NavMuteGuard mute(&navSoundMute_);   // Q-Dir：地址栏提交不响导航音
-                    if (CurTab().locked) NavigateFromSidebar(buf);
-                    else Navigate(buf);
+                    // 输入指向一个存在的文件（或 file:/// URL 解出来的文件）：
+                    // 跳到它所在的目录，加载完成后选中该文件
+                    std::wstring target = NormalizePath(AddressInputToPath(buf));
+                    DWORD attr = GetFileAttributesW(target.c_str());
+                    if (attr != INVALID_FILE_ATTRIBUTES &&
+                        !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                        pendingSelectFile_ = target;
+                        size_t s = target.find_last_of(L'\\');
+                        std::wstring dir = (s != std::wstring::npos && s > 0)
+                                               ? target.substr(0, s) : target;
+                        if (CurTab().locked) NavigateFromSidebar(dir);
+                        else Navigate(dir);
+                    } else if (CurTab().locked) {
+                        NavigateFromSidebar(buf);
+                    } else {
+                        Navigate(buf);
+                    }
                     AddAddressHistory(bar, CurTab().dir);   // Q-Dir：提交的路径进下拉历史
                 }
                 // 交还焦点给当前窗格的“内容区”：Q 视图分页要给视图窗口，
