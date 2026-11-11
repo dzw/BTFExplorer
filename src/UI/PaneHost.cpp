@@ -149,18 +149,20 @@ struct PaneHost::Impl : public ATL::CWindowImpl<Impl> {
                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
         };
         int tabW = (w > tabRightReserve_) ? (w - tabRightReserve_) : w;
-        // 顶部地址栏行（每窗格独立地址栏）：压在最上，分页栏与内容区整体下移让位。
-        // 导航按钮带（←/→/↑/⌂）挤在地址栏左边，地址栏只占剩下的宽度。
+        // 窗格内两行顺序：分页栏贴容器顶，地址栏行（导航按钮+地址栏）在其下，
+        // 内容区再往下。只有分页栏时（侧栏）行为不变；只有地址栏行时它贴顶。
         const int addrH = (addressBar != nullptr && addressH > 0) ? addressH : 0;
+        if (tab) place(tab, 0, tabTopPad_, tabW, strip);
+        const int addrY = (tab != nullptr) ? (tabTopPad_ + strip) : 0;
+        // 导航按钮带（←/→/↑/⌂）挤在地址栏左边，地址栏只占剩下的宽度
         int navW = 0;
         for (int i = 0; i < navCount && i < kNavMax; ++i) {
             if (navBtns[i] == nullptr) continue;
-            place(navBtns[i], kNavPad + i * (kNavBtnW + kNavGap), 0, kNavBtnW, addrH);
+            place(navBtns[i], kNavPad + i * (kNavBtnW + kNavGap), addrY, kNavBtnW, addrH);
             navW = kNavPad + (i + 1) * (kNavBtnW + kNavGap);
         }
-        if (addressBar) place(addressBar, navW, 0, (w > navW) ? (w - navW) : 0, addrH);
-        if (tab) place(tab, 0, addrH + tabTopPad_, tabW, strip);
-        const int contentY = addrH + tabTopPad_ + strip + topReserve_;
+        if (addressBar) place(addressBar, navW, addrY, (w > navW) ? (w - navW) : 0, addrH);
+        const int contentY = addrY + addrH + topReserve_;
         const int contentH = h - contentY - bottomH_;
         if (contentH > 0) {
             if (list) place(list, kEdgePad, contentY, w - kEdgePad * 2, contentH);

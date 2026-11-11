@@ -59,13 +59,13 @@ constexpr int kAddressHistoryMax = 10;
 // groupEnd=true 表示一组到此结束，组与组之间多留一点空隙（原来是工具栏分隔条）。
 struct ToolbarBtn { const wchar_t* text; int id; bool groupEnd; };
 constexpr ToolbarBtn kToolbarBtns[] = {
+    { L"地址栏:共用", IDC_ADDRBAR_TOGGLE, true  },  // 开关放最前：文字随模式变（共用 ⇄ 独立）
     { L"←", IDC_BACK,           false },
     { L"→", IDC_FORWARD,        false },
     { L"↑", IDC_UP,             false },
     { L"刷新", IDC_REFRESH,     false },
     { L"⌂", IDC_HOME,           true  },
     { L"☰", IDC_SIDEBAR_TOGGLE, true  },
-    { L"地址栏:共用", IDC_ADDRBAR_TOGGLE, false },  // 开关：文字随模式变（共用 ⇄ 独立）
     { L"菜单过滤词", IDC_MENU_FILTERS, false },
     { L"设置", IDC_SETTINGS,    true  },
 };
@@ -4331,8 +4331,8 @@ void MainWindow::UpdateNewTabButtons()
                 POINT o{ 0, 0 };
                 MapWindowPoints(p.host->Handle(), hwnd_, &o, 1);  // 宿主原点 -> 主窗口坐标
                 int baseX = o.x + (hc.right - hc.left);            // 窗格最右（主窗口坐标）
-                // 独立地址栏模式：容器顶部那行归地址栏，按钮行随分页条下移
-                int topY  = o.y + (paneAddressBars_ ? kAddressH : 0) + 1;
+                // 分页条贴窗格顶（地址行已对调到其下），▾/Q/编号 按钮随条在窗格顶
+                int topY  = o.y + 1;
                 int toolsX = baseX - 24;                          // “▾”最右
                 SetWindowPos(p.btnTools, HWND_TOP, toolsX, topY, 24, 20,
                              SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -4962,18 +4962,24 @@ void MainWindow::Layout()
     };
 
     // 状态栏高度先量出来（fullH 要扣掉它）。
-    // 独立地址栏模式：分隔条（窗格区+侧栏）顶到窗口第 0 行——侧栏“目录树/收藏”
-    // 分页条与全局按钮/过滤框合成顶部一行，窗格区由 rightWrap_ 顶部预留行让位。
+    // 两种地址栏模式分隔条都顶到窗口第 0 行：侧栏“目录树/收藏”分页条固定在
+    // 第 0 行左侧，切模式不上下跳。两种模式顶部都只有一行全局行，
+    // 窗格区从其下开始（rightWrap_ 顶部预留）。
     RECT rs; SendMessageW(status_, WM_SIZE, 0, MAKELPARAM(W, H));
     GetWindowRect(status_, &rs);
     int statusH = rs.bottom - rs.top;
-    y += paneAddressBars_ ? 0 : kToolbarRowH;
 
-    // 顶部工具栏按钮：
-    //   共用模式：普通按钮从左往右排一行（整行归按钮），地址栏另起一行（见下方分隔条之后）。
-    //   独立模式：侧栏“目录树/收藏”分页条上移到窗口第 0 行左侧（分隔条顶到 y=0），
-    //            全局按钮（刷新/☰/地址栏开关/菜单过滤词/设置）排在分页条右侧同一行，
-    //            过滤框贴右；窗格区从这一行下方开始（rightWrap_ 顶部预留 kToolbarRowH）。
+    // 顶部工具栏一行（两种模式同构，都以目录树右缘为起点，不压侧栏上方）：
+    //   共用模式：[地址栏:共用][←→↑刷新⌂][☰][菜单过滤词][设置][地址栏……][过滤框]，
+    //            地址栏接在“设置”按钮后面同一行，不再单独占一行；
+    //   独立模式：[地址栏:独立][刷新][☰][菜单过滤词][设置][过滤框]（←/→/↑/⌂ 在各窗格）。
+    //   窗格区都从这一行下方开始（rightWrap_ 顶部预留 kToolbarRowH）。
+    int rowX = 0;
+    if (sidebarVisible_) {
+        PaneSplitter* tb = (splitLayout_ != nullptr) ? splitLayout_->tree.get() : nullptr;
+        rowX = (tb != nullptr && tb->m_hWnd != nullptr) ? tb->GetPos() : sideWidth_;
+        if (rowX < 0) rowX = 0;
+    }
     if (toolbarBtns_.size() == ARRAYSIZE(kToolbarBtns)) {
         int bw[ARRAYSIZE(kToolbarBtns)] = {};
         HDC dc = GetDC(hwnd_);
@@ -5000,33 +5006,35 @@ void MainWindow::Layout()
         if (oldFont) SelectObject(dc, oldFont);
         ReleaseDC(hwnd_, dc);
 
-        // 独立模式：全局行的起点 = 侧栏右缘（分页条占侧栏那一段）；侧栏折叠则从 0 起
-        int rowX = 0;
-        if (paneAddressBars_ && sidebarVisible_) {
-            PaneSplitter* tb = (splitLayout_ != nullptr) ? splitLayout_->tree.get() : nullptr;
-            rowX = (tb != nullptr && tb->m_hWnd != nullptr) ? tb->GetPos() : sideWidth_;
-            if (rowX < 0) rowX = 0;
-        }
-        int x = paneAddressBars_ ? rowX + 4 : 0;
+        int x = rowX + 4;
         for (size_t i = 0; i < ARRAYSIZE(kToolbarBtns); ++i) {
             if (bw[i] < 0) continue;
             place(toolbarBtns_[i], x, kToolbarTop, bw[i], kToolbarBtnH);
             x += bw[i] + 2;                      // 按钮之间的间距
             if (kToolbarBtns[i].groupEnd) x += 6; // 组与组之间多留空（原来是分隔条）
         }
-        if (paneAddressBars_) {
-            // 过滤框贴右，与按钮同一行；按钮/过滤框要提到 rightWrap_ 的 z 序上面
-            //（它建得晚，会盖住先建的这些控件；其顶部预留行正好是空的）
-            if (listFilter_ != nullptr) {
-                place(listFilter_, W - 4 - kListFilterW, kAddressTop, kListFilterW, kAddressH);
-                SetWindowPos(listFilter_, HWND_TOP, 0, 0, 0, 0,
-                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-            }
-            for (size_t i = 0; i < ARRAYSIZE(kToolbarBtns); ++i)
-                if (bw[i] >= 0)
-                    SetWindowPos(toolbarBtns_[i], HWND_TOP, 0, 0, 0, 0,
-                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        // 共用模式：地址栏接在最后一个按钮（“设置”）后面同一行，占到过滤框左缘；
+        // 过滤框两种模式都贴右缘、与按钮同一行。
+        if (!paneAddressBars_ && address_ != nullptr) {
+            const int fx = W - 4 - kListFilterW;
+            int aw = fx - x - 8;
+            if (aw < 0) aw = 0;
+            ShowWindow(address_, SW_SHOW);
+            place(address_, x + 4, kAddressTop, aw, kAddressH);
         }
+        if (listFilter_ != nullptr) {
+            place(listFilter_, W - 4 - kListFilterW, kAddressTop, kListFilterW, kAddressH);
+            SetWindowPos(listFilter_, HWND_TOP, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        // 控件要提到 rightWrap_/treeBar 的 z 序上面（它们建得晚；顶部预留行正好是空的）
+        for (size_t i = 0; i < ARRAYSIZE(kToolbarBtns); ++i)
+            if (bw[i] >= 0)
+                SetWindowPos(toolbarBtns_[i], HWND_TOP, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        if (!paneAddressBars_ && address_ != nullptr)
+            SetWindowPos(address_, HWND_TOP, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 
     // 分页栏关闭时整条隐藏，28px 高度还给文件列表
@@ -5075,32 +5083,17 @@ void MainWindow::Layout()
         }
     }
 
-    // 地址栏：与侧栏“目录树/收藏”分页条同一高度（sideHost_ 顶在 y=kToolbarRowH，
-    // SetTabTopPad(0) 所以分页条顶就是 y），X 对齐目录树右边的分隔条；侧栏折叠时
-    // 分隔条记的位置不变，改按 sidebarVisible_ 贴回窗口左缘。右侧固定宽留给过滤框。
-    if (address_ != nullptr) {
-        int ax = 0;
-        if (sidebarVisible_ && treeBar != nullptr && treeBar->m_hWnd != nullptr)
-            ax = treeBar->GetPos();
-        else if (sidebarVisible_)
-            ax = sideWidth_;                 // 分隔条还没建好时用会话宽度兜底
-        int fx = W - 4 - kListFilterW;       // 过滤框贴右缘
-        int aw = fx - ax - 4;
-        if (aw < 0) aw = 0;
-        // 独立地址栏模式：顶部共用地址栏隐藏（每窗格自己的地址栏在容器里），
-        // 过滤框也已收进状态栏（见上方工具栏段），这里只管共用模式的摆放
+    // 独立地址栏模式：顶部共用地址栏隐藏（每窗格自己的地址栏在容器里）；
+    // 共用模式的摆放已在上方工具栏段完成（接在“设置”按钮后面同一行）
+    if (address_ != nullptr)
         ShowWindow(address_, paneAddressBars_ ? SW_HIDE : SW_SHOW);
-        if (!paneAddressBars_) {
-            place(address_, ax, kToolbarRowH, aw, kAddressH);
-            place(listFilter_, fx, kToolbarRowH, kListFilterW, kAddressH);
-        }
-    }
 
-    // 右侧容器底部分页栏高度随分页开关变化（rightWrap_ 据此重排：多窗格变矮/满高）；
-    // 独立地址栏模式顶部再让出一行给全局行（侧栏分页条+全局按钮+过滤框）
+    // 右侧容器底部分页栏高度随分页开关变化（rightWrap_ 据此重排：多窗格变矮/满高）。
+    // 顶部两种模式都只让出一行全局行（侧栏分页条+全局按钮+地址栏/过滤框），
+    // 多窗格分页条从其下缘开始。
     if (rightWrap_) {
         rightWrap_->SetBottomPane(pagerHost_ ? pagerHost_->Handle() : nullptr, pagerH);
-        rightWrap_->SetTopReserve(paneAddressBars_ ? kToolbarRowH : 0);
+        rightWrap_->SetTopReserve(kToolbarRowH);
     }
 
     // 侧栏内部（目录树 / 收藏 / 定位按钮）相对侧栏 tab 摆放，
