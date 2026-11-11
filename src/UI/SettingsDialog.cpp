@@ -18,6 +18,7 @@ enum {
     IDC_OPT_APPLY = 1049,   // “应用”按钮（即时生效，对话框不关闭）
     IDC_OPT_NAVSOUND = 1050,
     IDC_OPT_NOEXPANDICON = 1051,
+    IDC_OPT_PANEADDR = 1052,   // 每个窗格独立地址栏
 };
 
 constexpr wchar_t kDlgClass[] = L"PagedExplorerSettingsBox";
@@ -26,7 +27,7 @@ constexpr wchar_t kRunValue[]  = L"PagedExplorer";
 
 // 对话框尺寸（高度要盖住非客户区：标题栏 + 边框约占 30px）
 // 加了“目录树”分组后内容变高，留足余量避免最下一项压到底部按钮行
-constexpr int kDlgW = 404, kDlgH = 440;
+constexpr int kDlgW = 404, kDlgH = 480;
 
 // 模态期间共享的状态（同一时刻只有一个设置对话框）
 struct State {
@@ -76,6 +77,7 @@ void ReadControls(HWND h)
     g.data.autoStart  = (Button_GetCheck(GetDlgItem(h, IDC_OPT_STARTUP)) == BST_CHECKED);
     g.data.navSound   = (Button_GetCheck(GetDlgItem(h, IDC_OPT_NAVSOUND)) == BST_CHECKED);
     g.data.noExpandIcon = (Button_GetCheck(GetDlgItem(h, IDC_OPT_NOEXPANDICON)) == BST_CHECKED);
+    g.data.paneAddressBars = (Button_GetCheck(GetDlgItem(h, IDC_OPT_PANEADDR)) == BST_CHECKED);
 }
 
 LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
@@ -261,9 +263,14 @@ bool Show(HWND owner, HFONT font, SettingsData& data,
     HWND cNoExp = chk(L"禁止展开图标（三角形）", IDC_OPT_NOEXPANDICON, 34, 272);
     Button_SetCheck(cNoExp, g.data.noExpandIcon ? BST_CHECKED : BST_UNCHECKED);
 
+    // ---- 地址栏 ----
+    lab(L"地址栏", 20, 304, 200);
+    HWND cPaneAddr = chk(L"每个窗格独立地址栏（否则共用顶部地址栏）", IDC_OPT_PANEADDR, 34, 326);
+    Button_SetCheck(cPaneAddr, g.data.paneAddressBars ? BST_CHECKED : BST_UNCHECKED);
+
     // ---- 启动 ----
-    lab(L"启动", 20, 302, 200);
-    HWND cStart = chk(L"Windows 启动时运行本应用", IDC_OPT_STARTUP, 34, 324);
+    lab(L"启动", 20, 356, 200);
+    HWND cStart = chk(L"Windows 启动时运行本应用", IDC_OPT_STARTUP, 34, 378);
     Button_SetCheck(cStart, g.data.autoStart ? BST_CHECKED : BST_UNCHECKED);
 
     // 按钮贴客户区底部：以前用 kDlgH-40 定位，没扣掉标题栏/边框高度，

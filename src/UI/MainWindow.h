@@ -36,6 +36,7 @@ enum {
     IDC_TREE_SYNC = 1027,    // 侧栏 Tab 头上的“定位”：把目录树同步到当前分页
     IDC_SIDEBAR_TOGGLE = 1052,   // 顶部工具栏“☰”按钮：显示/隐藏左侧目录树+收藏侧栏
     IDC_HOME = 1053,             // 顶部工具栏“🏠”按钮：跳转到“我的电脑”
+    IDC_ADDRBAR_TOGGLE = 1054,   // 顶部工具栏“地址栏”开关：共用 ⇄ 每窗格独立
     IDC_TREEHOST = 1029,   // 目录树宿主容器（Q-Dir 同款：Dialog 包住 NamespaceTreeControl）
     IDC_SETTINGS = 1028,   // 工具栏“设置”按钮（对话框控件 ID 见 SettingsDialog.cpp）
     // 分页标题右键菜单：关闭 / 关闭其他 / 关闭右边 / 锁定
@@ -52,6 +53,7 @@ enum {
     IDC_FOCUS_ADDRESS = 1067, // F4 激活地址栏并全选
     IDC_PANES4 = 1068,       // Alt+主键盘4 = 四窗格（田字）；不对称三窗格是 Alt+小键盘4/6
     IDC_FAV_FILTER = 1069,   // 收藏页顶部的过滤输入框
+    IDC_LIST_FILTER = 1070,  // 地址栏右侧的列表过滤输入框（作用于激活分页的自绘列表）
 };
 
 // 每个右侧分页的独立状态（目录/页码/历史/加载器各自独立）
@@ -60,6 +62,7 @@ struct TabState {
     std::vector<std::wstring> history;
     int histPos = -1;
     std::vector<FileEntry> pageItems;
+    std::vector<FileEntry> fullItems; // 过滤激活时保留的“过滤前整页条目”（清过滤词后还原用）
     size_t curPage = 0;
     size_t shownPage = SIZE_MAX;   // pageItems 当前显示的页号（SIZE_MAX=未显示/已换目录）
     bool pageStale = false;        // 目录被外部改动：显示内容可能过期，等整页重载后换入
@@ -106,6 +109,7 @@ struct Pane {
     int lastTabRight = 0;                    // 最后一个 tab 头右缘（“+”按钮定位用）
     HWND btnNewTab = nullptr;                // 本窗格的“+”新增分页按钮
     HWND btnTools = nullptr;                 // 本窗格右上角的“▾”外部工具按钮
+    HWND address = nullptr;                  // 本窗格的独立地址栏（paneAddressBars_ 开时显示）
 };
 
 // 资源管理器主窗口：树 + 虚拟 ListView + 地址栏 + 分页栏 + 状态栏。
@@ -169,8 +173,11 @@ private:
     HWND  CurList() const;            // 激活窗格的 ListView
     void RefreshList();               // 重新请求当前页（活动窗格）
     void RefreshPaneList(size_t paneIdx); // 重新请求指定窗格当前分页（外部变化刷新用）
-    void SwapInPage(size_t paneIdx, TabState& t, HWND list,
+    void SwapInPage(size_t paneIdx, size_t tabIndex, TabState& t, HWND list,
                     std::vector<FileEntry> fresh); // 后台加载完成的一页一次性换入显示
+    // 地址栏右侧过滤框：按名称/路径过滤激活分页的自绘列表（shell 视图分页置灰）
+    void ApplyListFilterToTab(size_t tabIndex); // 把过滤词应用到指定分页（空词=还原整页）
+    void UpdateListFilterTarget();              // 切分页/窗格时还原旧分页、过滤新目标
     void UpdateWatcher();             // 把当前应监视的目录集推给 DirWatcher
     void OnExternalDirChanged(const std::wstring& dir);
     void RefreshListFromDisk();       // 文件增删改后：清分页缓存再刷新（防旧缓存）
@@ -246,6 +253,9 @@ private:
 
     // 数据
     HWND hwnd_ = nullptr, address_ = nullptr;
+    HWND listFilter_ = nullptr;          // 地址栏右侧的列表过滤输入框
+    std::wstring listFilterText_;        // 当前过滤词（作用于 filterTab_ 指向的分页）
+    size_t filterTab_ = SIZE_MAX;        // 过滤词当前作用到的分页（tabs_ 下标）
     TrayIcon trayIcon_;
     DirectoryTree directoryTree_;
     HWND tab_ = nullptr, favList_ = nullptr, btnTreeSync_ = nullptr; // 左侧 Tab / 收藏 / 树同步
@@ -328,6 +338,23 @@ private:
     int  PaneOfShellView(const ShellFolderView* view) const; // shell 视图 -> 窗格下标
     void ShellViewContextMenu(size_t pi, POINT screenPt); // shell 视图内右键菜单（同自绘列表那套）
     int  PaneOfTab(HWND h) const;       // Tab 容器 hwnd -> 窗格下标
+    int  PaneOfAddress(HWND h) const;   // 窗格独立地址栏 hwnd -> 窗格下标
+    int  PaneOfHost(HWND h) const;      // 窗格容器 hwnd -> 窗格下标
+    // 地址栏是 ComboBoxEx：通知的 lParam 可能是 comboex 本体、内层 combobox 或内层
+    // edit，统一向上归一化成“登记的那个 comboex 句柄”（顶部共用 / 某窗格独立）
+    HWND TopAddressControl(HWND h) const;
+    // Q-Dir sub_41AF8F(...,10)：提交过的路径进下拉历史，去重、新的在最上、最多 10 条
+    void AddAddressHistory(HWND bar, const std::wstring& path);
+    // “地址栏模式”：共用 = 只有顶部一条（默认）；独立 = 每个窗格容器顶部一条自己的。
+    // 切换时套用模式：登记/摘除窗格地址栏、显示/隐藏顶部共用地址栏并重排。
+    bool paneAddressBars_ = false;
+    void ApplyPaneAddressBars();
+    // 顶部工具栏的“地址栏”开关：点一下在“共用 ⇄ 每窗格独立”之间切换并落盘
+    void ToggleAddressBarMode();
+    // 开关按钮的文字跟着模式走（“地址栏:共用” / “地址栏:独立”），与设置对话框互相同步
+    void SyncAddrbarToggleBtn();
+    // 把各窗格独立地址栏的文本对齐到该窗格当前分页的目录（文本没变不写，不抢输入）
+    void UpdatePaneAddressBars();
     TabState& PaneActiveTab(size_t pi); // 指定窗格当前显示的分页
     TabState& RenderedTab(size_t pi);   // 指定窗格“列表里那几行”所属的分页
     std::wstring PaneItemPath(size_t pi, int item); // 指定窗格某行的完整路径

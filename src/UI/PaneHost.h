@@ -23,6 +23,7 @@ public:
 
     // 内部控件由主窗口创建并持有生命周期，这里只登记“归容器摆放”
     void SetTabStrip(HWND tab);        // 分页栏（只占标题行）
+    void SetAddressBar(HWND edit, int height); // 顶部地址栏行（每窗格独立地址栏；height<=0=不占行）
     void SetTabTopPad(int pad);        // 标题行上方的留白（侧栏用它和顶部工具栏拉开距离）
     void SetTabRightReserve(int reserve); // 标题行右侧留宽（给 ▾/Q/0 等按钮让位，按钮移到条外）
     void SetBottomPane(HWND pane, int height); // 底部窗格（固定高贴底，如分页栏）；上面内容区相应变矮

@@ -45,12 +45,15 @@ constexpr int kMinPaneSize = 7;
 constexpr int kBarEdgeSize = 3;
 
 // 顶部工具栏行：普通按钮一排（不再用 ToolbarWindow32）。按钮高度同时也是窗口高度，
-// 行高 36 里上下各留 4px，按钮与右侧地址栏共用同一条水平中线。
+// 行高 36 里上下各留 4px。地址栏不在这一行，摆在下方与侧栏分页条同高的位置。
 constexpr int kToolbarRowH = 36;
 constexpr int kToolbarBtnH = 28;
 constexpr int kToolbarTop = (kToolbarRowH - kToolbarBtnH) / 2;
 constexpr int kAddressH = 24;
 constexpr int kAddressTop = (kToolbarRowH - kAddressH) / 2;
+constexpr int kListFilterW = 160;   // 地址栏右侧过滤框的固定宽度
+// 地址栏下拉历史的条数上限（Q-Dir sub_41AF8F 的 10：去重、新的在最上）
+constexpr int kAddressHistoryMax = 10;
 
 // 顶部工具栏按钮表：BuildChildren 按它创建，Layout 按它量宽从左往右摆。
 // groupEnd=true 表示一组到此结束，组与组之间多留一点空隙（原来是工具栏分隔条）。
@@ -62,6 +65,7 @@ constexpr ToolbarBtn kToolbarBtns[] = {
     { L"刷新", IDC_REFRESH,     false },
     { L"⌂", IDC_HOME,           true  },
     { L"☰", IDC_SIDEBAR_TOGGLE, true  },
+    { L"地址栏:共用", IDC_ADDRBAR_TOGGLE, false },  // 开关：文字随模式变（共用 ⇄ 独立）
     { L"菜单过滤词", IDC_MENU_FILTERS, false },
     { L"设置", IDC_SETTINGS,    true  },
 };
@@ -309,6 +313,35 @@ static LRESULT CALLBACK AddressProc(HWND h, UINT m, WPARAM wp, LPARAM lp); // �
 static LRESULT CALLBACK PaneTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp); // 分页拖拽 tab 子类化
 static LRESULT CALLBACK SideTabProc(HWND h, UINT m, WPARAM wp, LPARAM lp);
 
+// 地址栏 = Q-Dir 的 ComboBoxEx32（sub_415A6B：样式 0x50000042 =
+// WS_CHILD|WS_VISIBLE|CBS_AUTOHSCROLL|CBS_DROPDOWN，无边框、无 WS_TABSTOP）。
+// 顶部共用地址栏和每窗格独立地址栏都用这一个构造函数。
+static HWND CreateAddressCombo(HWND parent, int id, bool visible, HFONT font)
+{
+    DWORD style = WS_CHILD | CBS_DROPDOWN | CBS_AUTOHSCROLL;
+    if (visible) style |= WS_VISIBLE;
+    HWND bar = CreateWindowExW(0, L"ComboBoxEx32", L"", style,
+        0, 0, 0, 0, parent,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+        reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(parent, GWLP_HINSTANCE)), nullptr);
+    if (font) SendMessageW(bar, WM_SETFONT, (WPARAM)font, TRUE);
+    return bar;
+}
+
+// 子类化 ComboBoxEx 的内层编辑框（CBEM_GETEDITCONTROL）：原过程存 GWLP_USERDATA，
+// 回车跳转靠 AddressProc（Q-Dir sub_410724 里 sub_40B623 子类化的同款手法）
+static void SubclassAddressEdit(HWND bar)
+{
+    if (bar == nullptr) return;
+    HWND edit = reinterpret_cast<HWND>(SendMessageW(bar, CBEM_GETEDITCONTROL, 0, 0));
+    if (edit == nullptr) {
+        WriteAppLog(L"ADDR combo edit control not ready; Enter-to-go not hooked");
+        return;
+    }
+    SetWindowLongPtrW(edit, GWLP_USERDATA, GetWindowLongPtrW(edit, GWLP_WNDPROC));
+    SetWindowLongPtrW(edit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&AddressProc));
+}
+
 // ListView 列（列序契约见 FileList.h：0=名称 1=类型 2=大小 3=修改日期）
 enum { COL_NAME = 0, COL_TYPE, COL_SIZE, COL_MTIME };
 
@@ -515,6 +548,8 @@ MainWindow* MainWindow::Create(HINSTANCE hInst)
     // 会话里恢复的“禁止展开图标(三角形)”要在建树之后再套用一次：
     // 侧栏（含目录树）在 BuildChildren 里就建好了，那时还没读到会话值
     self->directoryTree_.SetClassicExpandIcons(self->noExpandIcon_);
+    // 会话里恢复的“地址栏模式”要在窗格都建好之后套用（建窗格时地址栏默认隐藏）
+    self->ApplyPaneAddressBars();
     self->SyncPagerSizeCombo(); // 会话里恢复的“每页项数”要反映到分页栏下拉框
     ShowWindow(self->hwnd_, self->startupShowCmd_);
     UpdateWindow(self->hwnd_);
@@ -569,6 +604,7 @@ void MainWindow::OpenSettings()
     data.triLayout = triLayout_;
     data.navSound = navSound_;
     data.noExpandIcon = noExpandIcon_;
+    data.paneAddressBars = paneAddressBars_;
     if (!settings::GetAutoStart(data.autoStart)) return;
     const bool prevAutoStart = data.autoStart;
 
@@ -582,6 +618,10 @@ void MainWindow::OpenSettings()
         if (d.autoStart != prevAutoStart)
             settings::SetAutoStart(d.autoStart);
         navSound_ = d.navSound;
+        if (d.paneAddressBars != paneAddressBars_) {
+            paneAddressBars_ = d.paneAddressBars;
+            ApplyPaneAddressBars();   // 共用 ⇄ 独立地址栏即时切换（内部会重排）
+        }
         if (d.noExpandIcon != noExpandIcon_) {
             noExpandIcon_ = d.noExpandIcon;
             // 三角/箭头 ⇄ 经典 +/- 方框，即时切换
@@ -624,17 +664,20 @@ void MainWindow::BuildChildren()
     };
 
     // 顶部工具栏：普通按钮一排（原 ToolbarWindow32 已去掉，按钮表见 kToolbarBtns）。
-    // 地址栏继续是独立 EDIT 控件，摆在按钮行右侧（与资源管理器同款：工具栏 + 地址栏两带）。
+    // 地址栏继续是独立 EDIT 控件，Layout 里摆在侧栏“目录树/收藏”分页条的同一高度，
+    // X 对齐目录树右边的分隔条（与资源管理器“工具栏一行、地址栏一行”的分层同款）。
     toolbarBtns_.assign(ARRAYSIZE(kToolbarBtns), nullptr);
     for (size_t i = 0; i < ARRAYSIZE(kToolbarBtns); ++i)
         mk(WS_TABSTOP | BS_PUSHBUTTON, 0, WC_BUTTONW, kToolbarBtns[i].text,
            kToolbarBtns[i].id, &toolbarBtns_[i]);
-    mk(WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, WC_EDITW, L"", IDC_ADDRESS, &address_);
-    // 子类化地址栏：原过程存 GWLP_USERDATA，回车跳转靠 AddressProc
-    SetWindowLongPtrW(address_, GWLP_USERDATA,
-                      GetWindowLongPtrW(address_, GWLP_WNDPROC));
-    SetWindowLongPtrW(address_, GWLP_WNDPROC,
-                      reinterpret_cast<LONG_PTR>(&AddressProc));
+    // 地址栏：Q-Dir 同款 ComboBoxEx32（可下拉选历史路径），回车在 AddressProc 处理
+    address_ = CreateAddressCombo(hwnd_, IDC_ADDRESS, true, uiFont_);
+    SubclassAddressEdit(address_);
+    // 地址栏右侧的列表过滤框：边输入边筛激活分页的自绘列表（ApplyListFilterToTab）
+    mk(WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, WC_EDITW, L"", IDC_LIST_FILTER, &listFilter_);
+    if (uiFont_) SendMessageW(listFilter_, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+    SendMessageW(listFilter_, EM_SETCUEBANNER, TRUE,
+                 reinterpret_cast<LPARAM>(L"过滤当前列表（名称或路径）"));
 
     // 左侧 Tab 容器（目录树 / 收藏）
     CreateSidePanel();
@@ -790,6 +833,27 @@ void MainWindow::SwitchSideTab(int index)
 // 工具栏“☰”：显示/隐藏左侧目录树+收藏侧栏。
 // 用分隔条的 SetSinglePaneMode：折叠左窗格（侧栏）而保留 m_xySplitterPos，
 // 下次展开时窗格宽度原样回来，不会跳回默认 220。
+// 顶部工具栏“地址栏”开关：共用 ⇄ 每窗格独立（与设置对话框里的复选框同一状态）
+void MainWindow::ToggleAddressBarMode()
+{
+    paneAddressBars_ = !paneAddressBars_;
+    ApplyPaneAddressBars();   // 内部会重排并同步开关按钮文字
+    SaveSession();            // 模式是会话状态，立即落盘
+    WriteAppLog((L"TOGGLE_ADDRBAR mode=" +
+                 std::to_wstring(paneAddressBars_ ? 1 : 0)).c_str());
+}
+
+void MainWindow::SyncAddrbarToggleBtn()
+{
+    for (size_t i = 0; i < ARRAYSIZE(kToolbarBtns); ++i) {
+        if (kToolbarBtns[i].id == IDC_ADDRBAR_TOGGLE && toolbarBtns_[i] != nullptr) {
+            SetWindowTextW(toolbarBtns_[i],
+                           paneAddressBars_ ? L"地址栏:独立" : L"地址栏:共用");
+            return;
+        }
+    }
+}
+
 void MainWindow::ToggleSidebar()
 {
     if (splitLayout_ == nullptr || splitLayout_->tree == nullptr) return;
@@ -953,6 +1017,12 @@ void MainWindow::CreatePane(Pane& p)
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
         0, 0, 24, 20, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TOOLS_BASE + p.tag)), hInst, nullptr);
     if (uiFont_) SendMessageW(p.btnTools, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+
+    // 本窗格自己的地址栏：Q-Dir 同款 ComboBoxEx32（sub_410724 在窗格建立时创建），
+    // 控件 ID 与顶部共用地址栏相同。父窗口是容器，WM_COMMAND 由容器转回主窗口，
+    // 主窗口归一化 lParam 后按它区分是哪条地址栏。默认隐藏，ApplyPaneAddressBars 决定。
+    p.address = CreateAddressCombo(host, IDC_ADDRESS, false, uiFont_);
+    SubclassAddressEdit(p.address);
 }
 
 // 分配当前未被占用的窗格编号（最多同时 4 个窗格，编号池 0~7 足够）
@@ -987,6 +1057,7 @@ void MainWindow::RemovePane(size_t idx)
     if (panes_[idx].btnViewMode) DestroyWindow(panes_[idx].btnViewMode);
     if (panes_[idx].lblPaneTag) DestroyWindow(panes_[idx].lblPaneTag);
     if (panes_[idx].btnTools) DestroyWindow(panes_[idx].btnTools);
+    panes_[idx].address = nullptr;   // 独立地址栏是容器子窗口，随容器一起销毁
     panes_.erase(panes_.begin() + idx);   // 该窗格分页的 shell 视图宿主随 TabState 析构销毁
     for (auto& t : tabs_)
         if (t.pane > idx) --t.pane;
@@ -1006,6 +1077,86 @@ int MainWindow::PaneOfTab(HWND h) const
     for (size_t i = 0; i < panes_.size(); ++i)
         if (panes_[i].tab == h) return (int)i;
     return -1;
+}
+
+int MainWindow::PaneOfAddress(HWND h) const
+{
+    for (size_t i = 0; i < panes_.size(); ++i)
+        if (panes_[i].address == h) return (int)i;
+    return -1;
+}
+
+int MainWindow::PaneOfHost(HWND h) const
+{
+    for (size_t i = 0; i < panes_.size(); ++i)
+        if (panes_[i].host != nullptr && panes_[i].host->Handle() == h) return (int)i;
+    return -1;
+}
+
+// 通知的 lParam 可能是 ComboBoxEx 本体、它内层的 combobox 或内层 edit
+//（ComboBoxEx 转发子控件通知时不保证换成自己的句柄）。一路向上找，直到父窗口
+// 是主窗口（顶部共用地址栏本体）或窗格容器（窗格独立地址栏本体）为止。
+HWND MainWindow::TopAddressControl(HWND h) const
+{
+    HWND top = h;
+    while (top != nullptr) {
+        HWND parent = GetParent(top);
+        if (parent == hwnd_) break;                 // 顶部共用地址栏本体
+        if (parent != nullptr && PaneOfHost(parent) >= 0) break;  // 窗格地址栏本体
+        top = parent;                               // 内层 edit / 内层 combobox：继续向上
+    }
+    return top;
+}
+
+// Q-Dir sub_41AF8F(...,10)：提交过的路径进该地址栏的下拉历史——去重、新的在最上、
+// 最多 10 条。CB_ 消息发给 ComboBoxEx 会自动转发到内层 combobox。
+void MainWindow::AddAddressHistory(HWND bar, const std::wstring& path)
+{
+    if (bar == nullptr || path.empty()) return;
+    int idx = (int)SendMessageW(bar, CB_FINDSTRINGEXACT, -1,
+                                reinterpret_cast<LPARAM>(path.c_str()));
+    if (idx != CB_ERR)
+        SendMessageW(bar, CB_DELETESTRING, idx, 0);
+    SendMessageW(bar, CB_INSERTSTRING, 0, reinterpret_cast<LPARAM>(path.c_str()));
+    int cnt = (int)SendMessageW(bar, CB_GETCOUNT, 0, 0);
+    for (int i = cnt - 1; i >= kAddressHistoryMax; --i)
+        SendMessageW(bar, CB_DELETESTRING, i, 0);
+}
+
+// 应用“地址栏模式”：
+//   共用（默认）：只有顶部一条地址栏，跟激活窗格/分页走；
+//   独立：每个窗格容器顶部一条自己的地址栏，显示该窗格当前分页的目录，
+//         顶部共用地址栏隐藏。设置界面切换、启动恢复会话后调用。
+void MainWindow::ApplyPaneAddressBars()
+{
+    for (Pane& p : panes_) {
+        if (p.host == nullptr) continue;
+        // height<=0 时容器不再给地址栏留行（编辑框隐藏即可，不用销毁）
+        p.host->SetAddressBar(p.address, paneAddressBars_ ? kAddressH : 0);
+        if (p.address)
+            ShowWindow(p.address, paneAddressBars_ ? SW_SHOW : SW_HIDE);
+    }
+    if (address_ != nullptr)
+        ShowWindow(address_, paneAddressBars_ ? SW_HIDE : SW_SHOW);
+    UpdatePaneAddressBars();
+    SyncAddrbarToggleBtn();   // 工具栏开关文字跟随模式（启动恢复/设置切换/开关点击都会走这）
+    Layout();   // 窗格内容区高度变了（地址栏占行/让行），整体重排
+}
+
+// 把各窗格独立地址栏的文本对齐到该窗格当前分页的目录。
+// 只在文本不同时才写：用户正在输入还没提交（EN_KILLFOCUS/回车）时不抢文本和选中。
+void MainWindow::UpdatePaneAddressBars()
+{
+    if (!paneAddressBars_) return;
+    for (size_t i = 0; i < panes_.size(); ++i) {
+        Pane& p = panes_[i];
+        if (p.address == nullptr) continue;
+        wchar_t buf[MAX_PATH * 2] = {};
+        GetWindowTextW(p.address, buf, ARRAYSIZE(buf));
+        std::wstring want = AddressDisplayText(PaneActiveTab(i).dir);
+        if (buf != want)
+            SetWindowTextW(p.address, want.c_str());
+    }
 }
 
 TabState& MainWindow::PaneActiveTab(size_t pi)
@@ -1231,6 +1382,8 @@ void MainWindow::SaveSession()
     putLine(L"pagination=" + std::to_wstring(paginationEnabled_ ? 1 : 0));
     putLine(L"navsound=" + std::to_wstring(navSound_ ? 1 : 0));
     putLine(L"noexpandicon=" + std::to_wstring(noExpandIcon_ ? 1 : 0));
+    // 地址栏模式：0=全窗格共用顶部一条 1=每个窗格独立一条
+    putLine(L"paneaddr=" + std::to_wstring(paneAddressBars_ ? 1 : 0));
     putLine(L"pageSize=" + std::to_wstring(pageSize_));
     // 记录窗口位置/尺寸。
     // 非最大化/最小化时改用 GetWindowRect 取“真实屏幕矩形”，这样能正确捕获
@@ -1436,6 +1589,10 @@ bool MainWindow::RestoreSession()
                 noExpandIcon_ = (_wtoi(w.c_str() + 13) != 0);
                 continue;
             }
+            if (w.rfind(L"paneaddr=", 0) == 0) {
+                paneAddressBars_ = (_wtoi(w.c_str() + 9) != 0);
+                continue;
+            }
             if (w.rfind(L"pageSize=", 0) == 0) {
                 int v = _wtoi(w.c_str() + 9);
                 // 只接受下拉框里真实存在的档位，避免手改文件后把分页搞坏
@@ -1616,6 +1773,8 @@ void MainWindow::SelectRightTab(size_t index)
         if (p.tabs[k] == index) { p.active = k; break; }
     SendMessageW(p.tab, TCM_SETCURSEL, p.active, 0);
     SetWindowTextW(address_, t.dir.c_str());
+    UpdatePaneAddressBars();    // 独立地址栏模式：文本对齐各自窗格的当前分页
+    UpdateListFilterTarget();   // 过滤词换目标：还原旧分页、过滤新分页
     InvalidateTabStrips(prevPane);
     RefreshList();
     SyncTreeToCurrentTab(false);
@@ -1632,6 +1791,8 @@ void MainWindow::SelectPane(size_t index)
     activePane_ = index;
     activeTab_ = p.tabs[p.active];
     SetWindowTextW(address_, CurTab().dir.c_str());
+    UpdatePaneAddressBars();    // 独立地址栏模式：文本对齐各自窗格的当前分页
+    UpdateListFilterTarget();   // 过滤词换目标：还原旧分页、过滤新分页
     InvalidateTabStrips(prevPane);
     RefreshList();
     SyncTreeToCurrentTab(false);
@@ -1801,6 +1962,7 @@ void MainWindow::ReorderTabInPane(size_t paneIdx, int toSlot)
     if (paneIdx == activePane_) {
         activeTab_ = tabIndex;
         SetWindowTextW(address_, AddressDisplayText(tabs_[tabIndex].dir).c_str());
+        UpdatePaneAddressBars();    // 独立地址栏模式：目标窗格的地址栏跟上
         RefreshPaneList(paneIdx);
         SyncShellView(paneIdx);
     }
@@ -1847,6 +2009,8 @@ void MainWindow::UpdateRightTabLabels()
     }
     // 标题宽度变化会移动最后一个 tab 头右缘：立即同步各窗格“+”按钮，避免重叠/错位
     UpdateNewTabButtons();
+    // 独立地址栏模式：分页增删/移动后各窗格当前分页可能变了，文本跟着对齐
+    UpdatePaneAddressBars();
 }
 
 // 分页在本窗格里的序号（找不到返回 SIZE_MAX）
@@ -1994,6 +2158,14 @@ void MainWindow::RemoveTab(size_t index, bool& paneEmptied)
     }
     if (activeTab_ > index) --activeTab_;
     else if (activeTab_ >= tabs_.size() && !tabs_.empty()) activeTab_ = tabs_.size() - 1;
+    // 过滤目标分页关掉：清掉过滤词并还原输入框，别让下标指向错位的分页
+    if (filterTab_ != SIZE_MAX) {
+        if (filterTab_ == index) {
+            filterTab_ = SIZE_MAX;
+            listFilterText_.clear();
+            if (listFilter_) SetWindowTextW(listFilter_, L"");
+        } else if (filterTab_ > index) --filterTab_;
+    }
     paneEmptied = p.tabs.empty();
 }
 
@@ -2129,6 +2301,7 @@ void MainWindow::Navigate(const std::wstring& rawPath, bool addHistory)
     t.shownPage = SIZE_MAX;   // 显示页号作废
     t.pageStale = true;
     SetWindowTextW(address_, AddressDisplayText(path).c_str());
+    UpdatePaneAddressBars();  // 独立地址栏模式：该窗格自己的地址栏也要跟上
 
     if (addHistory) {
         if (!t.history.empty() && t.histPos >= 0 && t.history[t.histPos] == path) {
@@ -2148,6 +2321,7 @@ void MainWindow::Navigate(const std::wstring& rawPath, bool addHistory)
     } else {
         t.pages->Shutdown();          // 停掉旧目录的工作线程，清空缓存
         t.pageItems.clear();
+        t.fullItems.clear();
         t.shownPage = t.curPage;      // 视为“已显示”：不让 OnPageLoaded 反复重试
         t.pageStale = false;
         ListView_SetItemCountEx(CurList(), 0, 0);
@@ -2206,7 +2380,7 @@ void MainWindow::RefreshPaneList(size_t paneIdx)
     } else {
         std::vector<FileEntry> fresh;
         if (t.pages->TryGetPage(t.curPage, fresh)) {
-            SwapInPage(paneIdx, t, list, std::move(fresh));
+            SwapInPage(paneIdx, p.tabs[p.active], t, list, std::move(fresh));
         } else if (!tabChanged && t.pageStale && t.shownPage == t.curPage && !t.pageItems.empty()) {
             // 同一分页的外部重载进行中：保留旧内容，加载完成后整体换入
         } else if (!tabChanged && t.pageStale && !t.pageItems.empty()) {
@@ -2228,6 +2402,7 @@ void MainWindow::RefreshPaneList(size_t paneIdx)
             // 同一分页换目录/翻页：旧行属于别的内容，留着会误导（点它会打开不该开的项），
             // 清空等后台加载完成
             t.pageItems.clear();
+            t.fullItems.clear();
             t.shownPage = SIZE_MAX;
             ListView_SetItemCountEx(list, 0, 0);
             p.renderedTab = p.active;
@@ -2238,12 +2413,14 @@ void MainWindow::RefreshPaneList(size_t paneIdx)
 
 // 把后台加载好的一页一次性换入显示：设置条目数后排序并整体重绘，
 // 整个过程只有一次重绘（双缓冲下无闪烁）。换入前旧内容一直保留显示。
-void MainWindow::SwapInPage(size_t paneIdx, TabState& t, HWND list,
+void MainWindow::SwapInPage(size_t paneIdx, size_t tabIndex, TabState& t, HWND list,
                             std::vector<FileEntry> fresh)
 {
     t.pageItems = std::move(fresh);
+    t.fullItems.clear();   // 新的一页：过滤前的旧底单作废
     ListView_SetItemCountEx(list, static_cast<int>(t.pageItems.size()), LVSICF_NOINVALIDATEALL);
     ApplyCurrentSort(paneIdx);   // 排序 + 0..n-1 整体重绘
+    ApplyListFilterToTab(tabIndex); // 过滤词激活且本分页是目标时，筛掉不匹配的行
     t.shownPage = t.curPage;
     t.pageStale = false;
     if (paneIdx < panes_.size())
@@ -2269,7 +2446,7 @@ void MainWindow::OnPageLoaded()
         if (t.pageItems.empty() || t.pageStale || t.shownPage != t.curPage) {
             std::vector<FileEntry> fresh;
             if (t.pages->TryGetPage(t.curPage, fresh))
-                SwapInPage(i, t, panes_[i].list, std::move(fresh));
+                SwapInPage(i, panes_[i].tabs[panes_[i].active], t, panes_[i].list, std::move(fresh));
         }
     }
     CurTab().pages->PrefetchAround(CurTab().curPage);
@@ -3346,6 +3523,68 @@ static std::wstring ToLowerCopy(const std::wstring& s)
     return r;
 }
 
+// 把过滤词应用到指定分页的自绘列表。行号的一切消费方都走 pageItems，所以过滤
+// 就地重排 pageItems（只留命中行），过滤前的整页留在 fullItems 里，清词后还原。
+// 只作用于自绘虚拟列表（listMode==0）：shell 视图的行归 DefView 管，过滤不了。
+void MainWindow::ApplyListFilterToTab(size_t tabIndex)
+{
+    if (tabIndex >= tabs_.size()) return;
+    TabState& t = tabs_[tabIndex];
+    if (t.listMode != 0 || t.pane >= panes_.size()) return;
+    HWND list = panes_[t.pane].list;
+    if (list == nullptr) return;
+    // 共享列表显示的可能还是别的分页的行：只动数据、不碰列表控件
+    //（条数会在切回本分页显示时按 pageItems 重设）。
+    bool rendered = (panes_[t.pane].renderedTab != SIZE_MAX &&
+                     panes_[t.pane].renderedTab == panes_[t.pane].active &&
+                     panes_[t.pane].tabs[panes_[t.pane].active] == tabIndex);
+
+    if (tabIndex != filterTab_ || listFilterText_.empty()) {
+        // 非目标分页或词已清空：把过滤前的整页还原回来
+        if (t.fullItems.empty()) return;
+        t.pageItems = std::move(t.fullItems);
+        t.fullItems.clear();
+        if (rendered) {
+            ListView_SetItemCountEx(list, static_cast<int>(t.pageItems.size()),
+                                    LVSICF_NOINVALIDATEALL);
+            ListView_SetItemState(list, -1, 0, LVIS_SELECTED);   // 行号已变，清掉旧选中
+            ApplyCurrentSort(t.pane);   // 重排 + 重绘
+        }
+        return;
+    }
+
+    if (t.fullItems.empty() && !t.pageItems.empty())
+        t.fullItems = t.pageItems;   // 第一次过滤：留整页底单
+    const std::wstring f = ToLowerCopy(listFilterText_);
+    std::vector<FileEntry> keep;
+    keep.reserve(t.fullItems.size());
+    for (const FileEntry& e : t.fullItems)
+        if (ToLowerCopy(e.name).find(f) != std::wstring::npos ||
+            ToLowerCopy(e.path).find(f) != std::wstring::npos)
+            keep.push_back(e);
+    t.pageItems = std::move(keep);
+    if (rendered) {
+        ListView_SetItemCountEx(list, static_cast<int>(t.pageItems.size()),
+                                LVSICF_NOINVALIDATEALL);
+        ListView_SetItemState(list, -1, 0, LVIS_SELECTED);
+        ApplyCurrentSort(t.pane);
+    }
+}
+
+// 切分页/切窗格时同步过滤目标：旧目标分页还原整页，新目标分页按当前词过滤，
+// 并按新分页的列表实现开/关输入框（shell 视图分页没有可过滤的行，置灰）。
+void MainWindow::UpdateListFilterTarget()
+{
+    size_t old = filterTab_;
+    filterTab_ = activeTab_;
+    if (old != SIZE_MAX && old != filterTab_) ApplyListFilterToTab(old);
+    ApplyListFilterToTab(filterTab_);
+    if (listFilter_)
+        EnableWindow(listFilter_,
+                     activePane_ < panes_.size() &&
+                     PaneActiveTab(activePane_).listMode == 0);
+}
+
 void MainWindow::RefreshFavoritesList()
 {
     // 行上的 lParam 是本函数 new 出来的路径字符串，ListView_DeleteAllItems 不会
@@ -3808,13 +4047,17 @@ DWORD MainWindow::HandleFileDrop(HWND list, const std::vector<std::wstring>& pat
     return effect;
 }
 
-// 地址栏子类化：回车时向主窗口发 EN_RETURN 通知
+// 地址栏子类化（挂在 ComboBoxEx 的内层编辑框上）：回车时向主窗口发 EN_RETURN 通知。
+// 内层 edit 的父链是 edit -> combobox -> comboex -> 容器/主窗口，不能用 GetParent
+// 直取主窗口，改走 GA_ROOT；lParam 一律传内层 edit 自身，由主窗口归一化（见
+// TopAddressControl）后再认领是哪条地址栏。
 static LRESULT CALLBACK AddressProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 {
     if (m == WM_KEYDOWN && wp == VK_RETURN) {
-        auto* self = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(GetParent(h), GWLP_USERDATA));
+        HWND main = GetAncestor(h, GA_ROOT);
+        auto* self = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(main, GWLP_USERDATA));
         if (self)
-            SendMessageW(GetParent(h), WM_COMMAND,
+            SendMessageW(main, WM_COMMAND,
                          MAKEWPARAM(IDC_ADDRESS, EN_ADDR_RETURN), reinterpret_cast<LPARAM>(h));
         return 0;
     }
@@ -4070,7 +4313,8 @@ void MainWindow::UpdateNewTabButtons()
                 POINT o{ 0, 0 };
                 MapWindowPoints(p.host->Handle(), hwnd_, &o, 1);  // 宿主原点 -> 主窗口坐标
                 int baseX = o.x + (hc.right - hc.left);            // 窗格最右（主窗口坐标）
-                int topY  = o.y + 1;
+                // 独立地址栏模式：容器顶部那行归地址栏，按钮行随分页条下移
+                int topY  = o.y + (paneAddressBars_ ? kAddressH : 0) + 1;
                 int toolsX = baseX - 24;                          // “▾”最右
                 SetWindowPos(p.btnTools, HWND_TOP, toolsX, topY, 24, 20,
                              SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -4699,16 +4943,20 @@ void MainWindow::Layout()
                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
     };
 
-    // 顶部工具栏：普通按钮从左往右排，宽度按各自文字量出；地址栏接在最后一个
-    // 按钮右侧，占满剩余宽度。按钮与地址栏同一条水平中线（kToolbarRowH 内居中）。
+    // 顶部工具栏：普通按钮从左往右排，宽度按各自文字量出（整行归按钮）。
+    // 地址栏另起一行，摆在侧栏“目录树/收藏”分页条的同一高度，见下方分隔条之后。
     if (toolbarBtns_.size() == ARRAYSIZE(kToolbarBtns)) {
         HDC dc = GetDC(hwnd_);
         HFONT oldFont = uiFont_ ? (HFONT)SelectObject(dc, uiFont_) : nullptr;
         int x = 0;
         for (size_t i = 0; i < ARRAYSIZE(kToolbarBtns); ++i) {
             const ToolbarBtn& b = kToolbarBtns[i];
+            // 量按钮自己的当前文字：地址栏开关的文字随模式变（共用 ⇄ 独立）
+            wchar_t btxt[64]{};
+            GetWindowTextW(toolbarBtns_[i], btxt, ARRAYSIZE(btxt));
+            const wchar_t* txt = btxt[0] ? btxt : b.text;
             SIZE sz{};
-            GetTextExtentPoint32W(dc, b.text, (int)wcslen(b.text), &sz);
+            GetTextExtentPoint32W(dc, txt, (int)wcslen(txt), &sz);
             const int w = sz.cx + 16;        // 左右各留 8px：文字不贴按钮边框
             place(toolbarBtns_[i], x, kToolbarTop, w, kToolbarBtnH);
             x += w + 2;                      // 按钮之间的间距
@@ -4716,13 +4964,6 @@ void MainWindow::Layout()
         }
         if (oldFont) SelectObject(dc, oldFont);
         ReleaseDC(hwnd_, dc);
-        int ax = x - 2 + 6;                  // 末尾多的那次间距还原，再留空给地址栏
-        int aw = W - ax - 4;
-        if (aw < 80) { ax = 4; aw = W - 8; } // 窗口太窄放不下按钮行时退回整行
-        if (aw < 0) aw = 0;
-        place(address_, ax, kAddressTop, aw, kAddressH);
-    } else {
-        place(address_, 268, kAddressTop, W - 272, kAddressH);  // 兜底：未创建按钮时
     }
     y += kToolbarRowH;
 
@@ -4777,6 +5018,25 @@ void MainWindow::Layout()
             sideWidth_ = applied;
             geometryChanged_ = true;
         }
+    }
+
+    // 地址栏：与侧栏“目录树/收藏”分页条同一高度（sideHost_ 顶在 y=kToolbarRowH，
+    // SetTabTopPad(0) 所以分页条顶就是 y），X 对齐目录树右边的分隔条；侧栏折叠时
+    // 分隔条记的位置不变，改按 sidebarVisible_ 贴回窗口左缘。右侧固定宽留给过滤框。
+    if (address_ != nullptr) {
+        int ax = 0;
+        if (sidebarVisible_ && treeBar != nullptr && treeBar->m_hWnd != nullptr)
+            ax = treeBar->GetPos();
+        else if (sidebarVisible_)
+            ax = sideWidth_;                 // 分隔条还没建好时用会话宽度兜底
+        int fx = W - 4 - kListFilterW;       // 过滤框贴右缘
+        int aw = fx - ax - 4;
+        if (aw < 0) aw = 0;
+        // 独立地址栏模式：顶部共用地址栏隐藏（每窗格自己的地址栏在容器里）
+        ShowWindow(address_, paneAddressBars_ ? SW_HIDE : SW_SHOW);
+        if (!paneAddressBars_)
+            place(address_, ax, kToolbarRowH, aw, kAddressH);
+        place(listFilter_, fx, kToolbarRowH, kListFilterW, kAddressH);
     }
 
     // 右侧容器底部分页栏高度随分页开关变化（rightWrap_ 据此重排：多窗格变矮/满高）
@@ -5144,6 +5404,9 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         case IDC_SIDEBAR_TOGGLE:
             ToggleSidebar();
             return 0;
+        case IDC_ADDRBAR_TOGGLE:
+            ToggleAddressBarMode();
+            return 0;
         case IDC_TM_CLOSE:  CloseRightTab(menuTab_); return 0;
         case IDC_TM_OTHERS: CloseOtherTabs(menuTab_); return 0;
         case IDC_TM_RIGHT:  CloseRightTabs(menuTab_); return 0;
@@ -5206,9 +5469,16 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
                     return 0;
                 }
             }
-            // F4：焦点进地址栏并全选，直接敲新路径就能整体替换
-            SetFocus(address_);
-            SendMessageW(address_, EM_SETSEL, 0, -1);
+            // F4：焦点进地址栏并全选，直接敲新路径就能整体替换。
+            // 独立地址栏模式：进激活窗格自己的地址栏（提交时导航的就是这个窗格）。
+            // ComboBoxEx 上 EM_SETSEL 不保证转发，聚焦/全选都落在内层编辑框上。
+            HWND addrTarget = paneAddressBars_ ? CurPane().address : address_;
+            if (addrTarget == nullptr) addrTarget = address_;
+            HWND addrEdit = reinterpret_cast<HWND>(
+                SendMessageW(addrTarget, CBEM_GETEDITCONTROL, 0, 0));
+            if (addrEdit == nullptr) addrEdit = addrTarget;
+            SetFocus(addrEdit);
+            SendMessageW(addrEdit, EM_SETSEL, 0, -1);
             return 0;
         }
         case IDC_MENU_FILTERS:
@@ -5235,16 +5505,39 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             // 输入即过滤：只重建收藏列表的显示行，不动 favorites_ 与磁盘
             if (HIWORD(wp) == EN_CHANGE) RefreshFavoritesList();
             return 0;
+        case IDC_LIST_FILTER:
+            // 输入即过滤：筛激活分页的自绘列表显示行，不动底层数据
+            if (HIWORD(wp) == EN_CHANGE) {
+                wchar_t buf[256] = {};
+                GetWindowTextW(listFilter_, buf, ARRAYSIZE(buf));
+                listFilterText_ = buf;
+                filterTab_ = activeTab_;
+                ApplyListFilterToTab(activeTab_);
+                UpdateStatusBar();
+            }
+            return 0;
         case IDC_ADDRESS:
             if (HIWORD(wp) == EN_KILLFOCUS || HIWORD(wp) == EN_ADDR_RETURN) {
+                // lParam = 发通知的控件：可能是 ComboBoxEx 本体、内层 combobox 或内层
+                // edit（comboex 转发通知不保证换成自己的句柄），先归一化成登记的那个
+                // comboex 句柄再认领是顶部共用地址栏还是某窗格的独立地址栏。
+                HWND bar = TopAddressControl(reinterpret_cast<HWND>(lp));
+                if (bar == nullptr) bar = address_;
+                // 窗格地址栏提交时先把该窗格激活，下面的导航逻辑仍作用于“当前分页”
+                if (bar != address_) {
+                    int addrPane = PaneOfAddress(bar);
+                    if (addrPane >= 0 && static_cast<size_t>(addrPane) != activePane_)
+                        SelectPane(static_cast<size_t>(addrPane));
+                }
                 wchar_t buf[MAX_PATH * 2] = {};
-                GetWindowTextW(address_, buf, MAX_PATH * 2);
+                GetWindowTextW(bar, buf, MAX_PATH * 2);
                 if (buf[0] && buf != CurTab().dir) {
                     // 锁定只挡关闭与地址变化：激活的是锁定分页时，改走侧栏同款逻辑，
                     // 在同一窗格里新开一个分页打开新地址，不动锁定分页本身
                     NavMuteGuard mute(&navSoundMute_);   // Q-Dir：地址栏提交不响导航音
                     if (CurTab().locked) NavigateFromSidebar(buf);
                     else Navigate(buf);
+                    AddAddressHistory(bar, CurTab().dir);   // Q-Dir：提交的路径进下拉历史
                 }
                 // 交还焦点给当前窗格的“内容区”：Q 视图分页要给视图窗口，
                 // 否则焦点落到隐藏着的自绘列表上，地址栏回车后键盘就没反应了

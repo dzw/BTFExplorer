@@ -24,6 +24,8 @@ struct SettingsData {
     bool navSound   = true;   // 窗格换目录时播放导航音
     // 目录树：禁止展开图标（三角形）。true = 不画 +/- 三角形（Q-Dir 同名选项）
     bool noExpandIcon = false;
+    // 地址栏模式：false = 全窗格共用顶部一条（默认）；true = 每个窗格独立一条
+    bool paneAddressBars = false;
 };
 
 namespace settings {

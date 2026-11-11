@@ -26,6 +26,8 @@ struct PaneHost::Impl : public ATL::CWindowImpl<Impl> {
     DECLARE_WND_CLASS_EX(L"PEShellPaneHost", 0, COLOR_WINDOW + 1)
 
     HWND tab = nullptr;
+    HWND addressBar = nullptr;  // 顶部地址栏行（每窗格独立地址栏，主窗口创建后登记）
+    int addressH = 0;           // 地址栏行高（0 = 不启用，不占行）
     HWND blankHit = nullptr;
     HWND list = nullptr;
     std::vector<HWND> contents;
@@ -139,8 +141,11 @@ struct PaneHost::Impl : public ATL::CWindowImpl<Impl> {
                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
         };
         int tabW = (w > tabRightReserve_) ? (w - tabRightReserve_) : w;
-        if (tab) place(tab, 0, tabTopPad_, tabW, strip);
-        const int contentY = tabTopPad_ + strip;
+        // 顶部地址栏行（每窗格独立地址栏）：压在最上，分页栏与内容区整体下移让位
+        const int addrH = (addressBar != nullptr && addressH > 0) ? addressH : 0;
+        if (addressBar) place(addressBar, 0, 0, w, addrH);
+        if (tab) place(tab, 0, addrH + tabTopPad_, tabW, strip);
+        const int contentY = addrH + tabTopPad_ + strip;
         const int contentH = h - contentY - bottomH_;
         if (contentH > 0) {
             if (list) place(list, kEdgePad, contentY, w - kEdgePad * 2, contentH);
@@ -220,6 +225,14 @@ void PaneHost::SetBottomPane(HWND pane, int height)
     impl_->bottomPane_ = pane;
     impl_->bottomH_ = height;
     Relayout();
+}
+
+void PaneHost::SetAddressBar(HWND edit, int height)
+{
+    if (!impl_) return;
+    impl_->addressBar = edit;
+    impl_->addressH = height;
+    Relayout();   // 行高变了立即重摆（显示/隐藏由主窗口控制）
 }
 
 void PaneHost::SetTabStrip(HWND tab)
