@@ -26,6 +26,9 @@ public:
     void SetAddressBar(HWND edit, int height); // 顶部地址栏行（每窗格独立地址栏；height<=0=不占行）
     // 地址栏行左侧的导航按钮（←/→/↑/⌂，每窗格一套）：随地址栏行一起显示/占位
     void SetNavButtons(const HWND* btns, int count);
+    // 顶部预留行（内容区整体下移）：右侧窗格区容器在“每窗格独立地址栏”模式下用它
+    // 给窗口顶部的全局行（侧栏分页条+全局按钮+过滤框）让位
+    void SetTopReserve(int h);
     void SetTabTopPad(int pad);        // 标题行上方的留白（侧栏用它和顶部工具栏拉开距离）
     void SetTabRightReserve(int reserve); // 标题行右侧留宽（给 ▾/Q/0 等按钮让位，按钮移到条外）
     void SetBottomPane(HWND pane, int height); // 底部窗格（固定高贴底，如分页栏）；上面内容区相应变矮

@@ -43,6 +43,7 @@ struct PaneHost::Impl : public ATL::CWindowImpl<Impl> {
     int tabRightReserve_ = 0;  // 标题行右侧留宽（给 ▾/Q/0 等按钮让位，按钮移到条外）
     HWND bottomPane_ = nullptr; // 底部窗格（固定高贴底，如分页栏）
     int bottomH_ = 0;           // 底部窗格高度
+    int topReserve_ = 0;        // 顶部预留行高（独立地址栏模式给全局行让位）
 
     BEGIN_MSG_MAP_EX(Impl)
         MSG_WM_SIZE(OnSize)
@@ -159,7 +160,7 @@ struct PaneHost::Impl : public ATL::CWindowImpl<Impl> {
         }
         if (addressBar) place(addressBar, navW, 0, (w > navW) ? (w - navW) : 0, addrH);
         if (tab) place(tab, 0, addrH + tabTopPad_, tabW, strip);
-        const int contentY = addrH + tabTopPad_ + strip;
+        const int contentY = addrH + tabTopPad_ + strip + topReserve_;
         const int contentH = h - contentY - bottomH_;
         if (contentH > 0) {
             if (list) place(list, kEdgePad, contentY, w - kEdgePad * 2, contentH);
@@ -257,6 +258,14 @@ void PaneHost::SetNavButtons(const HWND* btns, int count)
         impl_->navBtns[i] = btns[i];
     for (int i = impl_->navCount; i < kNavMax; ++i)
         impl_->navBtns[i] = nullptr;
+    Relayout();
+}
+
+void PaneHost::SetTopReserve(int h)
+{
+    if (!impl_) return;
+    if (impl_->topReserve_ == h) return;   // 值没变不动（Layout 每次都会调）
+    impl_->topReserve_ = (h > 0) ? h : 0;
     Relayout();
 }
 
