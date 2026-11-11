@@ -39,6 +39,7 @@ enum {
     IDC_SIDEBAR_TOGGLE = 1052,   // 顶部工具栏“☰”按钮：显示/隐藏左侧目录树+收藏侧栏
     IDC_HOME = 1053,             // 顶部工具栏“🏠”按钮：跳转到“我的电脑”
     IDC_ADDRBAR_TOGGLE = 1054,   // 顶部工具栏“地址栏”开关：共用 ⇄ 每窗格独立
+    IDC_DRIVE_BOX = 1055,        // 顶部工具栏“盘符”下拉框（Q-Dir 同款驱动器框）：选中即跳该盘
     IDC_TREEHOST = 1029,   // 目录树宿主容器（Q-Dir 同款：Dialog 包住 NamespaceTreeControl）
     IDC_SETTINGS = 1028,   // 工具栏“设置”按钮（对话框控件 ID 见 SettingsDialog.cpp）
     // 分页标题右键菜单：关闭 / 关闭其他 / 关闭右边 / 锁定
@@ -354,7 +355,10 @@ private:
     // 地址栏/外部打开传入的是文件路径时先记下它，所在目录加载完成后（OnPageLoaded）
     // 在列表里选中该文件。单次生效：用掉即清空。
     std::wstring pendingSelectFile_;
+    HWND driveBox_ = nullptr;   // 顶部工具栏“盘符”下拉框（设置按钮后面，选中即跳该盘）
     void ApplyPaneAddressBars();
+    // 盘符下拉框的选中项跟随激活分页的目录（跨盘导航/切窗格/切分页都会同步）
+    void UpdateDriveBox();
     // 顶部工具栏的“地址栏”开关：点一下在“共用 ⇄ 每窗格独立”之间切换并落盘
     void ToggleAddressBarMode();
     // 开关按钮的文字跟着模式走（“地址栏:共用” / “地址栏:独立”），与设置对话框互相同步

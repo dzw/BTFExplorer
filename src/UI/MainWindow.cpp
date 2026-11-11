@@ -52,6 +52,7 @@ constexpr int kToolbarTop = (kToolbarRowH - kToolbarBtnH) / 2;
 constexpr int kAddressH = 24;
 constexpr int kAddressTop = (kToolbarRowH - kAddressH) / 2;
 constexpr int kListFilterW = 160;   // 地址栏右侧过滤框的固定宽度
+constexpr int kDriveBoxW = 72;      // “盘符”下拉框的固定宽度（条目是 C:\ 这种盘符）
 // 地址栏下拉历史的条数上限（Q-Dir sub_41AF8F 的 10：去重、新的在最上）
 constexpr int kAddressHistoryMax = 10;
 
@@ -60,14 +61,14 @@ constexpr int kAddressHistoryMax = 10;
 struct ToolbarBtn { const wchar_t* text; int id; bool groupEnd; };
 constexpr ToolbarBtn kToolbarBtns[] = {
     { L"地址栏:共用", IDC_ADDRBAR_TOGGLE, true  },  // 开关放最前：文字随模式变（共用 ⇄ 独立）
-    { L"←", IDC_BACK,           false },
-    { L"→", IDC_FORWARD,        false },
-    { L"↑", IDC_UP,             false },
     { L"刷新", IDC_REFRESH,     false },
-    { L"⌂", IDC_HOME,           true  },
     { L"☰", IDC_SIDEBAR_TOGGLE, true  },
     { L"菜单过滤词", IDC_MENU_FILTERS, false },
     { L"设置", IDC_SETTINGS,    true  },
+    { L"←", IDC_BACK,           false },   // 导航组贴在盘符下拉框左边（见 Layout）
+    { L"→", IDC_FORWARD,        false },
+    { L"↑", IDC_UP,             false },
+    { L"⌂", IDC_HOME,           true  },
 };
 
 // 一条分隔条窗口。竖/横只是构造参数 m_bVertical 的差别，窗口类名与 Q-Dir 一致。
@@ -709,6 +710,14 @@ void MainWindow::BuildChildren()
     // 地址栏：Q-Dir 同款 ComboBoxEx32（可下拉选历史路径），回车在 AddressProc 处理
     address_ = CreateAddressCombo(hwnd_, IDC_ADDRESS, true, uiFont_);
     SubclassAddressEdit(address_);
+    // 盘符下拉框（Q-Dir 同款驱动器框）：设置按钮后面，选中即跳转该盘（见 Layout/WM_COMMAND）
+    mk(WS_TABSTOP | CBS_DROPDOWNLIST, 0, WC_COMBOBOXW, L"", IDC_DRIVE_BOX, &driveBox_);
+    {
+        wchar_t drv[512]{};
+        GetLogicalDriveStringsW(512, drv);
+        for (const wchar_t* p = drv; *p; p += wcslen(p) + 1)
+            SendMessageW(driveBox_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(p));
+    }
     // 地址栏右侧的列表过滤框：边输入边筛激活分页的自绘列表（ApplyListFilterToTab）
     mk(WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, WC_EDITW, L"", IDC_LIST_FILTER, &listFilter_);
     if (uiFont_) SendMessageW(listFilter_, WM_SETFONT, (WPARAM)uiFont_, TRUE);
@@ -888,6 +897,27 @@ void MainWindow::SyncAddrbarToggleBtn()
             return;
         }
     }
+}
+
+// 盘符下拉框跟随激活分页的盘：当前目录不在列表里（网络路径/虚拟目录）就清空选中
+void MainWindow::UpdateDriveBox()
+{
+    if (driveBox_ == nullptr) return;
+    const std::wstring& d = CurTab().dir;
+    if (d.size() < 2 || d[1] != L':') {
+        SendMessageW(driveBox_, CB_SETCURSEL, -1, 0);
+        return;
+    }
+    const int n = (int)SendMessageW(driveBox_, CB_GETCOUNT, 0, 0);
+    for (int i = 0; i < n; ++i) {
+        wchar_t s[8]{};
+        if (SendMessageW(driveBox_, CB_GETLBTEXT, i, (LPARAM)s) == CB_ERR) continue;
+        if (_wcsnicmp(s, d.c_str(), 2) == 0) {
+            SendMessageW(driveBox_, CB_SETCURSEL, i, 0);
+            return;
+        }
+    }
+    SendMessageW(driveBox_, CB_SETCURSEL, -1, 0);
 }
 
 void MainWindow::ToggleSidebar()
@@ -1845,6 +1875,7 @@ void MainWindow::SelectPane(size_t index)
     activePane_ = index;
     activeTab_ = p.tabs[p.active];
     SetWindowTextW(address_, CurTab().dir.c_str());
+    UpdateDriveBox();           // 盘符下拉框跟随新激活分页的盘
     UpdatePaneAddressBars();    // 独立地址栏模式：文本对齐各自窗格的当前分页
     UpdateListFilterTarget();   // 过滤词换目标：还原旧分页、过滤新分页
     InvalidateTabStrips(prevPane);
@@ -2355,6 +2386,7 @@ void MainWindow::Navigate(const std::wstring& rawPath, bool addHistory)
     t.shownPage = SIZE_MAX;   // 显示页号作废
     t.pageStale = true;
     SetWindowTextW(address_, AddressDisplayText(path).c_str());
+    UpdateDriveBox();         // 盘符下拉框跟随当前盘
     UpdatePaneAddressBars();  // 独立地址栏模式：该窗格自己的地址栏也要跟上
 
     if (addHistory) {
@@ -5075,6 +5107,14 @@ void MainWindow::Layout()
             x += bw[i] + 2;                      // 按钮之间的间距
             if (kToolbarBtns[i].groupEnd) x += 6; // 组与组之间多留空（原来是分隔条）
         }
+        // 盘符下拉框：接在最后一个按钮（“设置”）后面。高度给足下拉列表空间
+        //（combobox 的高度含收起的列表区，合上时只有顶部 kAddressH 那截可见）
+        if (driveBox_ != nullptr) {
+            place(driveBox_, x + 2, kAddressTop, kDriveBoxW, 200);
+            SetWindowPos(driveBox_, HWND_TOP, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            x += kDriveBoxW + 6;
+        }
         // 共用模式：地址栏接在最后一个按钮（“设置”）后面同一行，占到过滤框左缘；
         // 过滤框两种模式都贴右缘、与按钮同一行。
         if (!paneAddressBars_ && address_ != nullptr) {
@@ -5624,6 +5664,18 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         case IDC_NEXT:  PostMessageW(hwnd_, WM_APP_PAGE_REFRESH, IDC_NEXT, 0); return 0;
         case IDC_LAST:
             PostMessageW(hwnd_, WM_APP_PAGE_REFRESH, IDC_LAST, 0);
+            return 0;
+        case IDC_DRIVE_BOX:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                // 选中盘符即跳转该盘；锁定分页时同窗格新开分页（与地址栏同款语义）
+                int sel = (int)SendMessageW(driveBox_, CB_GETCURSEL, 0, 0);
+                if (sel == CB_ERR) return 0;
+                wchar_t drv[8]{};
+                if (SendMessageW(driveBox_, CB_GETLBTEXT, sel, (LPARAM)drv) == CB_ERR)
+                    return 0;
+                if (CurTab().locked) NavigateFromSidebar(drv);
+                else Navigate(drv);
+            }
             return 0;
         case IDC_PAGE_SIZE:
             if (HIWORD(wp) == CBN_SELCHANGE) {
