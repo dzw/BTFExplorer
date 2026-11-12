@@ -357,6 +357,9 @@ private:
     std::wstring pendingSelectFile_;
     HWND driveBox_ = nullptr;   // 顶部工具栏“盘符”下拉框（设置按钮后面，选中即跳该盘）
     void ApplyPaneAddressBars();
+    // 顶部一行全局控件（按钮/盘符框/共用地址栏/过滤框）的摆放：Layout 与
+    // 分隔条拖动（onMoved）共用，起点是目录树右缘
+    void LayoutTopRow(int W);
     // 盘符下拉框的选中项跟随激活分页的目录（跨盘导航/切窗格/切分页都会同步）
     void UpdateDriveBox();
     // 顶部工具栏的“地址栏”开关：点一下在“共用 ⇄ 每窗格独立”之间切换并落盘

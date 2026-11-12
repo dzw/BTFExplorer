@@ -4869,6 +4869,10 @@ void MainWindow::RebuildSplitters(int totalWidth)
             CaptureSplitState();
             LayoutSidebarInner();
             UpdateNewTabButtons();
+            // 顶部全局行（按钮/盘符框/共用地址栏/过滤框）以目录树右缘为起点，
+            // 也要跟着分隔条走
+            RECT trc{}; GetClientRect(hwnd_, &trc);
+            LayoutTopRow(trc.right);
         };
         bar->onDragEnd = [this]() { SaveSession(); };   // 拖完即落盘
     };
@@ -5031,43 +5035,27 @@ bool MainWindow::LayoutSidebarInner()
     return moved;
 }
 
-void MainWindow::Layout()
+// 顶部一行全局控件（按钮 + 盘符框 + 共用地址栏 + 过滤框）的摆放。
+// 从 Layout 里拆出来：拖分隔条时 Layout 不会重跑（onMoved 只重摆侧栏内部与
+// +/Q/▾），但这行控件的起点是目录树右缘，得跟着分隔条走，所以拖动中每步
+// onMoved 也要调一次。控件的显隐（导航按钮下放、共用地址栏）也在这里统一处理。
+void MainWindow::LayoutTopRow(int W)
 {
-    RECT rc; GetClientRect(hwnd_, &rc);
-    int W = rc.right, H = rc.bottom;
-    int y = 0;
-
-    // 摆子控件时**不要**逐个立即重绘。原来用 MoveWindow(..., TRUE)，拖分隔条时每个
-    // 鼠标移动都会让几十个控件各自同步重绘一次，中间态全被看见 -> 整个界面闪动。
-    // 现在只挪不画（SWP_NOREDRAW），全部摆好后由末尾一次 RedrawWindow 统一刷新，
-    // 和资源管理器的做法一致：只呈现最终状态。
-    geometryChanged_ = false;   // 本轮若有控件位置/尺寸真变了，置 true
+    // 与 Layout 的 place 相同语义：只挪不画，几何没变不发消息。
+    // 挪过的控件自己 InvalidateRect，让下一轮消息循环补绘（拖动中每步只动几个）。
     auto place = [&](HWND h, int x, int yy, int w, int hh) {
         if (h == nullptr) return;
         RECT r{}; GetWindowRect(h, &r);
         POINT org{ r.left, r.top };
         ScreenToClient(hwnd_, &org);
-        // 几何没变的控件不发 SetWindowPos（多余的消息也会惊动控件内部状态）
         if (org.x == x && org.y == yy && r.right - r.left == w && r.bottom - r.top == hh)
             return;
-        geometryChanged_ = true;
         SetWindowPos(h, nullptr, x, yy, w, hh,
                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+        InvalidateRect(h, nullptr, FALSE);
     };
 
-    // 状态栏高度先量出来（fullH 要扣掉它）。
-    // 两种地址栏模式分隔条都顶到窗口第 0 行：侧栏“目录树/收藏”分页条固定在
-    // 第 0 行左侧，切模式不上下跳。两种模式顶部都只有一行全局行，
-    // 窗格区从其下开始（rightWrap_ 顶部预留）。
-    RECT rs; SendMessageW(status_, WM_SIZE, 0, MAKELPARAM(W, H));
-    GetWindowRect(status_, &rs);
-    int statusH = rs.bottom - rs.top;
-
-    // 顶部工具栏一行（两种模式同构，都以目录树右缘为起点，不压侧栏上方）：
-    //   共用模式：[地址栏:共用][←→↑刷新⌂][☰][菜单过滤词][设置][地址栏……][过滤框]，
-    //            地址栏接在“设置”按钮后面同一行，不再单独占一行；
-    //   独立模式：[地址栏:独立][刷新][☰][菜单过滤词][设置][过滤框]（←/→/↑/⌂ 在各窗格）。
-    //   窗格区都从这一行下方开始（rightWrap_ 顶部预留 kToolbarRowH）。
+    // 按钮行起点 = 目录树右缘（以目录树为边界，不压侧栏）；侧栏折叠则从 0 起
     int rowX = 0;
     if (sidebarVisible_) {
         PaneSplitter* tb = (splitLayout_ != nullptr) ? splitLayout_->tree.get() : nullptr;
@@ -5138,6 +5126,43 @@ void MainWindow::Layout()
             SetWindowPos(address_, HWND_TOP, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
+}
+
+void MainWindow::Layout()
+{
+    RECT rc; GetClientRect(hwnd_, &rc);
+    int W = rc.right, H = rc.bottom;
+    int y = 0;
+
+    // 摆子控件时**不要**逐个立即重绘。原来用 MoveWindow(..., TRUE)，拖分隔条时每个
+    // 鼠标移动都会让几十个控件各自同步重绘一次，中间态全被看见 -> 整个界面闪动。
+    // 现在只挪不画（SWP_NOREDRAW），全部摆好后由末尾一次 RedrawWindow 统一刷新，
+    // 和资源管理器的做法一致：只呈现最终状态。
+    geometryChanged_ = false;   // 本轮若有控件位置/尺寸真变了，置 true
+    auto place = [&](HWND h, int x, int yy, int w, int hh) {
+        if (h == nullptr) return;
+        RECT r{}; GetWindowRect(h, &r);
+        POINT org{ r.left, r.top };
+        ScreenToClient(hwnd_, &org);
+        // 几何没变的控件不发 SetWindowPos（多余的消息也会惊动控件内部状态）
+        if (org.x == x && org.y == yy && r.right - r.left == w && r.bottom - r.top == hh)
+            return;
+        geometryChanged_ = true;
+        SetWindowPos(h, nullptr, x, yy, w, hh,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+    };
+
+    // 状态栏高度先量出来（fullH 要扣掉它）。
+    // 两种地址栏模式分隔条都顶到窗口第 0 行：侧栏“目录树/收藏”分页条固定在
+    // 第 0 行左侧，切模式不上下跳。两种模式顶部都只有一行全局行，
+    // 窗格区从其下开始（rightWrap_ 顶部预留）。
+    RECT rs; SendMessageW(status_, WM_SIZE, 0, MAKELPARAM(W, H));
+    GetWindowRect(status_, &rs);
+    int statusH = rs.bottom - rs.top;
+
+    // 顶部工具栏一行（按钮/盘符框/共用地址栏/过滤框）：摆放逻辑拆在 LayoutTopRow，
+    // 这里和拖分隔条的 onMoved 都会调（起点是目录树右缘，要跟着分隔条走）
+    LayoutTopRow(W);
 
     // 分页栏关闭时整条隐藏，28px 高度还给文件列表
     int pagerH = paginationEnabled_ ? 28 : 0;
