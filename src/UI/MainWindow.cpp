@@ -1129,6 +1129,7 @@ void MainWindow::RemovePane(size_t idx)
     }
     if (panes_[idx].list) RevokeDragDrop(panes_[idx].list);
     panes_[idx].fileList.reset();
+    panes_[idx].shellView.reset();   // 共享 shell 视图先于容器销毁（宿主是容器子窗口）
     panes_[idx].host.reset();
     panes_[idx].tab = nullptr;
     panes_[idx].list = nullptr;
@@ -1138,7 +1139,7 @@ void MainWindow::RemovePane(size_t idx)
     if (panes_[idx].btnTools) DestroyWindow(panes_[idx].btnTools);
     panes_[idx].address = nullptr;   // 独立地址栏是容器子窗口，随容器一起销毁
     for (HWND& b : panes_[idx].navBtns) b = nullptr;   // 导航按钮同样随容器销毁
-    panes_.erase(panes_.begin() + idx);   // 该窗格分页的 shell 视图宿主随 TabState 析构销毁
+    panes_.erase(panes_.begin() + idx);   // 窗格共享 shell 视图已随 Pane 成员析构
     for (auto& t : tabs_)
         if (t.pane > idx) --t.pane;
     if (panes_.empty()) activePane_ = 0;
@@ -1836,11 +1837,19 @@ bool MainWindow::RestoreSession()
     Layout();
     // 恢复各分页的文件列表实现（shell 视图此刻才创建——需要窗格/分页都已就绪）。
     // 先为所有标记 shell 的分页懒建视图，再按各窗格当前分页的模式摆放可见性。
-    for (size_t i = 0; i < tabs_.size(); ++i)
-        if (tabs_[i].listMode == 1 && tabs_[i].pane < panes_.size())
-            EnsureTabShellView(tabs_[i].pane, tabs_[i]);
-    for (size_t pi = 0; pi < panes_.size(); ++pi)
-        ApplyPaneListMode(pi);
+    for (size_t pi = 0; pi < panes_.size(); ++pi) {
+        // 窗格里有 shell 模式分页才建共享视图，并导航到激活分页目录；
+        // 没有的窗格只摆两套实现的可见性
+        bool anyShell = false;
+        for (size_t k = 0; k < panes_[pi].tabs.size() && !anyShell; ++k)
+            if (tabs_[panes_[pi].tabs[k]].listMode == 1) anyShell = true;
+        if (anyShell) {
+            EnsurePaneShellView(pi);
+            SyncShellView(pi);
+        } else {
+            ApplyPaneListMode(pi);
+        }
+    }
     UpdateWatcher();
     return true;
 }
@@ -1891,11 +1900,11 @@ void MainWindow::SelectPane(size_t index)
 // 视图返回 S_OK 却什么都不删（实测日志）。
 void MainWindow::SyncShellViewActivation()
 {
-    for (size_t i = 0; i < tabs_.size(); ++i) {
-        TabState& t = tabs_[i];
-        if (!t.shellView) continue;
-        bool focus = (i == activeTab_ && t.pane == activePane_ && t.listMode == 1);
-        t.shellView->UIActivateView(focus ? SVUIA_ACTIVATE_FOCUS : SVUIA_DEACTIVATE);
+    for (size_t pi = 0; pi < panes_.size(); ++pi) {
+        Pane& p = panes_[pi];
+        if (!p.shellView) continue;
+        bool focus = (pi == activePane_ && PaneActiveTab(pi).listMode == 1);
+        p.shellView->UIActivateView(focus ? SVUIA_ACTIVATE_FOCUS : SVUIA_DEACTIVATE);
     }
 }
 
@@ -1974,14 +1983,9 @@ void MainWindow::MoveTabToPane(size_t tabIndex, size_t paneIdx)
     SendMessageW(to.tab, TCM_INSERTITEMW, inPane, reinterpret_cast<LPARAM>(&ti));
     to.active = inPane;
 
-    // 分页的 shell 视图宿主挂在“所属窗格的容器”里：迁到别的窗格必须重挂父窗口，
-    // 否则源窗格因清空被销毁时，会把它一起带走（TabState 还拿着它的句柄）。
-    if (tabs_[tabIndex].shellView) {
-        HWND viewHost = tabs_[tabIndex].shellView->Host();
-        from.host->RemoveContent(viewHost);
-        SetParent(viewHost, to.host->Handle());
-        to.host->AddContent(viewHost);
-    }
+    // shell 视图按“窗格”共享（Pane::shellView），不随分页迁移：源窗格保留自己的
+    // 共享视图，目标窗格切到该分页时由 SyncShellView 把目标窗格的共享视图导航过来。
+    // 源窗格剩余分页的显隐要重摆一次（被拖走的可能正显示着）。
 
     // 源窗格空了：关掉它
     if (panes_[oldPane].tabs.empty()) {
@@ -1991,6 +1995,8 @@ void MainWindow::MoveTabToPane(size_t tabIndex, size_t paneIdx)
         // 列表还显示被拖走那一页的内容。选中落回钳位后的 active 并重刷。
         SendMessageW(from.tab, TCM_SETCURSEL, static_cast<WPARAM>(from.active), 0);
         RefreshPaneList(oldPane);
+        ApplyPaneListMode(oldPane);   // 剩余分页的显隐重摆（被拖走的可能正显示着）
+        SyncShellView(oldPane);       // 共享视图显示着 shell 分页时跟上新激活分页目录
     }
     SelectRightTab(tabIndex);
     Layout();
@@ -2227,9 +2233,8 @@ void MainWindow::RemoveTab(size_t index, bool& paneEmptied)
             break;
         }
 
-    // 视图宿主登记在窗格容器里：分页没了要先摘掉，别给容器留个死句柄
-    if (tabs_[index].shellView)
-        panes_[paneIdx].host->RemoveContent(tabs_[index].shellView->Host());
+    // shell 视图按窗格共享，不随分页销毁；显隐由后续 SelectRightTab ->
+    // SyncShellView 按新激活分页的 listMode 重摆
 
     tabs_[index].pages->Shutdown();
     tabs_.erase(tabs_.begin() + index);
@@ -2670,9 +2675,10 @@ void MainWindow::UpdateStatusBar()
     // 否则左分区会一直空着。
     if (activePane_ < panes_.size() && t.listMode == 1) {
         std::wstring viewText;
-        if (t.shellView) viewText = t.shellView->LastStatusText();
-        int n = (t.shellView && t.shellView->HasView()) ? t.shellView->ItemCount() : -1;
-        int sel = (t.shellView && t.shellView->HasView()) ? t.shellView->SelectedCount() : -1;
+        ShellFolderView* sv = panes_[activePane_].shellView.get();
+        if (sv) viewText = sv->LastStatusText();
+        int n = (sv && sv->HasView()) ? sv->ItemCount() : -1;
+        int sel = (sv && sv->HasView()) ? sv->SelectedCount() : -1;
         wchar_t buf[200];
         if (sel > 0) {
             // 选中优先（资源管理器同款）。字节数要从视图取太慢，这里只报项目数。
@@ -2801,17 +2807,16 @@ void MainWindow::ApplyCurrentSort(size_t paneIdx)
 // ---------------------------------------------------------------------------
 // 文件列表双实现：自绘虚拟列表（FileList） <-> shell 视图（ShellFolderView）
 // ---------------------------------------------------------------------------
-// 懒创建该分页自己的 shell 视图（宿主为主窗口的子窗口，与列表重叠摆放），并导航到分页目录。
-bool MainWindow::EnsureTabShellView(size_t paneIdx, TabState& t)
+// 懒创建窗格共享的 shell 视图（宿主登记进窗格容器，与自绘列表重叠摆放）。
+// 不在这里导航：目录对齐由 SyncShellView 按激活分页做（切换分页/导航共用一条路）。
+bool MainWindow::EnsurePaneShellView(size_t paneIdx)
 {
-    WriteAppLog((L"DBG EnsureTabShellView paneIdx=" + std::to_wstring(paneIdx) +
-                 L" hasView=" + std::to_wstring(t.shellView ? 1 : 0) +
-                 L" dir=[" + t.dir + L"]").c_str());
-    if (t.shellView) return true;
     if (paneIdx >= panes_.size()) return false;
+    Pane& p = panes_[paneIdx];
+    if (p.shellView) return true;
     auto sv = std::make_unique<ShellFolderView>();
     WriteAppLog(L"DBG ShellFolderView create calling");
-    if (!sv->Create(panes_[paneIdx].host->Handle())) {
+    if (!sv->Create(p.host->Handle())) {
         WriteAppLog(L"ShellFolderView create failed");
         return false;
     }
@@ -2832,29 +2837,29 @@ bool MainWindow::EnsureTabShellView(size_t paneIdx, TabState& t)
             SendMessageW(status_, SB_SETTEXTW, 0,
                          reinterpret_cast<LPARAM>(text.c_str()));
     };
-    t.shellView = std::move(sv);
+    p.shellView = std::move(sv);
     // 视图内条目数/选中数变化 -> 刷新状态栏（“已选择 N 个项目 X MB”）。
     // 必须延后：回调发生在视图的定时器/消息链内，直接刷状态栏虽安全但统一走
     // 延后更稳妥（避免在 shell 回调栈里重入布局）。
-    t.shellView->onSelectionMaybeChanged = [this]() {
+    p.shellView->onSelectionMaybeChanged = [this]() {
         PostMessageW(hwnd_, WM_APP_STATUS_REFRESH, 0, 0);
     };
     // 视图内右键 -> 延后到主循环弹本程序的菜单：shell 的原生菜单没有过滤配置，
     // 也没有“复制名称/全路径”“添加到收藏”“在 Explorer 中打开”这些自定义项，
     // 两种列表实现因此才有同一套右键菜单。
-    t.shellView->onContextMenu = [this, view = t.shellView.get()](POINT screenPt) {
+    p.shellView->onContextMenu = [this, view = p.shellView.get()](POINT screenPt) {
         PostMessageW(hwnd_, WM_APP_SHELL_CTXMENU, 0,
                      reinterpret_cast<LPARAM>(new ShellCtxRequest{view, screenPt}));
     };
     // F2：交给主窗口用 LVM_EDITLABEL 弹视图自己的就地改名编辑框。
     // （不能放行给 shell：实测按 F2 没反应，DefView 的键盘改名要靠站点转发快捷键，
     //   本站点没接；慢双击是鼠标路径，所以能用。）
-    t.shellView->onRenameKey = [this, view = t.shellView.get()]() {
+    p.shellView->onRenameKey = [this, view = p.shellView.get()]() {
         PostMessageW(hwnd_, WM_APP_SHELL_RENAME, reinterpret_cast<WPARAM>(view), 0);
     };
     // 在视图里点一下/敲一下键盘，也要把所在窗格切为激活窗格：shell 视图的消息
     // 不走自绘列表那条 FileList::Proc，没有自动激活，这里补上（同样延后执行）。
-    t.shellView->onActivateRequest = [this, view = t.shellView.get()]() {
+    p.shellView->onActivateRequest = [this, view = p.shellView.get()]() {
         int pi = PaneOfShellView(view);
         if (pi < 0) return;
         if (static_cast<size_t>(pi) != activePane_)
@@ -2863,28 +2868,19 @@ bool MainWindow::EnsureTabShellView(size_t paneIdx, TabState& t)
             PostMessageW(hwnd_, WM_APP_SHELL_ACTIVATE, 1, 0);  // 窗格已激活：延后补 FOCUS
     };
     // 视图宿主登记给容器摆放（它与自绘列表重叠，显隐由 listMode 决定）
-    panes_[paneIdx].host->AddContent(t.shellView->Host());
-    if (!t.dir.empty() && !t.shellView->Navigate(t.dir)) {
-        WriteAppLog((L"ShellFolderView navigate failed: " + t.dir).c_str());
-        panes_[paneIdx].host->RemoveContent(t.shellView->Host());
-        t.shellView.reset();
-        return false;
-    }
+    p.host->AddContent(p.shellView->Host());
     return true;
 }
 
-// 窗格 shell 模式下只显示当前分页的视图，隐藏同窗格其余分页的视图：
-// 切分页既不重建也不导航，各分页的 SHELLDLL_DefView 句柄因此保持稳定。
-void MainWindow::ShowHidePaneShellViews(size_t paneIdx)
+// 按窗格激活分页的 listMode 显隐窗格共享的 shell 视图
+//（目录对齐由 SyncShellView 负责；这里只管可见性）
+void MainWindow::ShowHidePaneShellView(size_t paneIdx)
 {
     if (paneIdx >= panes_.size()) return;
     Pane& p = panes_[paneIdx];
-    for (size_t k = 0; k < p.tabs.size(); ++k) {
-        TabState& tt = tabs_[p.tabs[k]];
-        if (!tt.shellView) continue;
-        bool show = (tt.listMode == 1 && k == p.active);
-        ShowWindow(tt.shellView->Host(), show ? SW_SHOW : SW_HIDE);
-    }
+    if (!p.shellView) return;
+    bool show = (PaneActiveTab(paneIdx).listMode == 1);
+    ShowWindow(p.shellView->Host(), show ? SW_SHOW : SW_HIDE);
 }
 
 // 当前分页右上角“Q”按钮（延后到这里执行）：只切换该分页的实现（窗格内其余分页不受影响）
@@ -2896,12 +2892,12 @@ void MainWindow::ToggleListMode(size_t paneIdx)
     Pane& p = panes_[paneIdx];
     TabState& t = PaneActiveTab(paneIdx);
     if (t.listMode == 0) {
-        // 切到 shell 视图：确保当前分页有独立视图（懒创建 + 导航到其目录）
-        if (!EnsureTabShellView(paneIdx, t)) return;
+        // 切到 shell 视图：确保窗格有共享视图（懒创建），并导航到本分页目录
+        if (!EnsurePaneShellView(paneIdx)) return;
         t.listMode = 1;
-        ApplyPaneListMode(paneIdx);
-        if (paneIdx == activePane_ && t.shellView && t.shellView->HasView())
-            SetFocus(t.shellView->ViewWindow());
+        SyncShellView(paneIdx);   // 目录对齐 + 显隐 + Layout
+        if (paneIdx == activePane_ && p.shellView && p.shellView->HasView())
+            SetFocus(p.shellView->ViewWindow());
     } else {
         // 切回自绘虚拟列表：各分页的 shell 视图只隐藏不销毁（切回 shell 时复用）
         t.listMode = 0;
@@ -2924,25 +2920,26 @@ void MainWindow::ApplyPaneListMode(size_t paneIdx)
     Pane& p = panes_[paneIdx];
     BOOL listVisible = (PaneActiveTab(paneIdx).listMode == 0) ? SW_SHOW : SW_HIDE;
     ShowWindow(p.list, listVisible);
-    ShowHidePaneShellViews(paneIdx);
+    ShowHidePaneShellView(paneIdx);
     // 宿主可能是在上次 Layout 之后才创建的（尺寸还是 0），统一重摆一次：
     // 宿主跟随列表位置/尺寸，shell 视图再填满宿主（Layout 内逐视图处理）
     Layout();
 }
 
-// 当前分页处于 shell 视图模式时，让该分页的视图对上其目录。
-// 切分页走到这里通常目录未变 -> 只做 Show/Hide（视图句柄不变，不重建）；
-// 仅当该分页自身导航过（Directory()!=dir）才 Navigate 重建其内部视图。
+// 当前分页处于 shell 视图模式时，让窗格共享视图对上该分页目录。
+// 切到目录相同的分页只做 Show/Hide（不重建）；目录不同才 Navigate
+// 重建视图内部（共享视图的代价：滚动/选中/视图模式不按分页保留）。
 void MainWindow::SyncShellView(size_t paneIdx)
 {
     if (paneIdx >= panes_.size()) return;
     Pane& p = panes_[paneIdx];
     TabState& t = PaneActiveTab(paneIdx);
     if (t.listMode == 1) {
-        if (!t.shellView) {
-            if (!EnsureTabShellView(paneIdx, t)) return;
-        } else if (!t.dir.empty() && t.shellView->Directory() != t.dir) {
-            if (!t.shellView->Navigate(t.dir))
+        if (!p.shellView) {
+            if (!EnsurePaneShellView(paneIdx)) return;
+        }
+        if (!t.dir.empty() && p.shellView->Directory() != t.dir) {
+            if (!p.shellView->Navigate(t.dir))
                 WriteAppLog((L"ShellFolderView sync navigate failed: " + t.dir).c_str());
         }
     }
@@ -2950,7 +2947,7 @@ void MainWindow::SyncShellView(size_t paneIdx)
     // listMode 为准。共享的自绘列表若不在此处显隐，从 shell 分页切回自绘分页
     // 会停在隐藏态（空白）。
     ShowWindow(p.list, t.listMode == 0 ? SW_SHOW : SW_HIDE);
-    ShowHidePaneShellViews(paneIdx);
+    ShowHidePaneShellView(paneIdx);
     // 刚显示（或刚懒创建，宿主尺寸还是 0）的视图必须重摆一次：
     // Layout 对每个可见宿主 MoveWindow(...,TRUE)，强制 DefView 重绘。
     // 否则 SW_HIDE->SW_SHOW 的分页会停在空白，直到点“Q”（其路径含 Layout）才恢复。
@@ -3142,8 +3139,8 @@ void MainWindow::ListContextMenu(HWND list, const POINT& screenPt, bool keyboard
     std::vector<std::wstring> sel;
     {
         TabState& pt = PaneActiveTab((size_t)pi);
-        if (pt.listMode == 1 && pt.shellView) {
-            sel = pt.shellView->SelectedPaths();
+        if (pt.listMode == 1 && panes_[pi].shellView) {
+            sel = panes_[pi].shellView->SelectedPaths();
         } else {
             for (int i = -1;;) {
                 i = ListView_GetNextItem(list, i, LVNI_SELECTED);
@@ -3205,8 +3202,7 @@ int MainWindow::PaneOfShellView(const ShellFolderView* view) const
 {
     if (!view) return -1;
     for (size_t p = 0; p < panes_.size(); ++p)
-        for (size_t k = 0; k < panes_[p].tabs.size(); ++k)
-            if (tabs_[panes_[p].tabs[k]].shellView.get() == view) return (int)p;
+        if (panes_[p].shellView.get() == view) return (int)p;
     return -1;
 }
 
@@ -3256,25 +3252,27 @@ bool MainWindow::TranslateShellViewKey(MSG* msg)
         return false;
     if (activePane_ >= panes_.size()) return false;
     const TabState& t = PaneActiveTab(activePane_);
-    if (t.listMode != 1 || !t.shellView) return false;
-    const HWND view = t.shellView->ViewWindow();
+    ShellFolderView* sv = panes_[activePane_].shellView.get();
+    if (t.listMode != 1 || !sv) return false;
+    const HWND view = sv->ViewWindow();
     if (!view) return false;
     // 焦点必须确实在这个视图里（或其子窗口），否则会抢走地址栏/搜索框的按键
     if (msg->hwnd != view && !IsChild(view, msg->hwnd)) return false;
     if (TakeAppGlobalKey(msg)) return true;
-    return t.shellView->TranslateAccelerator(*msg);
+    return sv->TranslateAccelerator(*msg);
 }
 
 void MainWindow::ShellViewContextMenu(size_t pi, POINT screenPt)
 {
     if (pi >= panes_.size()) return;
     TabState& t = PaneActiveTab(pi);
-    if (t.listMode != 1 || !t.shellView) return;
+    ShellFolderView* sv = panes_[pi].shellView.get();
+    if (t.listMode != 1 || !sv) return;
     if (pi != activePane_) PostSelectPane(pi);
 
     bool onItem = false;
-    std::wstring hit = t.shellView->ItemPathAt(screenPt, &onItem);
-    std::vector<std::wstring> sel = t.shellView->SelectedPaths();
+    std::wstring hit = sv->ItemPathAt(screenPt, &onItem);
+    std::vector<std::wstring> sel = sv->SelectedPaths();
     // 空白处 -> 背景菜单（不针对任何条目）；条目但取不到路径（虚拟位置）->
     // 用选区兜底，shell 在右键时已把命中项选中
     std::wstring path;
@@ -3315,7 +3313,7 @@ void MainWindow::ShellViewContextMenu(size_t pi, POINT screenPt)
     }
     if (renameSelected && !path.empty()) {
         WriteAppLog((L"CONTEXT_MENU rename selected (shell view): " + path).c_str());
-        if (!(t.shellView && t.shellView->StartInlineRename()))
+        if (!(sv && sv->StartInlineRename()))
             RenamePath(path);   // 兜底：视图不可用时才用对话框
     }
     if (addFavorite) OnAddFavorite();
@@ -3411,12 +3409,12 @@ std::wstring MainWindow::CurrentPagePath(int item) const
 
 bool MainWindow::SelectedPath(std::wstring& out) const
 {
-    // shell 视图模式：从当前分页视图的选中项取（该模式下自绘列表是隐藏的）
+    // shell 视图模式：从窗格共享视图的选中项取（该模式下自绘列表是隐藏的）
     if (activePane_ >= panes_.size()) return false;
     const Pane& ap = panes_[activePane_];
     const TabState& at = tabs_[ap.tabs[ap.active]];
-    if (at.listMode == 1 && CurTab().shellView) {
-        auto paths = CurTab().shellView->SelectedPaths();
+    if (at.listMode == 1 && ap.shellView) {
+        auto paths = ap.shellView->SelectedPaths();
         if (paths.empty()) return false;
         out = std::move(paths.front());
         return true;
@@ -3429,12 +3427,12 @@ bool MainWindow::SelectedPath(std::wstring& out) const
 
 std::vector<std::wstring> MainWindow::SelectedPaths() const
 {
-    // shell 视图模式：从当前分页视图的选中项取
+    // shell 视图模式：从窗格共享视图的选中项取
     if (activePane_ < panes_.size()) {
         const Pane& ap = panes_[activePane_];
         const TabState& at = tabs_[ap.tabs[ap.active]];
-        if (at.listMode == 1 && CurTab().shellView)
-            return CurTab().shellView->SelectedPaths();
+        if (at.listMode == 1 && ap.shellView)
+            return ap.shellView->SelectedPaths();
     }
     std::vector<std::wstring> out;
     int sel = -1;
@@ -3843,8 +3841,9 @@ void MainWindow::FocusPane(size_t index)
     if (index >= panes_.size() || panes_[index].tabs.empty()) return;
     if (index != activePane_) SelectPane(index);
     TabState& t = PaneActiveTab(index);
-    HWND h = (t.listMode == 1 && t.shellView && t.shellView->HasView())
-                 ? t.shellView->ViewWindow() : panes_[index].list;
+    ShellFolderView* sv = panes_[index].shellView.get();
+    HWND h = (t.listMode == 1 && sv && sv->HasView())
+                 ? sv->ViewWindow() : panes_[index].list;
     if (h) SetFocus(h);
 }
 
@@ -5234,10 +5233,7 @@ void MainWindow::Layout()
         ShowWindow(p.host->Handle(), SW_SHOW); // 曾经被隐藏过（切换布局）的窗格要恢复
         p.host->Relayout();
         // 容器只管摆宿主窗口，宿主内部的 shell 视图要自己填满新尺寸
-        for (size_t ti = 0; ti < p.tabs.size(); ++ti) {
-            TabState& tt = tabs_[p.tabs[ti]];
-            if (tt.shellView) tt.shellView->Layout();
-        }
+        if (p.shellView) p.shellView->Layout();
     }
 
     // 窗格矩形按窗口实际位置刷新（分页拖拽跨窗格判定用）
@@ -5851,8 +5847,8 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_APP_SHELL_ACTIVATE: {
         if (wp == 0) {
-            for (size_t i = 0; i < tabs_.size(); ++i)
-                if (tabs_[i].shellView) tabs_[i].shellView->UIActivateView(SVUIA_DEACTIVATE);
+            for (auto& pn : panes_)
+                if (pn.shellView) pn.shellView->UIActivateView(SVUIA_DEACTIVATE);
         } else {
             SyncShellViewActivation();
         }
@@ -5880,7 +5876,8 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
             WriteAppLog((L"STATE tab" + std::to_wstring(k) +
                          L" pane=" + std::to_wstring(t.pane) +
                          L" listmode=" + std::to_wstring(t.listMode) +
-                         L" shell=" + std::to_wstring(t.shellView ? 1 : 0) +
+                         L" shell=" + std::to_wstring(
+                             (t.pane < panes_.size() && panes_[t.pane].shellView) ? 1 : 0) +
                          L" items=" + std::to_wstring((int)t.pageItems.size()) +
                          L" dir=[" + t.dir + L"]").c_str());
         }
@@ -5904,7 +5901,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    case WM_APP_SHELL_CTXMENU: {  // shell 视图内右键（延后弹菜单，见 EnsureTabShellView）
+    case WM_APP_SHELL_CTXMENU: {  // shell 视图内右键（延后弹菜单，见 EnsurePaneShellView）
         auto* req = reinterpret_cast<ShellCtxRequest*>(lp);
         if (req) {
             int pi = PaneOfShellView(req->view);   // 视图已随分页关闭销毁 -> 丢弃
@@ -5914,15 +5911,15 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    case WM_APP_SHELL_RENAME: {   // shell 视图内 F2（延后到主循环，见 EnsureTabShellView）
+    case WM_APP_SHELL_RENAME: {   // shell 视图内 F2（延后到主循环，见 EnsurePaneShellView）
         int pi = PaneOfShellView(reinterpret_cast<ShellFolderView*>(wp));
-        if (pi < 0) return 0;                      // 视图已随分页关闭销毁
+        if (pi < 0) return 0;                      // 视图已随窗格关闭销毁
         if (static_cast<size_t>(pi) != activePane_) PostSelectPane((size_t)pi);
-        TabState& t = PaneActiveTab((size_t)pi);
+        ShellFolderView* sv = panes_[(size_t)pi].shellView.get();
         // 就地改名：弹 DefView 自己的编辑框（与慢双击同一个）；弹不出来才退回对话框
-        if (t.shellView && t.shellView->StartInlineRename()) return 0;
+        if (sv && sv->StartInlineRename()) return 0;
         std::vector<std::wstring> sel =
-            t.shellView ? t.shellView->SelectedPaths() : std::vector<std::wstring>{};
+            sv ? sv->SelectedPaths() : std::vector<std::wstring>{};
         if (sel.empty()) {
             WriteAppLog(L"RENAME request ignored (shell view): no selected item");
             return 0;

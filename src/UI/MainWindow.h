@@ -78,9 +78,6 @@ struct TabState {
     // 会话里保存了 listmode= 的分页仍按保存值恢复（见 RestoreSession）。
     int listMode = 1;
     std::unique_ptr<PageManager> pages;
-    // Q-Dir 式 shell 视图：每个分页一个独立实例（独立 SHELLDLL_DefView 窗口），
-    // 切分页只 Show/Hide 不重建，故分页的视图句柄稳定。懒创建。
-    std::unique_ptr<ShellFolderView> shellView;
     TabState() : pages(std::make_unique<PageManager>()) {}
 };
 
@@ -114,6 +111,10 @@ struct Pane {
     HWND btnTools = nullptr;                 // 本窗格右上角的“▾”外部工具按钮
     HWND address = nullptr;                  // 本窗格的独立地址栏（paneAddressBars_ 开时显示）
     HWND navBtns[4] = { nullptr, nullptr, nullptr, nullptr }; // 地址栏左侧的 ←/→/↑/⌂
+    // Q-Dir 式 shell 视图：每窗格一份（与自绘列表 FileList 同粒度，同窗格的分页共用）。
+    // 懒创建；切到 shell 模式分页时把这份共享视图导航到该分页目录（目录没变就不动），
+    // 视图内的滚动/选中/视图模式因此不按分页保留。随窗格销毁。
+    std::unique_ptr<ShellFolderView> shellView;
 };
 
 // 资源管理器主窗口：树 + 虚拟 ListView + 地址栏 + 分页栏 + 状态栏。
@@ -204,9 +205,9 @@ private:
     // 文件列表双实现（自绘虚拟列表 <-> shell 视图）
     void ToggleListMode(size_t paneIdx);     // 窗格右上角“Q”按钮：切换实现
     void ApplyPaneListMode(size_t paneIdx);  // 按 listMode 摆放两套实现的可见性
-    void SyncShellView(size_t paneIdx);      // shell 模式下让当前分页的视图对上其目录
-    bool EnsureTabShellView(size_t paneIdx, TabState& t);  // 懒创建该分页自己的 shell 视图
-    void ShowHidePaneShellViews(size_t paneIdx);           // 只显示当前分页的视图，隐藏同窗格其余
+    void SyncShellView(size_t paneIdx);      // shell 模式下让窗格共享视图对上当前分页目录
+    bool EnsurePaneShellView(size_t paneIdx);              // 懒创建该窗格共享的 shell 视图
+    void ShowHidePaneShellView(size_t paneIdx);            // 按当前分页 listMode 显隐窗格共享视图
     void SyncShellViewActivation();                        // 同步 UIActivate：激活窗格当前分页视图 FOCUS，其余 DEACTIVATE
 
     // FileListDelegate：自绘列表的交互回调（控件侧只管显示与命中，业务在这里）
